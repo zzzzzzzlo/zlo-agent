@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, open, readFile, realpath } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
+import { InMemoryCredentialStore, type AssistantMessage } from '@earendil-works/pi-ai'
 import {
   createAgentSession,
   createExtensionRuntime,
   ModelRuntime,
   SessionManager,
   SettingsManager,
-  type AgentSessionEvent,
   type ResourceLoader,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent'
@@ -17,9 +17,16 @@ import type { AgentExecution, ExecutionConfig, ExecutionResult, ExecutionSession
 export class PiExecution implements AgentExecution {
   private runtime?: Promise<ModelRuntime>
   private readonly createRuntime: () => Promise<ModelRuntime>
+  private readonly environmentOnly: boolean
 
-  constructor(createRuntime = () => ModelRuntime.create({ modelsPath: null, allowModelNetwork: false })) {
-    this.createRuntime = createRuntime
+  constructor(createRuntime?: () => Promise<ModelRuntime>) {
+    this.environmentOnly = createRuntime === undefined
+    this.createRuntime = createRuntime ?? (() => ModelRuntime.create({
+      credentials: new InMemoryCredentialStore(),
+      modelsPath: null,
+      allowModelNetwork: false,
+      refreshOnCreate: false,
+    }))
   }
 
   private async getRuntime(): Promise<ModelRuntime> {
@@ -31,7 +38,21 @@ export class PiExecution implements AgentExecution {
   }
 
   async validateRoute(route: ModelRoute): Promise<void> {
-    await resolveModel(await this.getRuntime(), route)
+    await this.resolveModel(await this.getRuntime(), route)
+  }
+
+  private async resolveModel(runtime: ModelRuntime, route?: ModelRoute) {
+    if (!route) throw new ModelUnavailableError('Choose a Pi provider and model explicitly')
+    // These built-ins use direct environment credentials. Bedrock and Vertex can
+    // also discover file/profile credentials even with an empty credential store.
+    if (this.environmentOnly && !['openai', 'anthropic', 'google', 'deepseek'].includes(route.provider)) {
+      throw new ModelUnavailableError('This Pi provider is not enabled for environment authentication')
+    }
+    const model = runtime.getModel(route.provider, route.model)
+    if (!model) throw new ModelUnavailableError('Unknown Pi model route')
+    const auth = await runtime.checkAuth(model.provider).catch(() => undefined)
+    if (!auth) throw new ModelUnavailableError('Pi model provider has no configured authentication')
+    return model
   }
 
   async open(config: ExecutionConfig): Promise<ExecutionSession> {
@@ -39,8 +60,8 @@ export class PiExecution implements AgentExecution {
     await mkdir(config.sessionDirectory, { recursive: true })
     const directory = await realpath(config.sessionDirectory)
     const modelRuntime = await this.getRuntime()
-    let model = config.route && await resolveModel(modelRuntime, config.route)
-    if (!config.session) model ??= await resolveModel(modelRuntime)
+    let model = config.route && await this.resolveModel(modelRuntime, config.route)
+    if (!config.session && !model) throw new ModelUnavailableError('Choose a Pi provider and model explicitly')
 
     const path = config.session?.path ?? join(directory, `${randomUUID()}.jsonl`)
     if (config.session) {
@@ -53,7 +74,7 @@ export class PiExecution implements AgentExecution {
     }
     const manager = SessionManager.open(path, directory, cwd)
     const previousRoute = manager.getBranch().findLast(entry => entry.type === 'model_change')
-    model ??= await resolveModel(modelRuntime, previousRoute && { provider: previousRoute.provider, model: previousRoute.modelId })
+    model ??= await this.resolveModel(modelRuntime, previousRoute && { provider: previousRoute.provider, model: previousRoute.modelId })
     const ref = { id: manager.getSessionId(), path }
     const route = { provider: model.provider, model: model.id }
     let stopping = false
@@ -77,7 +98,8 @@ export class PiExecution implements AgentExecution {
     let disposed = false
     let active: Promise<ExecutionResult> | undefined
     let stop: Promise<void> | undefined
-    let lastAssistant: Extract<AgentSessionEvent, { type: 'message_end' }>['message'] | undefined
+    let lastAssistant: AssistantMessage | undefined
+    const providerMessages = new WeakSet<AssistantMessage>()
     const emit = (event: RuntimeEvent): void => {
       try { config.onEvent(event) } catch { /* A subscriber cannot break the Pi loop. */ }
     }
@@ -89,6 +111,14 @@ export class PiExecution implements AgentExecution {
       if (!stopping) emit({ type: 'model.request_started' })
       if (stopping) throw new Error('Run is stopping')
       return prepared ?? undefined
+    }
+    const stream = session.agent.streamFunction
+    session.agent.streamFunction = async (model, context, options) => {
+      const response = await stream(model, context, options)
+      // Pi may report a runtime exception as a synthetic assistant error. Track the
+      // actual provider responses without subscribing to or consuming their events.
+      void response.result().then(message => providerMessages.add(message), () => {})
+      return response
     }
     const unsubscribe = session.subscribe(event => {
       if (event.type === 'agent_start' && stopping) void session.abort().catch(() => {})
@@ -141,7 +171,7 @@ export class PiExecution implements AgentExecution {
             return { status: stopping ? 'interrupted' : 'runtime_error' }
           }
           if (stopping) return { status: 'interrupted' }
-          return runResult(lastAssistant)
+          return runResult(lastAssistant, lastAssistant !== undefined && providerMessages.has(lastAssistant))
         })()
         try { return await active } finally { active = undefined }
       },
@@ -161,19 +191,6 @@ export class PiExecution implements AgentExecution {
       },
     }
   }
-}
-
-async function resolveModel(runtime: ModelRuntime, route?: ModelRoute) {
-  if (!route) {
-    const model = runtime.getAvailableSnapshot()[0]
-    if (!model) throw new ModelUnavailableError('No Pi model with configured provider authentication')
-    return model
-  }
-  const model = runtime.getModel(route.provider, route.model)
-  if (!model) throw new ModelUnavailableError('Unknown Pi model route')
-  const auth = await runtime.checkAuth(model.provider).catch(() => undefined)
-  if (!auth) throw new ModelUnavailableError('Pi model provider has no configured authentication')
-  return model
 }
 
 function explicitResources(systemPrompt: string): ResourceLoader {
@@ -211,10 +228,10 @@ function asPiTool(tool: ExecutionTool, stopping: () => boolean): ToolDefinition 
   }
 }
 
-function runResult(message: Extract<AgentSessionEvent, { type: 'message_end' }>['message'] | undefined): ExecutionResult {
-  if (!message || message.role !== 'assistant') return { status: 'runtime_error' }
+function runResult(message: AssistantMessage | undefined, fromProvider: boolean): ExecutionResult {
+  if (!message) return { status: 'runtime_error' }
   if (message.stopReason === 'aborted') return { status: 'interrupted' }
-  if (message.stopReason !== 'stop') return { status: 'model_error' }
+  if (message.stopReason !== 'stop') return { status: fromProvider ? 'model_error' : 'runtime_error' }
   return { status: 'completed', text: message.content.filter(part => part.type === 'text').map(part => part.text).join('\n') }
 }
 

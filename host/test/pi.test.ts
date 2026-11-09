@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { appendFile, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { appendFile, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
@@ -7,7 +7,7 @@ import { getCurrentTools } from '@earendil-works/pi-ai'
 import { fauxAssistantMessage, fauxProvider, fauxToolCall } from '@earendil-works/pi-ai/providers/faux'
 import { ModelRuntime } from '@earendil-works/pi-coding-agent'
 import { PiExecution } from '../src/pi.ts'
-import type { ExecutionConfig, RuntimeEvent } from '../src/execution.ts'
+import { ModelUnavailableError, type ExecutionConfig, type RuntimeEvent } from '../src/execution.ts'
 
 const firstRoute = { provider: 'faux', model: 'test-a' }
 const nextRoute = { provider: 'faux', model: 'test-b' }
@@ -77,7 +77,7 @@ test('Pi executes an allowlisted tool, streams output and restores its transcrip
   assert.equal(events.flatMap(event => event.type === 'message.delta' ? [event.delta] : []).join(''), 'Artifact created')
 
   await execution.validateRoute(nextRoute)
-  await assert.rejects(execution.validateRoute({ provider: 'faux', model: 'missing' }), /Unknown Pi model route/)
+  await assert.rejects(execution.validateRoute({ provider: 'faux', model: 'missing' }), ModelUnavailableError)
   faux.setResponses([(context, _options, _state, model) => {
     if (model.id !== nextRoute.model) failures.push('switch did not reach provider')
     if (!JSON.stringify(context).includes('Write an artifact')) failures.push('old context not restored')
@@ -150,6 +150,52 @@ test('Pi cancels a live model request, checkpoints and continues with a fresh se
   finally { await resumed.dispose() }
 })
 
+test('Pi waits for a started tool to settle and skips the next tool after Stop', { timeout: 5_000 }, async t => {
+  const { execution, config, faux } = await fixture(t)
+  const started = Promise.withResolvers<void>()
+  const release = Promise.withResolvers<void>()
+  const calls: string[] = []
+  config.tools = [{
+    name: 'test_effect',
+    description: 'Return a result after a safe boundary',
+    parameters: { type: 'object' },
+    async execute(id) {
+      calls.push(id)
+      started.resolve()
+      await release.promise
+      return { boundary: 'completed' }
+    },
+  }]
+  faux.setResponses([fauxAssistantMessage([
+    fauxToolCall('test_effect', {}, { id: 'first' }),
+    fauxToolCall('test_effect', {}, { id: 'second' }),
+  ], { stopReason: 'toolUse' })])
+  const session = await execution.open(config)
+  const result = session.run('Execute both tools')
+  try {
+    await started.promise
+    let stopFinished = false
+    const stop = session.requestStop().then(() => { stopFinished = true })
+    await Promise.resolve()
+    assert.equal(stopFinished, false)
+    release.resolve()
+    await stop
+    assert.deepEqual(await result, { status: 'interrupted' })
+    assert.deepEqual(calls, ['first'])
+    assert.equal(faux.state.callCount, 1)
+    await session.checkpoint()
+    assert.match(await readFile(session.ref.path, 'utf8'), /boundary/)
+  } finally {
+    release.resolve()
+    await session.dispose()
+  }
+  faux.setResponses([fauxAssistantMessage('Continued without replay')])
+  const resumed = await execution.open({ ...config, session: session.ref })
+  try { assert.deepEqual(await resumed.run('Resume safely'), { status: 'completed', text: 'Continued without replay' }) }
+  finally { await resumed.dispose() }
+  assert.deepEqual(calls, ['first'])
+})
+
 test('Pi can checkpoint before a first assistant response and rejects damaged or missing transcripts', { timeout: 5_000 }, async t => {
   const { execution, config, faux } = await fixture(t)
   const fresh = await execution.open(config)
@@ -178,4 +224,35 @@ test('a resolved Pi model error is reported without retry and observer exception
     assert.equal(faux.state.callCount, 1)
     await session.checkpoint()
   } finally { await session.dispose() }
+})
+
+test('Pi rejects missing model configuration before a session is created', async t => {
+  const { config } = await fixture(t)
+  await assert.rejects(new PiExecution().open({ ...config, route: undefined }), ModelUnavailableError)
+  assert.deepEqual(await readdir(config.sessionDirectory), [])
+})
+
+test('default Pi runtime validates an environment route without discovery or a credential file', async t => {
+  const { config } = await fixture(t)
+  const piDirectory = join(config.cwd, 'pi-config')
+  await mkdir(piDirectory)
+  const oldDirectory = process.env.PI_CODING_AGENT_DIR
+  const oldKey = process.env.OPENAI_API_KEY
+  process.env.PI_CODING_AGENT_DIR = piDirectory
+  process.env.OPENAI_API_KEY = 'offline-test-value'
+  t.after(() => {
+    if (oldDirectory === undefined) delete process.env.PI_CODING_AGENT_DIR
+    else process.env.PI_CODING_AGENT_DIR = oldDirectory
+    if (oldKey === undefined) delete process.env.OPENAI_API_KEY
+    else process.env.OPENAI_API_KEY = oldKey
+  })
+  const fetch = t.mock.method(globalThis, 'fetch', () => { throw new Error('Unexpected network request') })
+  const execution = new PiExecution()
+  const route = { provider: 'openai', model: 'gpt-4.1-mini' }
+  await execution.validateRoute(route)
+  const session = await execution.open({ ...config, route })
+  try { assert.deepEqual(session.route, route) } finally { await session.dispose() }
+  await assert.rejects(execution.validateRoute({ provider: 'google-vertex', model: 'gemini-2.5-flash' }), ModelUnavailableError)
+  assert.deepEqual(await readdir(piDirectory), [])
+  assert.equal(fetch.mock.callCount(), 0)
 })
