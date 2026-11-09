@@ -1,16 +1,11 @@
-# Pi Agent 接入指南
+# Electron 与 Agent Host
 
-接口位于 `src/integrations/agent/AgentAdapter.ts`。当前实现是同目录的 `MockAgentAdapter`，由 `src/stores/workspace.ts` 在组装工作区时注入。
+Electron 主进程使用自身附带的 Node 启动独立 Host，通过 stdin/stdout 的版本化 JSONL 通信。应用启动会等待 `ready`。Host 退出或握手超时后 UI 显示离线，可从 UI 重新启动。窗口关闭时发送 `exit`，等待 Host 停止、刷盘并释放写锁。
 
-| 契约 | 含义 |
-| --- | --- |
-| `send({ sessionId, runId, messages })` | 接收当前运行标识及可见历史，Promise 表示提交是否被接收 |
-| `subscribe(listener)` | 订阅流式事件并返回取消订阅函数 |
-| `cancel({ sessionId, runId })` | 请求停止指定运行，重复取消允许安全返回 |
-| `steer({ sessionId, runId }, text)` | 为正在运行的任务提交后续指令，首版 Mock 返回未接入错误 |
+Preload 通过 `window.agentHost` 暴露固定的 `DesktopHostApi`。Main 校验主框架来源、参数及工作区选择，Renderer 保持 sandbox、contextIsolation 和关闭 Node 集成。文件路径只由系统选择器授权。Host 继续校验路径边界、链接和文件类型。
 
-实现 `PiAgentAdapter` 时，在适配器内把宿主事件归一化为 `message.delta`、`tool.updated`、`run.ended`。文本事件携带新增片段，同一个工具用固定 ID 更新状态。每次接受运行后产生一次终止事件（完成、取消或错误），并始终原样返回会话和运行标识。取消成功后也需要终止事件，界面据此恢复发送按钮。宿主若已经保存会话历史，应在适配器中按会话绑定复用，避免在续聊时重复导入。
+`HostAgentAdapter` 将业务命令发送到 Main。Zustand 按 Conversation 渲染快照和事件。打开会话时从 `getHistory` 取得历史与游标，再订阅该游标之后的事件。重连后重新获取快照和游标。用户消息只发送 Conversation ID、请求 ID 与本轮文本。Host 独立恢复 Pi 上下文。
 
-引入运行时后，只在 Electron 主进程或独立宿主中管理运行时连接。按实际需要扩展 preload，把 IPC 限制在上述操作和事件。实现适配器后，在工作区组装点替换 Mock，并从适配器能力声明驱动模型、运行中指令和工具入口的可用状态。聊天列、工具卡与窗口组件继续消费标准事件。
+`sendMessage` 创建 Task。运行中追加用 `steerConversation`。停止确认与最终 `stopped` 分开。用户可以通过活动面板看到工具和用量，失败、停止与待核对各有自己的状态。归档保留审计历史。
 
-验收时优先覆盖切换会话后的迟到事件、同时运行两个会话、用户取消与正常完成的竞争、宿主退出后收束所有运行，以及中文文本的流式边界。
+具体 wire 方法、事件、运行 ID 与兼容性见 [Sprint 4 协议](../../docs/11-desktop-protocol.md)。

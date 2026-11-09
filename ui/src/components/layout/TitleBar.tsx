@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { Box, ChevronDown, Minus, PanelLeft, PanelRight, Square, X } from 'lucide-react'
+import { Box, Minus, PanelLeft, PanelRight, Square, X } from 'lucide-react'
 import { useWorkspace, activeSession } from '../../stores/workspace'
 import { IconButton } from '../ui/IconButton'
 import { BrandMark } from '../ui/BrandMark'
@@ -13,6 +13,9 @@ export function TitleBar({ activity, onActivity, notify }: {
   const sidebar = useWorkspace((state) => state.sidebar)
   const toggle = useWorkspace((state) => state.toggleSidebar)
   const title = useWorkspace((state) => activeSession(state)?.title ?? '新会话')
+  const route = useWorkspace((state) => activeSession(state)?.route)
+  const mock = useWorkspace((state) => state.mock)
+  const modelLabel = mock ? 'Mock 模型' : route ? route.provider + '/' + route.model : 'Host 默认模型'
   return (
     <header className="titlebar">
       <div className={`title-brand ${sidebar ? '' : 'is-collapsed'}`}>
@@ -23,8 +26,8 @@ export function TitleBar({ activity, onActivity, notify }: {
         <div className="title-location"><span>工作区</span><span aria-hidden="true">/</span><strong>{title}</strong></div>
         <div className="title-actions">
           <Glass variant="control" className="model-shell">
-            <button className="model-button" onClick={() => notify('模型选择尚未接入。当前使用本地 Mock。')}>
-              <Box size={13} /><span>Mock 模型</span><ChevronDown size={12} />
+            <button className="model-button" title={modelLabel} onClick={() => notify(modelLabel + ' · 可在新建会话时选择模型')}>
+              <Box size={13} /><span>{modelLabel}</span>
             </button>
           </Glass>
           <IconButton label={activity ? '收起活动面板' : '展开活动面板'} aria-expanded={activity} className={activity ? 'is-on' : ''} onClick={onActivity}><PanelRight size={17} /></IconButton>

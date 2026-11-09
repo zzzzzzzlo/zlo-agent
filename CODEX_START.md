@@ -1,4 +1,6 @@
-# 给 Codex 的首轮开发任务（可整段复制）
+# 给 Codex 的首轮开发任务（历史执行规范）
+
+当前开发基线为 Sprint 4。桌面边界、会话契约和验收以 [Sprint 4 桌面协议](docs/11-desktop-protocol.md) 与 [验收记录](docs/12-sprint4-verification.md) 为准。下方保留首轮规范及其架构约束。
 
 你现在担任这个项目的 **Lead Engineer / Architecture Implementer**。我们要开发一个 Local-first 通用 Agent，第一场景是 Windows Coding Agent。用户已经完成大部分架构决策；你的职责是**遵守架构、参考成熟上游、执行首轮开发并拿出可运行结果**，不是重新发明需求或一次性造出全部平台。
 

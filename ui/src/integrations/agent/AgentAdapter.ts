@@ -1,5 +1,6 @@
-export type RunStatus = 'running' | 'completed' | 'cancelled' | 'error'
-export type TerminalStatus = Exclude<RunStatus, 'running'>
+export type RunStatus = 'queued' | 'running' | 'verifying' | 'stopping' | 'completed' |
+  'cancelled' | 'stopped' | 'error' | 'blocked' | 'reconciliation'
+export type TerminalStatus = 'completed' | 'cancelled' | 'error'
 
 export interface RunKey {
   sessionId: string

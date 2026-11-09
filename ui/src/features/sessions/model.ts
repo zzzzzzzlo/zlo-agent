@@ -1,4 +1,5 @@
 import type { RunStatus, ToolUpdate } from '../../integrations/agent/AgentAdapter'
+import type { ConversationMessage, ConversationSummary, ConversationTurn, TaskStatus } from '../../../../host/src/contracts/desktop.ts'
 
 export interface Turn {
   id: string
@@ -7,6 +8,13 @@ export interface Turn {
   tools: ToolUpdate[]
   status: RunStatus
   error?: string
+  taskRunId?: string
+  attemptId?: string
+  assistantId?: string
+  taskStatus?: TaskStatus
+  instructions?: ConversationMessage[]
+  usage?: ConversationTurn['usage']
+  verification?: ConversationTurn['verification']
 }
 
 export interface Session {
@@ -14,6 +22,12 @@ export interface Session {
   title: string
   updatedAt: number
   turns: Turn[]
+  loaded?: boolean
+  nextBefore?: number
+  latestStatus?: RunStatus
+  workspace?: string
+  route?: ConversationSummary['route']
+  check?: ConversationSummary['check']
 }
 
 export const newTitle = '新会话'

@@ -3,18 +3,20 @@ import type { MouseEvent } from 'react'
 import { MessageSquare, MoreHorizontal, PanelLeft, Pencil, Plus, Settings2, Trash2 } from 'lucide-react'
 import { useWorkspace } from '../../stores/workspace'
 import type { Session } from '../../features/sessions/model'
+import { isBusy } from '../../integrations/agent/conversationProjection'
 import { Glass } from '../glass/Glass'
 import { IconButton } from '../ui/IconButton'
 
 export type SessionAction = { type: 'rename' | 'delete'; session: Session }
 
-export function Sidebar({ onSettings, onSessionAction }: {
+export function Sidebar({ onCreate, onSettings, onSessionAction }: {
+  onCreate: () => void
   onSettings: () => void
   onSessionAction: (action: SessionAction) => void
 }) {
   const sessions = useWorkspace((state) => state.sessions)
   const activeId = useWorkspace((state) => state.activeId)
-  const create = useWorkspace((state) => state.createSession)
+  const ready = useWorkspace((state) => state.host.state === 'ready')
   const select = useWorkspace((state) => state.selectSession)
   const toggle = useWorkspace((state) => state.toggleSidebar)
   const popover = useRef<HTMLDivElement>(null)
@@ -46,7 +48,7 @@ export function Sidebar({ onSettings, onSessionAction }: {
     <aside className="sidebar" aria-label="会话导航">
       <Glass variant="panel" material="frost" className="sidebar-glass" contentClassName="sidebar-content">
         <div className="sidebar-top">
-          <button className="new-session" onClick={create}>
+          <button className="new-session" onClick={onCreate} disabled={!ready}>
             <Plus size={17} /><span>新建会话</span><kbd>Ctrl N</kbd>
           </button>
           <div className="sidebar-label"><span>会话历史</span><span className="mono">{String(sessions.length).padStart(2, '0')}</span></div>
@@ -58,7 +60,7 @@ export function Sidebar({ onSettings, onSessionAction }: {
               <button className="session-select" onClick={() => select(session.id)} aria-current={session.id === activeId ? 'page' : undefined} title={session.title}>
                 <MessageSquare size={14} />
                 <span>{session.title}</span>
-                {session.turns.at(-1)?.status === 'running' && <i className="live-dot" aria-label="运行中" />}
+                {isBusy(session.turns.at(-1)?.status ?? session.latestStatus) && <i className="live-dot" aria-label="运行中" />}
               </button>
               <IconButton label={`${session.title}的会话操作`} className="session-more" aria-haspopup="dialog" onClick={(event) => openMenu(event, session.id)}>
                 <MoreHorizontal size={16} />
@@ -77,7 +79,7 @@ export function Sidebar({ onSettings, onSessionAction }: {
       <div className="session-popover" ref={popover} popover="auto" role="dialog" aria-label="会话操作">
         <Glass variant="popover" elevated contentClassName="session-menu">
           <button onClick={() => act('rename')}><Pencil size={14} />重命名</button>
-          <button className="danger-text" onClick={() => act('delete')}><Trash2 size={14} />删除会话</button>
+          <button onClick={() => act('delete')}><Trash2 size={14} />归档会话</button>
         </Glass>
       </div>
     </aside>

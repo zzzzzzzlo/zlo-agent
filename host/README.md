@@ -85,7 +85,11 @@ node --disable-warning=ExperimentalWarning --test test/host.test.ts test/cli.tes
 
 默认数据目录为 `%LOCALAPPDATA%\ZloAgent\fake` 或 `%LOCALAPPDATA%\ZloAgent\pi`。可用 `--data <目录>` 选择其他本地目录。数据目录须与工作区分离。SQLite 文件保存 Task、Attempt、命令、操作回执和事件，`sessions/` 保存 Pi JSONL。会话可能包含工作区内容，按本地私有数据管理。
 
-- Host 只并行执行一个根任务和它的一个只读 Worker。根任务每次恢复产生新 Attempt，Worker 的重启使用 Fresh Session。每个根任务最多八次 Attempt，Worker 每次运行最多八个模型请求及 60 秒，根 Agent 每段运行最多 32 个模型请求。
+- Host 只并行执行一个根任务和它的一个只读 Worker。显式停止后继续会创建新 Attempt。没有未确认副作用的进程中断恢复保留原 Attempt，Worker 的重启使用 Fresh Session。每个根任务最多八次 Attempt，Worker 每次运行最多八个模型请求及 60 秒，根 Agent 每段运行最多 32 个模型请求。
 - Root 工具限于有界 UTF-8 文本的列目录、读取、新建和唯一文本匹配替换。Worker 只有只读工具。Host API 可通过 Coding Profile 进一步关闭写工具或委派。目录边界和链接检查属于工具级权限，系统级沙箱尚未接入。工作区应由用户信任并选择。
 - 发生未知写入、会话损坏或停止超时，查看 `getHistory` 的原因、操作 ID、工具与目标路径。在本地核对文件现状后，可用新任务描述剩余工作。此版本没有自动解锁或回滚未知写入的命令。
 - SQLite 和 JSONL 各自有刷盘边界。断电跨存储原子性及 Windows 目录元数据的刷盘无法保证。中断期间尚未确认交付的说明可以再次进入上下文。
+
+## 桌面 Conversation
+
+桌面启动与用户操作见 [桌面手册](../ui/README.md)。[Sprint 4 桌面协议](../docs/11-desktop-protocol.md) 定义 `createConversation`、`getConversationHistory`、`sendMessage`、`steerConversation`、`stopConversation`、`resumeConversation` 与游标订阅。Host 保留既有 Task CLI，同时在 Conversation 上提供产品级历史。使用 `--faux` 可通过官方 Faux Provider 运行真实 Pi SDK 的离线开发场景。

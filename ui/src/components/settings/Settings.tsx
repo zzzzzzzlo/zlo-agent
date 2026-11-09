@@ -21,6 +21,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
   const strength = useWorkspace((state) => state.strength)
   const setTheme = useWorkspace((state) => state.setTheme)
   const setStrength = useWorkspace((state) => state.setStrength)
+  const mock = useWorkspace((state) => state.mock)
 
   return (
     <Modal title="设置" subtitle="工作区偏好" className="settings-modal" onClose={onClose}>
@@ -60,7 +61,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
         ) : (
           <section className="settings-content settings-about">
             <h3>Zlo Agent <span className="mono">v0.1.0</span></h3>
-            <p>个人 AI Agent 桌面工作区。当前为本地演示，所有回复与工具结果均为模拟。</p>
+            <p>{mock ? '个人 AI Agent 桌面工作区。当前启用了界面演示。' : '个人 AI Agent 桌面工作区。会话和执行记录由本地 Agent Host 保存。'}</p>
             <dl>
               <div><dt>新建会话</dt><dd><kbd>Ctrl N</kbd></dd></div>
               <div><dt>打开设置</dt><dd><kbd>Ctrl ,</kbd></dd></div>

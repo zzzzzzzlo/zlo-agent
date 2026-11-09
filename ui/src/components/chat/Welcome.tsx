@@ -1,14 +1,20 @@
-import { ArrowUpRight, Boxes, FileText, FlaskConical } from 'lucide-react'
+import { ArrowUpRight, Boxes, FileCode2, FileText, FlaskConical } from 'lucide-react'
 import { Glass } from '../glass/Glass'
 import { BrandMark } from '../ui/BrandMark'
 
-const examples = [
+const demoExamples = [
   { icon: FileText, title: '梳理一项任务', description: '把想法拆成行动步骤', prompt: '帮我把个人项目拆成几个可以执行的步骤。' },
   { icon: Boxes, title: '预览工具执行', description: '查看工具状态变化', prompt: '演示一次工具调用和状态变化。' },
   { icon: FlaskConical, title: '体验错误状态', description: '看看失败如何显示', prompt: '演示错误状态' },
 ]
 
-export function Welcome({ onPrompt }: { onPrompt: (text: string) => void }) {
+const examples = [
+  demoExamples[0],
+  { icon: Boxes, title: '了解工作区', description: '查看目录并梳理文件', prompt: '请列出工作区文件，并概述它们的用途。' },
+  { icon: FileCode2, title: '构思登录页面', description: '准备实现结构与验收步骤', prompt: '帮我设计一个简单登录页面的结构与验收步骤。' },
+]
+
+export function Welcome({ onPrompt, mock }: { onPrompt: (text: string) => void; mock: boolean }) {
   return (
     <div className="welcome">
       <div className="welcome-orbit">
@@ -22,7 +28,7 @@ export function Welcome({ onPrompt }: { onPrompt: (text: string) => void }) {
       <div className="examples">
         <div className="examples-caption"><span>试试这些示例</span><span className="mono">QUICK START</span></div>
         <div className="example-grid">
-          {examples.map(({ icon: Icon, title, description, prompt }) => (
+          {(mock ? demoExamples : examples).map(({ icon: Icon, title, description, prompt }) => (
             <button key={title} className="example" onClick={() => onPrompt(prompt)}>
               <span className="example-icon"><Icon size={17} strokeWidth={1.65} /></span>
               <ArrowUpRight className="example-arrow" size={14} />

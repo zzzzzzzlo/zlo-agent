@@ -9,6 +9,7 @@ import { ActivityPanel } from './components/layout/ActivityPanel'
 import { Sidebar } from './components/sidebar/Sidebar'
 import type { SessionAction } from './components/sidebar/Sidebar'
 import { SessionDialog } from './components/sidebar/SessionDialog'
+import { NewConversationDialog } from './components/sidebar/NewConversationDialog'
 import { ChatSurface } from './components/chat/ChatSurface'
 import { Composer } from './components/chat/Composer'
 import { Settings } from './components/settings/Settings'
@@ -17,10 +18,12 @@ export function App() {
   const theme = useWorkspace((state) => state.theme)
   const strength = useWorkspace((state) => state.strength)
   const sidebar = useWorkspace((state) => state.sidebar)
-  const createSession = useWorkspace((state) => state.createSession)
+  const initialize = useWorkspace((state) => state.initialize)
+  const hostState = useWorkspace((state) => state.host.state)
   const [activity, setActivity] = useState(false)
   const [settings, setSettings] = useState(false)
   const [sessionAction, setSessionAction] = useState<SessionAction>()
+  const [newConversation, setNewConversation] = useState(false)
   const [toast, setToast] = useState('')
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
 
@@ -34,23 +37,23 @@ export function App() {
     timer.current = setTimeout(() => setToast(''), 3300)
   }, [])
   useEffect(() => () => clearTimeout(timer.current), [])
+  useEffect(initialize, [initialize])
 
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
       if (event.isComposing || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return
-      if (event.key.toLowerCase() === 'n' && !settings && !sessionAction) {
+      if (event.key.toLowerCase() === 'n' && !settings && !sessionAction && !newConversation && hostState === 'ready') {
         event.preventDefault()
-        createSession()
-        document.getElementById('composer-input')?.focus()
+        setNewConversation(true)
       }
-      if (event.key === ',' && !sessionAction) {
+      if (event.key === ',' && !sessionAction && !newConversation) {
         event.preventDefault()
         setSettings(true)
       }
     }
     window.addEventListener('keydown', shortcut)
     return () => window.removeEventListener('keydown', shortcut)
-  }, [createSession, settings, sessionAction])
+  }, [hostState, settings, sessionAction, newConversation])
 
   return (
     <LiquiThemeProvider injectTokens={false} theme={{ glass: optics[strength] }}>
@@ -58,7 +61,7 @@ export function App() {
         <div className="window-backdrop" aria-hidden="true" />
         <TitleBar activity={activity} onActivity={() => setActivity((visible) => !visible)} notify={notify} />
         <div className="workspace">
-          {sidebar && <Sidebar onSettings={() => setSettings(true)} onSessionAction={setSessionAction} />}
+          {sidebar && <Sidebar onCreate={() => setNewConversation(true)} onSettings={() => setSettings(true)} onSessionAction={setSessionAction} />}
           <main className="chat-surface" aria-label="对话">
             <ChatSurface />
             <Composer notify={notify} />
@@ -70,6 +73,7 @@ export function App() {
         </div>
         {settings && <Settings onClose={() => setSettings(false)} />}
         {sessionAction && <SessionDialog action={sessionAction} onClose={() => setSessionAction(undefined)} />}
+        {newConversation && <NewConversationDialog onClose={() => setNewConversation(false)} />}
       </div>
     </LiquiThemeProvider>
   )

@@ -11,13 +11,15 @@
 ## 状态和数据流
 
 ```text
-React UI → Zustand actions → AgentAdapter → MockAgentAdapter
-React UI ← Zustand state   ← AgentEvent   ← MockAgentAdapter
+React / Zustand → HostAgentAdapter → Sandbox Preload → Electron Main
+                                                     ↕ JSONL
+                                                  Agent Host
+                                          ↙ SQLite           ↘ Pi Session
 ```
 
-`src/stores/workspace.ts` 管理会话、每会话草稿、活动会话和外观。持久层使用带版本键的 localStorage，保存会话和外观；每轮开始与结束时写入，流式增量在内存中合并。再次打开时，上次未结束的运行显示为已取消。草稿和活动面板开关属于当前窗口。
+`src/stores/workspace.ts` 维护选中的 Conversation、草稿、窗口偏好及 Host 数据的展示投影。业务状态、历史及事件游标由 Host 提供。Renderer 使用快照与增量恢复显示，localStorage 保存 UI 偏好和草稿。工具卡片与活动栏读取同一投影。
 
-每条消息增量、工具更新和结束事件带 `sessionId` 与 `runId`。切换会话仍能保留原会话的运行状态。删除会话时先移除本地状态，再取消该会话的活动运行，迟到事件会被忽略。Tool 卡片和活动栏读取同一份数据。
+主进程管理 Host 进程、请求相关性和截止时间。Preload 公开有限的业务方法，主进程验证事件来源和输入。工作区通过本地目录选择器授权。生产模式不需要 Renderer 网络连接。
 
 ## Liqui Design
 

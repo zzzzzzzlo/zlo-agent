@@ -1,4 +1,4 @@
-# Local-first 通用 Agent · 首轮开发包 v0.1
+# Zlo Agent · Local-first 桌面 Coding Agent
 
 **项目定位**：通用 Agent 架构，首个落地场景为 Windows 本地 Coding Agent。基于 Pi，不改写 Pi Agent Loop。首轮目标是让一个真实、可恢复、可观测的任务执行闭环跑通，而不是一口气实现最终全部模块。
 
@@ -30,6 +30,6 @@
 
 > 注：接口应预留，但**不可**声称缺失的沙箱或权限能力已经提供了安全保障。高风险工具默认拒绝/受限执行。
 
-## 可运行的首轮 Host
+## 当前桌面版
 
-从 [Host 使用手册](host/README.md) 启动 CLI，或查看 [开发里程碑与验收记录](docs/10-sprint-execution.md)。仓库中的 `ui/` 是独立 Electron 原型，当前仍使用它自己的 Mock Adapter。
+桌面版由 Electron 自动启动本地 Agent Host。支持多轮对话、工具和用量事件、停止、追加指令与重启恢复。参阅 [桌面启动](ui/README.md)、[Host CLI](host/README.md)、[Sprint 4 接口与事件](docs/11-desktop-protocol.md) 和 [Sprint 4 验收](docs/12-sprint4-verification.md)。首轮记录仍可在 [Sprint 0–3](docs/10-sprint-execution.md) 查阅。

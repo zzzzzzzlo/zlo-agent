@@ -1,12 +1,42 @@
-import { join } from 'node:path'
+import { mkdirSync } from 'node:fs'
+import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import { app, BrowserWindow, ipcMain, session } from 'electron'
 import type { IpcMainInvokeEvent } from 'electron'
 import { windowChannels } from '../window-api'
+import { localDirectory } from './agent-input.ts'
+import { registerAgentIpc } from './agent-ipc.ts'
+import { HostProcessManager, spawnAgentHost } from './host-process.ts'
+
+const developmentData = app.isPackaged ? undefined : process.env.ZLO_AGENT_DESKTOP_DATA
+if (developmentData && localDirectory(developmentData)) {
+  mkdirSync(developmentData, { recursive: true })
+  app.setPath('userData', resolve(developmentData))
+}
+
+const hostMode = !app.isPackaged && process.env.ZLO_AGENT_DESKTOP_MODE === 'faux' ? 'faux' : 'pi'
+const hostRoot = app.isPackaged ? join(process.resourcesPath, 'agent-host') : resolve(app.getAppPath(), '../host')
+const userData = app.getPath('userData')
+const defaultWorkspace = join(userData, 'workspace')
+const host = new HostProcessManager({
+  mode: hostMode,
+  spawnChild() {
+    mkdirSync(defaultWorkspace, { recursive: true })
+    return spawnAgentHost({
+      executable: process.execPath, root: hostRoot,
+      data: join(userData, 'agent-data', hostMode), defaultWorkspace, mode: hostMode,
+    })
+  },
+})
 
 const rendererFile = join(__dirname, '../renderer/index.html')
-const devUrl = app.isPackaged ? undefined : process.env.ELECTRON_RENDERER_URL
-const rendererUrl = new URL(devUrl ?? pathToFileURL(rendererFile).href)
+const devUrl = app.isPackaged || !process.env.ELECTRON_RENDERER_URL
+  ? undefined : new URL(process.env.ELECTRON_RENDERER_URL)
+if (devUrl && (!['http:', 'https:'].includes(devUrl.protocol)
+  || !['localhost', '127.0.0.1', '[::1]'].includes(devUrl.hostname))) {
+  throw new Error('Renderer development server must use a loopback address')
+}
+const rendererUrl = devUrl ?? pathToFileURL(rendererFile)
 const supportsDesktopAcrylic = process.platform === 'win32'
   && Number(process.getSystemVersion().split('.')[2]) >= 22621
 
@@ -14,7 +44,7 @@ function windowFor(event: IpcMainInvokeEvent) {
   const sender = event.senderFrame
   const window = BrowserWindow.fromWebContents(event.sender)
   if (!window || sender !== event.sender.mainFrame || sender?.url !== rendererUrl.href) {
-    throw new Error('Invalid window control sender')
+    throw new Error('Invalid IPC sender')
   }
   return window
 }
@@ -60,7 +90,12 @@ app.whenReady().then(() => {
     if (window.isMaximized()) window.unmaximize()
     else window.maximize()
   })
+  registerAgentIpc({
+    host, windowFor, rendererUrl: rendererUrl.href,
+    protectedPaths: app.isPackaged ? [userData, process.resourcesPath] : [userData],
+  })
 
+  void host.start()
   createWindow()
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -68,3 +103,18 @@ app.whenReady().then(() => {
 })
 
 app.on('window-all-closed', () => app.quit())
+
+let quitting = false
+let hostClosed = false
+app.on('before-quit', (event) => {
+  if (hostClosed) return
+  event.preventDefault()
+  if (quitting) return
+  quitting = true
+  void host.shutdown().catch(() => {
+    console.error('Agent Host did not exit within the shutdown deadline.')
+  }).finally(() => {
+    hostClosed = true
+    app.quit()
+  })
+})

@@ -1,5 +1,7 @@
 # Windows 验证记录
 
+此页保留 Mock 原型的历史验证。当前桌面版见 [Sprint 4 验收记录](../../docs/12-sprint4-verification.md)。
+
 环境为 Windows 11（Build 26200，125% 缩放）、Node.js 24.15.0、Electron 43.4.1。使用独立测试配置目录，实际启动开发窗口和生产渲染器。
 
 | 项目 | 结果 |

@@ -1,45 +1,46 @@
-# Zlo Agent
+# Zlo Agent 桌面版
 
-面向 Windows 的个人 AI Agent 桌面客户端首版。窗口默认采用浅色黑白灰配色和磨砂透景，Windows 11 22H2 及以上通过系统亚克力模糊后方窗口。通过内置 Mock 会话体验发送、流式回复、工具状态和停止操作。所有演示都在本地完成，无需模型密钥或配套服务。
+面向 Windows x64 的本地 Coding Agent。Electron 自动启动独立 Agent Host，通过受限 IPC 提交命令和接收事件。对话、Pi Session 和任务记录保存在本机。
 
 ## 安装与启动
 
-UI 是主工作目录下的独立 `ui/` 包。需要 Windows 10/11（x64）、Node.js 22.12+ 或 24+（x64）和 npm。从主工作目录启动时，先进入 UI 包：
+从仓库根目录使用 Node.js 24 和 npm。
 
 ```powershell
-cd .\ui
-npm ci
-npm run dev
+npm.cmd ci --prefix host --ignore-scripts
+npm.cmd ci --prefix ui
+Set-Location .\ui
+npm.cmd run dev
 ```
 
-首次启动可能需要下载 Electron 二进制。开发命令会启动可拖动和缩放的 Electron 窗口。构建与运行生产版本可使用以下命令。
+正式桌面模式使用 Pi v1.5.0。先在启动 Electron 的环境中配置官方 Provider 的凭证，再在新建会话时输入 Provider 与模型 ID。受支持的环境变量为 `OPENAI_API_KEY`、`ANTHROPIC_API_KEY`（或 `ANTHROPIC_AUTH_TOKEN`）、`GEMINI_API_KEY` 和 `DEEPSEEK_API_KEY`。也可用 `ZLO_AGENT_MODEL_PROVIDER` 与 `ZLO_AGENT_MODEL_ID` 设置新会话的默认路由。应用使用系统环境读取凭证。
 
 ```powershell
-npm run typecheck
-npm run build
-npm start
+npm.cmd run build
+npm.cmd start
+npm.cmd run pack:win
 ```
 
-### Windows 便携版
+`pack:win` 会构建 Windows x64 便携版并输出到 `release/`。安装包附带 Host 生产依赖和 Electron 内置 Node。用户配置和 SQLite 位于 Electron 的 `userData`，其中 `agent-data/pi` 保存正式会话，`workspace` 是普通对话的默认只读工作区。
+
+## 使用
+
+- 新建会话时可指定模型。Coding 会话还需通过系统选择器指定工作区，并填入相对验收文件。可以附加必含文本。只读对话用有内容的模型回复作为执行检查。
+- Enter 发送，Shift + Enter 换行。运行中可以追加指令或停止。任务完成后，在原会话发送新消息会创建新 Task 并继续使用原 Pi Session。
+- 活动面板显示工具、状态与 Token 用量。停止完成后可以恢复。未知写入会单独显示为待核对状态。
+- 重启应用会加载 Host 中的对话历史。会话菜单支持重命名和归档。外观、当前选择及草稿保存在本地 UI 偏好。
+
+## 开发验收
 
 ```powershell
-npm run pack:win
+npm.cmd test
+npm.cmd run test:desktop
 ```
 
-打包输出到 UI 包内的 `release/`。现有最新版是 [圆角便携版](release/Zlo-Agent-0.1.0-win-x64-rounded-portable.exe)，双击即可启动。便携版会把程序解压到临时目录运行。外观偏好与演示会话保存在当前 Windows 用户的 Electron 配置目录。
+桌面自动化测试用官方 Faux Provider 驱动真实 Electron 与 Pi SDK。也可手动设置 `ZLO_AGENT_DESKTOP_MODE=faux` 后运行未打包的 Electron。开发服务器上的独立 Mock 演示可用 `VITE_ZLO_AGENT_MODE=mock` 显式开启。
 
-## 界面操作
-
-- 左侧可新建、切换会话。在会话右端打开菜单可以重命名或删除。使用标题栏按钮收起、展开侧栏。
-- 在欢迎页选一个示例即可填入输入框。Enter 发送，Shift + Enter 换行。回复生成时，输入框右侧切换为停止按钮。
-- 发送「演示错误状态」会展示模拟失败。发送其它文本会依次看到工具运行、完成和流式回复。点开工具卡片可查看演示详情。
-- 标题栏右侧可打开活动面板。模型和附件入口会说明当前接入状态。
-- Ctrl + N 新建会话，Ctrl + , 打开设置。设置中提供深色、浅色和三档玻璃强度，同时控制后方桌面的显现程度。
-
-## 文档
-
-- [实施计划](docs/implementation-plan.md)
-- [架构与 Liqui Design 用法](docs/architecture.md)
-- [Pi Agent 接入指南](docs/integration-guide.md)
-- [Windows 验证记录](docs/verification.md)
+- [窗口、IPC 和数据流](docs/architecture.md)
+- [桌面接入指南](docs/integration-guide.md)
+- [共享协议](../docs/11-desktop-protocol.md)
+- [验收与代码审查](../docs/12-sprint4-verification.md)
 - [许可和第三方说明](THIRD-PARTY-NOTICES.md)

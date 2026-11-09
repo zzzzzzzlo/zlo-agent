@@ -52,3 +52,7 @@ V0：模块化单体 `Local Agent Host` + 解耦 UI（终端 CLI 或 localhost W
 3. 第一阶段先做可运行的 compatibility spike，比对是否保持现有 Coding Tool/Extension/Session 功能、恢复语义及迁移成本，再给出 ADR 选择：采用 durable（必须锁版本+适配层）或稳定 SDK + 独立 TaskStore。
 
 原则：不因为上游已有 Task Graph 就在应用层重复造第二个“权威 Task 状态”，如果选 durable，明确是以 durable task records 为存储底座，应用层只封装业务 DAG/验收；如果选稳定 SDK，则自建可持久化 TaskEngine。
+
+## Sprint 4 桌面进程与身份边界
+
+当前主入口是 Electron → Preload → Main → JSONL → LocalAgentHost。Conversation Service 拥有长期对话、消息和历史视图。Task Engine 拥有业务 Task、稳定 TaskRun 及 Attempt。Orchestrator 拥有 AgentRun 与 Pi Session 引用。Renderer 消费统一快照与事件，领域状态及历史由 Host 保存。详见 [桌面协议](11-desktop-protocol.md) 和 [运行架构](../diagrams/system.mmd)。

@@ -1,33 +1,22 @@
 flowchart TD
-    USER[User] --> UI[Local UI / CLI]
-    UI -->|commands| CMD[Host Command API]
-    CMD --> TE[Task Engine / Dynamic DAG]
-    TE <-->|plan, escalation| ROOT[Root Supervisor / Pi Agent]
-    TE -->|ready work| ORCH[Multi-Agent Orchestrator]
-    ROOT -->|propose delegation| ORCH
-    ORCH --> AT[Agent Tree / Team Manager]
-    ORCH --> CC[Convergence Controller]
-    ORCH --> CB[Context Builder]
-    ORCH --> MS[Model Resource Scheduler]
-    CB --> MEM[Memory Core port]
-    CB --> ART[ArtifactStore]
-    CB --> TE
-    MS --> REG[Model Registry / Quota + Budget]
-    ORCH --> EX[Agent Execution / Pi SDK Adapter]
-    CB --> EX
-    MS --> EX
-    EX --> TOOL[Tool Gateway / Capability Gate]
-    TOOL --> WS[Workspace + Sandbox Port]
-    EX --> VE[Verification]
-    VE -->|verified outcome| TE
-    J[Judgment Kernel / rule + Jev shadow] -.-> ORCH
-    J -.-> CB
-    J -.-> MS
-    EX --> EB[(Durable event / outbox)]
-    TE --> EB
-    ORCH --> EB
-    MEM --> EB
-    MS --> EB
-    EB --> UI
-    EB --> OBS[Observability / Evaluation]
-    OBS -.->|versioned performance profile, optional| REG
+    USER[Windows user] --> UI[React and Zustand projection]
+    UI <-->|typed business methods| PRE[Sandboxed Preload]
+    PRE <-->|validated IPC| MAIN[Electron Main and Host Process Manager]
+    MAIN <-->|versioned JSONL| HOST[Local Agent Host]
+    CLI[CLI] <-->|versioned JSONL| HOST
+    HOST --> CONV[Conversation Service]
+    HOST --> TASK[Task Engine]
+    CONV -->|atomic message and task binding| SQL[(SQLite WAL)]
+    TASK -->|TaskRun, Attempt, receipts and events| SQL
+    HOST --> ORCH[Multi-Agent Orchestrator]
+    ORCH --> ROOT[Root AgentRun]
+    ROOT -->|bounded delegation| WORKER[Read-only Worker AgentRun]
+    ORCH --> CONTEXT[Scoped Context Package]
+    ROOT --> PI[Pi SDK]
+    WORKER --> PI
+    PI --> SESSION[(Pi JSONL sessions)]
+    PI --> TOOLS[Capability and Workspace Tools]
+    HOST --> VERIFY[Deterministic Verification]
+    SQL -->|history and cursor events| CONV
+    CONV -->|durable conversation stream| HOST
+    SQL -.-> OBS[Read-only observation]

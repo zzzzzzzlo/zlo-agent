@@ -1,18 +1,21 @@
 {
   "name": "zlo-agent",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
-  "description": "A local desktop workspace for previewing Agent conversations",
+  "description": "A local desktop workspace for Zlo Agent",
   "author": "Zlo Agent contributors",
   "license": "MIT",
   "main": "./out/main/index.js",
-  "engines": { "node": "^22.12.0 || >=24.0.0" },
+  "engines": { "node": ">=24" },
   "scripts": {
     "dev": "electron-vite dev",
     "start": "electron-vite preview",
     "typecheck": "tsc --noEmit",
+    "test": "node --test test/*.test.ts",
+    "test:desktop": "npm run build && node --test test/desktop-e2e.test.mjs",
     "build": "npm run typecheck && electron-vite build",
-    "pack:win": "npm run build && node -e \"require('electron')\" && electron-builder --win portable --publish never --config.electronDist=node_modules/electron/dist"
+    "stage:host": "node electron/scripts/stage-host.mjs",
+    "pack:win": "npm run build && npm run stage:host && node -e \"require('electron')\" && electron-builder --win portable --publish never --config.electronDist=node_modules/electron/dist"
   },
   "dependencies": {
     "@liqui-design/glass": "0.5.0",
@@ -30,6 +33,7 @@
     "electron": "43.4.1",
     "electron-builder": "^26.15.3",
     "electron-vite": "^4.0.0",
+    "playwright-core": "1.65.0",
     "tailwindcss": "^4.1.0",
     "typescript": "~5.9.3",
     "vite": "^7.3.0"
@@ -39,6 +43,19 @@
     "productName": "Zlo Agent",
     "directories": { "output": "release" },
     "files": ["out/main/**/*", "out/preload/**/*", "out/renderer/**/*", "resources/icon.png", "LICENSE", "THIRD-PARTY-NOTICES.md", "licenses/**/*"],
+    "afterPack": "electron/scripts/check-host-bundle.cjs",
+    "extraResources": [
+      {
+        "from": "out/agent-host",
+        "to": "agent-host",
+        "filter": ["package.json", "src/**/*"]
+      },
+      {
+        "from": "out/agent-host/node_modules",
+        "to": "agent-host/node_modules",
+        "filter": ["**/*", "!.bin{,/**/*}", "!.package-lock.json"]
+      }
+    ],
     "win": {
       "icon": "resources/icon.png",
       "target": [{ "target": "portable", "arch": ["x64"] }],
