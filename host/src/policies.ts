@@ -1,4 +1,5 @@
-import type { AgentExecution, ModelRoute } from './execution.ts'
+import type { AgentExecution } from './execution.ts'
+import type { ContextPackage, ModelRoute } from './contracts/domain.ts'
 
 export interface ModelResourceScheduler {
   validateRoute(route: ModelRoute): Promise<void>
@@ -36,16 +37,19 @@ export class LocalModelScheduler implements ModelResourceScheduler {
 }
 
 export interface ContextBuilder {
-  worker(goal: string): string
+  worker(context: ContextPackage): string
 }
 
 export class LocalContextBuilder implements ContextBuilder {
-  worker(goal: string): string {
+  worker(context: ContextPackage): string {
     return [
       'Investigate this scoped task in the supplied workspace using the read-only tools.',
       'Return a concise factual summary with relative file references and remaining risks.',
-      'Task goal:',
-      goal,
+      'Task goal: ' + context.goal,
+      'Constraints: ' + context.constraints.join(' '),
+      'Available tools: ' + context.availableTools.join(', '),
+      'Model request budget: ' + context.maxModelRequests,
+      ...(context.artifactRefs.length ? ['Relevant workspace artifacts: ' + context.artifactRefs.join(', ')] : []),
     ].join('\n')
   }
 }

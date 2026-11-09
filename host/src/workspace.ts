@@ -4,9 +4,9 @@ import type { Stats } from 'node:fs'
 import { lstat, open, opendir, realpath, rename, unlink } from 'node:fs/promises'
 import { dirname, join, relative, resolve } from 'node:path'
 import type { ExecutionTool } from './execution.ts'
+import type { VerificationCheck, VerificationResult } from './contracts/domain.ts'
 
-export type VerificationCheck = { path: string; contains?: string }
-export type VerificationResult = { passed: boolean; evidence: string }
+export type { VerificationCheck, VerificationResult } from './contracts/domain.ts'
 export type WorkspaceTool = ExecutionTool & { effect: 'read' | 'write' }
 export interface Verifier {
   verify(check: VerificationCheck, signal?: AbortSignal): Promise<VerificationResult>

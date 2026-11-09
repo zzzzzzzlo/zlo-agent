@@ -138,7 +138,9 @@ test('crash after a write and before its receipt blocks replay even with a saved
     assert.equal(readFileSync(join(cwd, 'artifact.txt'), 'utf8'), 'written once\n')
     const events = host.events(taskId)
     assert.equal(events.filter((event) => event.type === 'tool.started').length, 1)
-    assert.equal(events.some((event) => event.type === 'tool.finished' || event.type === 'task.stopped'), false)
+    assert.equal(events.some((event) => event.type === 'task.stopped'), false)
+    assert.deepEqual(events.filter((event) => event.type === 'tool.finished').map(({ payload }) => payload.status),
+      ['unknown_effect'])
     assert.deepEqual(events.find((event) => event.type === 'operation.reconciliation_required')?.payload.operationIds,
       [operations[0]?.id])
     assert.deepEqual(host.resume(taskId, 'unsafe-resume'), { accepted: false, status: 'needs_reconciliation' })

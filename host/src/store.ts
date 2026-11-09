@@ -2,28 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
+import type { AgentEvent, EventDraft } from './contracts/domain.ts';
 
-export interface EventDraft {
-  taskId: string;
-  type: string;
-  taskRunId?: string;
-  taskNodeId?: string;
-  taskAttemptId?: string;
-  agentId?: string;
-  agentRunId?: string;
-  sessionId?: string;
-  parentAgentRunId?: string;
-  correlationId?: string;
-  causationId?: string;
-  payload: Record<string, unknown>;
-}
-
-export interface AgentEvent extends EventDraft {
-  schemaVersion: 1;
-  id: string;
-  seq: number;
-  occurredAt: string;
-}
+export type { AgentEvent, EventDraft } from './contracts/domain.ts';
 
 type EventSink = (event: AgentEvent) => void | Promise<void>;
 
@@ -43,6 +24,7 @@ export class LocalStore {
   readonly #db: DatabaseSync;
   readonly #writerLock: DatabaseSync | undefined;
   readonly #subscriptions = new Map<string, Set<Subscription>>();
+  readonly #projectors = new Set<(event: AgentEvent) => void>();
   #changedTasks: Set<string> | undefined;
 
   constructor(databasePath: string) {
@@ -75,6 +57,7 @@ export class LocalStore {
       for (const subscription of subscriptions) subscription.active = false;
     }
     this.#subscriptions.clear();
+    this.#projectors.clear();
     this.#db.close();
     this.#writerLock?.close();
   }
@@ -116,6 +99,12 @@ export class LocalStore {
       .map((row) => JSON.parse(row.value as string) as T);
   }
 
+  listBefore<T>(namespace: string, before: string | null, limit: number): T[] {
+    return this.#db.prepare(`
+      SELECT value FROM records WHERE namespace = ? AND (? IS NULL OR id < ?) ORDER BY id DESC LIMIT ?
+    `).all(namespace, before, before, limit).map((row) => JSON.parse(row.value as string) as T);
+  }
+
   put(namespace: string, id: string, value: unknown): void {
     this.#requireTransaction();
     this.#db.prepare(`
@@ -124,20 +113,32 @@ export class LocalStore {
     `).run(namespace, id, encode(value));
   }
 
-  append(draft: EventDraft): AgentEvent {
+  append(draft: EventDraft, streamId = draft.taskId): AgentEvent {
     const changedTasks = this.#requireTransaction();
-    const row = this.#db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE task_id = ?').get(draft.taskId);
     const event: AgentEvent = {
       ...draft,
       schemaVersion: 1,
       id: randomUUID(),
-      seq: Number(row?.seq) + 1,
+      seq: this.eventCursor(streamId) + 1,
       occurredAt: new Date().toISOString(),
     };
     this.#db.prepare('INSERT INTO events(task_id, seq, id, event) VALUES (?, ?, ?, ?)')
-      .run(event.taskId, event.seq, event.id, encode(event));
-    changedTasks.add(event.taskId);
+      .run(streamId, event.seq, event.id, encode(event));
+    changedTasks.add(streamId);
+    if (streamId === draft.taskId) {
+      for (const project of this.#projectors) project(event);
+    }
     return event;
+  }
+
+  eventCursor(streamId: string): number {
+    const row = this.#db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE task_id = ?').get(streamId);
+    return Number(row?.seq);
+  }
+
+  /** Project primary events inside their write transaction. Projections write to separate streams. */
+  projectEvents(project: (event: AgentEvent) => void): void {
+    this.#projectors.add(project);
   }
 
   events(taskId: string, after = 0): AgentEvent[] {

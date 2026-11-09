@@ -1,13 +1,8 @@
 import { randomUUID } from 'node:crypto'
-import type { ModelRoute } from './execution.ts'
-import type { LocalStore, EventDraft } from './store.ts'
-import type { VerificationCheck, VerificationResult } from './workspace.ts'
+import type { EndReason, EventDraft, ModelRoute, TaskStatus, VerificationCheck, VerificationResult } from './contracts/domain.ts'
+import type { LocalStore } from './store.ts'
 
-export type TaskStatus = 'ready' | 'running' | 'verifying' | 'succeeded' | 'failed' |
-  'blocked' | 'stop_requested' | 'stopping' | 'stopped' | 'needs_reconciliation'
-export type EndReason = 'user_stop' | 'host_shutdown' | 'process_interrupted' | 'model_error' |
-  'model_interrupted' | 'runtime_error' | 'verification_failed' | 'unknown_effect' | 'checkpoint_error' |
-  'stop_timeout' | 'budget_exhausted'
+export type { EndReason, TaskStatus } from './contracts/domain.ts'
 export interface WorkerResult {
   resultStatus: 'succeeded' | 'failed'
   summary: string
@@ -27,10 +22,12 @@ export interface WorkerNode {
 export interface TaskSnapshot {
   schemaVersion: 1
   id: string
+  taskRunId: string
+  conversationId?: string
   rootNodeId: string
   goal: string
   cwd: string
-  check: VerificationCheck
+  check?: VerificationCheck
   status: TaskStatus
   attemptId?: string
   attemptCount: number
@@ -46,9 +43,11 @@ export interface Attempt {
   schemaVersion: 1
   id: string
   taskId: string
+  taskRunId: string
   nodeId: string
   startedAt: string
   finishedAt?: string
+  recoveries?: number
   status: 'running' | 'succeeded' | 'failed' | 'interrupted' | 'unknown_effect'
   reason?: EndReason
 }
@@ -56,18 +55,25 @@ export interface Operation {
   schemaVersion: 1
   id: string
   taskId: string
+  taskRunId: string
   attemptId: string
+  agentRunId?: string
+  agentId?: string
+  sessionId?: string
+  taskNodeId?: string
+  parentAgentRunId?: string
   tool: string
   effect: 'read' | 'write'
   target?: string
-  status: 'started' | 'succeeded' | 'failed' | 'unknown_effect'
+  status: 'started' | 'succeeded' | 'failed' | 'interrupted' | 'unknown_effect'
 }
 export interface CreateTask {
   requestId: string
   goal: string
   cwd: string
-  check: VerificationCheck
+  check?: VerificationCheck
   route?: ModelRoute
+  conversationId?: string
 }
 
 const edges: Record<TaskStatus, TaskStatus[]> = {
@@ -106,7 +112,22 @@ function serialize(value: unknown): string {
 
 export class TaskEngine {
   readonly #db: LocalStore
-  constructor(db: LocalStore) { this.#db = db }
+  constructor(db: LocalStore) {
+    this.#db = db
+    const legacy = this.list().filter((task) => !task.taskRunId)
+    if (legacy.length) this.#db.transaction(() => {
+      const runs = new Map(legacy.map((task) => [task.id, randomUUID()]))
+      for (const task of legacy) this.#save({ ...task, taskRunId: runs.get(task.id)! })
+      for (const attempt of this.#db.list<Attempt>('attempts')) {
+        const taskRunId = runs.get(attempt.taskId)
+        if (taskRunId) this.#db.put('attempts', attempt.id, { ...attempt, taskRunId })
+      }
+      for (const operation of this.#db.list<Operation>('operations')) {
+        const taskRunId = runs.get(operation.taskId)
+        if (taskRunId) this.#db.put('operations', operation.id, { ...operation, taskRunId })
+      }
+    })
+  }
 
   get(taskId: string): TaskSnapshot {
     const snapshot = this.#db.get<TaskSnapshot>('tasks', taskId)
@@ -148,7 +169,7 @@ export class TaskEngine {
 
   #event(task: TaskSnapshot, type: string, payload: Record<string, unknown>, correlationId?: string): void {
     this.#db.append({
-      taskId: task.id, taskRunId: task.attemptId, taskAttemptId: task.attemptId,
+      taskId: task.id, taskRunId: task.taskRunId, taskAttemptId: task.attemptId,
       taskNodeId: task.rootNodeId, type, payload, correlationId,
     })
   }
@@ -161,16 +182,18 @@ export class TaskEngine {
     return next
   }
 
-  create(command: CreateTask): { taskId: string } {
+  create(command: CreateTask, onCreated?: (task: TaskSnapshot) => void): { taskId: string } {
     return this.#command(command.requestId, ['create', command], () => {
       const task: TaskSnapshot = {
-        schemaVersion: 1, id: randomUUID(), rootNodeId: randomUUID(), cwd: command.cwd,
+        schemaVersion: 1, id: randomUUID(), taskRunId: randomUUID(), rootNodeId: randomUUID(), cwd: command.cwd,
+        conversationId: command.conversationId,
         goal: checkText(command.goal, 'goal', 16000),
-        check: { path: checkText(command.check.path, 'verification path', 512), contains: command.check.contains },
+        check: command.check && { path: checkText(command.check.path, 'verification path', 512), contains: command.check.contains },
         route: command.route, status: 'ready', attemptCount: 0, instructions: [], planVersion: 0,
       }
-      if (command.check.contains !== undefined) checkText(command.check.contains, 'verification text', 16000)
+      if (command.check?.contains !== undefined) checkText(command.check.contains, 'verification text', 16000)
       this.#save(task)
+      onCreated?.(task)
       this.#event(task, 'task.created', { status: task.status }, command.requestId)
       return { taskId: task.id }
     })
@@ -179,24 +202,27 @@ export class TaskEngine {
   start(taskId: string): TaskSnapshot {
     return this.#db.transaction(() => {
       const task = this.get(taskId)
-      const attemptId = randomUUID()
-      const started = this.#transition({ ...task, attemptId, attemptCount: task.attemptCount + 1 }, 'running')
-      const attempt: Attempt = {
-        schemaVersion: 1, id: attemptId, taskId, nodeId: task.rootNodeId,
+      const recovered = task.attemptId ? this.#db.get<Attempt>('attempts', task.attemptId) : undefined
+      const reuse = recovered?.status === 'interrupted' && recovered.reason === 'process_interrupted'
+      const attempt: Attempt = reuse ? {
+        ...recovered, status: 'running', reason: undefined, finishedAt: undefined, recoveries: (recovered.recoveries ?? 0) + 1,
+      } : {
+        schemaVersion: 1, id: randomUUID(), taskId, taskRunId: task.taskRunId, nodeId: task.rootNodeId,
         startedAt: new Date().toISOString(), status: 'running',
       }
-      this.#db.put('attempts', attemptId, attempt)
-      return started
+      this.#db.put('attempts', attempt.id, attempt)
+      return this.#transition({ ...task, attemptId: attempt.id, attemptCount: task.attemptCount + (reuse ? 0 : 1) }, 'running')
     })
   }
 
-  addInstruction(taskId: string, requestId: string, text: string): { accepted: true } {
+  addInstruction(taskId: string, requestId: string, text: string, onAccepted?: () => void): { accepted: true } {
     return this.#command(requestId, ['instruction', taskId, text], () => {
       const task = this.get(taskId)
       if (!['ready', 'running', 'verifying', 'stopped', 'blocked'].includes(task.status)) throw new Error('Task does not accept instructions')
       if (task.instructions.length >= 64) throw new Error('Instruction limit reached')
       task.instructions.push({ id: requestId, text: checkText(text, 'instruction', 8000), delivered: false })
       this.#save(task)
+      onAccepted?.()
       this.#event(task, 'task.instruction_added', {}, requestId)
       return { accepted: true }
     })
@@ -244,14 +270,18 @@ export class TaskEngine {
   resume(taskId: string, requestId: string, checkpointAvailable = true): { accepted: boolean; status: TaskStatus } {
     return this.#command(requestId, ['resume', taskId], () => {
       const task = this.get(taskId)
-      if (!canTransition(task.status, 'ready') || task.attemptCount >= 8) return { accepted: false, status: task.status }
+      const retainAttempt = task.reason === 'process_interrupted' && Boolean(task.attemptId)
+      if (!canTransition(task.status, 'ready') || (!retainAttempt && task.attemptCount >= 8)) {
+        return { accepted: false, status: task.status }
+      }
       if (!checkpointAvailable) {
         this.#event(task, 'operation.reconciliation_required', { operationIds: [], reason: 'checkpoint_error' })
         const blocked = this.#finish(task, 'needs_reconciliation', 'checkpoint_error')
         return { accepted: false, status: blocked.status }
       }
       const next = this.#transition({
-        ...task, stopIntent: undefined, reason: undefined, attemptId: undefined, verification: undefined,
+        ...task, stopIntent: undefined, reason: undefined,
+        attemptId: retainAttempt ? task.attemptId : undefined, verification: undefined,
       }, 'ready', 'task.resumed', requestId)
       return { accepted: true, status: next.status }
     })
@@ -292,7 +322,8 @@ export class TaskEngine {
       }
       const id = randomUUID()
       const attempt: Attempt = {
-        schemaVersion: 1, id, taskId, nodeId, startedAt: new Date().toISOString(), status: 'running',
+        schemaVersion: 1, id, taskId, taskRunId: task.taskRunId, nodeId,
+        startedAt: new Date().toISOString(), status: 'running',
       }
       this.#save({ ...task, worker: { ...task.worker, attemptId: id, status: 'running' } })
       this.#db.put('attempts', id, attempt)
@@ -307,7 +338,7 @@ export class TaskEngine {
       this.#save({ ...task, worker: { ...task.worker, status: result?.resultStatus ?? 'ready', result } })
       this.#finishAttempt(task.worker.attemptId, result?.resultStatus ?? 'interrupted')
       this.#db.append({
-        taskId, taskRunId: task.attemptId, taskNodeId: nodeId, taskAttemptId: task.worker.attemptId,
+        taskId, taskRunId: task.taskRunId, taskNodeId: nodeId, taskAttemptId: task.worker.attemptId,
         type: 'task.worker_settled', payload: { status: result?.resultStatus ?? 'interrupted' },
       })
     })
@@ -319,7 +350,10 @@ export class TaskEngine {
       if (task.status !== 'running' || !task.attemptId) throw new Error('Task is not accepting tool work')
       if (this.#db.get('operations', id)) throw new Error('Duplicate tool call')
       const operation: Operation = {
-        schemaVersion: 1, id, taskId, attemptId: event.taskAttemptId ?? task.attemptId, tool, effect, target, status: 'started',
+        schemaVersion: 1, id, taskId, taskRunId: task.taskRunId, attemptId: event.taskAttemptId ?? task.attemptId,
+        agentRunId: event.agentRunId, agentId: event.agentId, sessionId: event.sessionId,
+        taskNodeId: event.taskNodeId, parentAgentRunId: event.parentAgentRunId,
+        tool, effect, target, status: 'started',
       }
       this.#db.put('operations', id, operation)
       this.#db.append({ ...event, type: 'tool.started', payload: { id, tool, effect } })
@@ -368,7 +402,14 @@ export class TaskEngine {
         operation.effect === 'write' && (operation.status === 'started' || operation.status === 'unknown_effect'))
       for (const operation of this.operations(taskId)) {
         if (operation.status !== 'started') continue
-        this.#db.put('operations', operation.id, { ...operation, status: operation.effect === 'write' ? 'unknown_effect' : 'failed' })
+        const status = operation.effect === 'write' ? 'unknown_effect' : 'interrupted'
+        this.#db.put('operations', operation.id, { ...operation, status })
+        this.#db.append({
+          taskId, taskRunId: task.taskRunId, taskAttemptId: operation.attemptId, taskNodeId: operation.taskNodeId,
+          agentRunId: operation.agentRunId, agentId: operation.agentId, sessionId: operation.sessionId,
+          parentAgentRunId: operation.parentAgentRunId, type: 'tool.finished',
+          payload: { id: operation.id, tool: operation.tool, status },
+        })
       }
       if (task.worker?.status === 'running') {
         this.#finishAttempt(task.worker.attemptId, 'interrupted', reason)

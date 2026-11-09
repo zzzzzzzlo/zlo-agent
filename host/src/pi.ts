@@ -100,6 +100,7 @@ export class PiExecution implements AgentExecution {
     let stop: Promise<void> | undefined
     let lastAssistant: AssistantMessage | undefined
     const providerMessages = new WeakSet<AssistantMessage>()
+    const steering = new Map<string, string>()
     const emit = (event: RuntimeEvent): void => {
       try { config.onEvent(event) } catch { /* A subscriber cannot break the Pi loop. */ }
     }
@@ -129,6 +130,15 @@ export class PiExecution implements AgentExecution {
         lastAssistant = event.message
         const { input, output, cacheRead, cacheWrite } = event.message.usage
         emit({ type: 'model.usage', input, output, cacheRead, cacheWrite })
+      }
+      if (event.type === 'message_end' && event.message.role === 'user') {
+        const content = event.message.content
+        const text = typeof content === 'string' ? content : content.map((part) => part.type === 'text' ? part.text : '').join('')
+        const instructionId = steering.get(text)
+        if (instructionId) {
+          steering.delete(text)
+          emit({ type: 'instruction.applied', instructionId })
+        }
       }
     })
     const checkpoint = async (): Promise<void> => {
@@ -175,9 +185,16 @@ export class PiExecution implements AgentExecution {
         })()
         try { return await active } finally { active = undefined }
       },
-      async steer(text) {
+      async steer(text, instructionId) {
         if (!active || stopping || !session.isStreaming) throw new Error('Pi has no active run to steer')
-        if (await session.steer(text) !== 'queued') throw new Error('Pi did not queue the instruction')
+        const input = instructionId ? 'Additional user instruction (' + instructionId + '): ' + text : text
+        if (instructionId) steering.set(input, instructionId)
+        try {
+          if (await session.steer(input) !== 'queued') throw new Error('Pi did not queue the instruction')
+        } catch (error) {
+          steering.delete(input)
+          throw error
+        }
       },
       requestStop,
       checkpoint,

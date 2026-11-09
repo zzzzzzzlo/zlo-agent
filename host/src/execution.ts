@@ -1,12 +1,5 @@
-export interface SessionRef {
-  id: string
-  path: string
-}
-
-export interface ModelRoute {
-  provider: string
-  model: string
-}
+import type { ModelRoute, SessionRef } from './contracts/domain.ts'
+export type { ModelRoute, SessionRef } from './contracts/domain.ts'
 
 export interface ExecutionTool {
   name: string
@@ -17,6 +10,7 @@ export interface ExecutionTool {
 
 export type RuntimeEvent =
   | { type: 'message.delta'; delta: string }
+  | { type: 'instruction.applied'; instructionId: string }
   | { type: 'model.request_started' }
   | { type: 'model.usage'; input: number; output: number; cacheRead: number; cacheWrite: number }
   | { type: 'model.route_changed'; route: ModelRoute }
@@ -40,7 +34,7 @@ export interface ExecutionSession {
   readonly ref: SessionRef
   readonly route: ModelRoute
   run(prompt: string): Promise<ExecutionResult>
-  steer(text: string): Promise<void>
+  steer(text: string, instructionId?: string): Promise<void>
   requestStop(): Promise<void>
   checkpoint(): Promise<void>
   dispose(): Promise<void>
