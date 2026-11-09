@@ -1,0 +1,93 @@
+:root {
+  color-scheme: light;
+  --canvas: #f4f4f4;
+  --canvas-edge: #e5e5e5;
+  --backdrop-ink: #f5f5f5;
+  --backdrop-opacity: 60%;
+  --backdrop-soft: 90%;
+  --backdrop-vivid: 53%;
+  --text: #141414;
+  --muted: #303030;
+  --quiet: #414141;
+  --accent: #202020;
+  --accent-fill: #202020;
+  --accent-ink: #fff;
+  --accent-wash: #0000000e;
+  --positive: #202020;
+  --danger: #202020;
+  --caution: #3c3c3c;
+  --line: #00000021;
+  --line-strong: #00000036;
+  --surface: #ffffff3b;
+  --surface-hover: #ffffff8f;
+  --surface-selected: #ffffff9c;
+  --bubble: #f7f7f7d9;
+  --sidebar-base: #eeeeee28;
+  --dialog-base: #f0f0f0cc;
+  --rim: #ffffff90;
+  --rim-crest: #ffffffce;
+  --shadow: 0 14px 36px #00000023, 0 3px 9px #00000018;
+  --orbit-glow: #ffffff76;
+  --orbit-line: #0000003d;
+  --scrim: #0000004d;
+  --lq-text: var(--text);
+  --lq-tint: #ffffff99;
+  --lq-tint-deep: #ffffff31;
+  --lq-rim-hi: #ffffffa0;
+  --lq-rim-lo: #ffffff46;
+  --lq-shadow: var(--shadow);
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
+  --font-display: "Segoe UI Variable Display", "Microsoft YaHei UI", "Segoe UI", sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
+  --sidebar-width: 230px;
+  --activity-width: 278px;
+  --title-height: 55px;
+  --chat-width: 770px;
+  --chat-gutter: clamp(20px, 5%, 56px);
+  --radius-sm: 8px;
+  --radius-md: 14px;
+  --radius-lg: 18px;
+  --radius-window: 14px;
+  --ease: cubic-bezier(.2,.7,.25,1);
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --canvas: #141414;
+  --canvas-edge: #252525;
+  --backdrop-ink: #0d0d0d;
+  --backdrop-opacity: 57%;
+  --backdrop-soft: 88%;
+  --backdrop-vivid: 50%;
+  --text: #f9f9f9;
+  --muted: #e1e1e1;
+  --quiet: #d2d2d2;
+  --accent: #f2f2f2;
+  --accent-fill: #f0f0f0;
+  --accent-ink: #171717;
+  --accent-wash: #ffffff1b;
+  --positive: #ebebeb;
+  --danger: #fff;
+  --caution: #d4d4d4;
+  --line: #ffffff29;
+  --line-strong: #ffffff42;
+  --surface: #ffffff12;
+  --surface-hover: #ffffff27;
+  --surface-selected: #ffffff29;
+  --bubble: #303030e3;
+  --sidebar-base: #15151528;
+  --dialog-base: #242424dc;
+  --rim: #ffffff32;
+  --rim-crest: #ffffff6e;
+  --shadow: 0 15px 36px #0000006a, 0 3px 9px #00000045;
+  --orbit-glow: #ffffff23;
+  --orbit-line: #ffffff60;
+  --scrim: #00000084;
+  --lq-tint: #24242498;
+  --lq-tint-deep: #14141456;
+  --lq-rim-hi: #ffffff50;
+  --lq-rim-lo: #ffffff22;
+}
+
+:root[data-glass="soft"] { --backdrop-opacity: var(--backdrop-soft); }
+:root[data-glass="vivid"] { --backdrop-opacity: var(--backdrop-vivid); }

@@ -1,0 +1,49 @@
+{
+  "name": "zlo-agent",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A local desktop workspace for previewing Agent conversations",
+  "author": "Zlo Agent contributors",
+  "license": "MIT",
+  "main": "./out/main/index.js",
+  "engines": { "node": "^22.12.0 || >=24.0.0" },
+  "scripts": {
+    "dev": "electron-vite dev",
+    "start": "electron-vite preview",
+    "typecheck": "tsc --noEmit",
+    "build": "npm run typecheck && electron-vite build",
+    "pack:win": "npm run build && node -e \"require('electron')\" && electron-builder --win portable --publish never --config.electronDist=node_modules/electron/dist"
+  },
+  "dependencies": {
+    "@liqui-design/glass": "0.5.0",
+    "lucide-react": "^0.544.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zustand": "^5.0.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.1.0",
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "electron": "43.4.1",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^4.0.0",
+    "tailwindcss": "^4.1.0",
+    "typescript": "~5.9.3",
+    "vite": "^7.3.0"
+  },
+  "build": {
+    "appId": "com.zlo.agent",
+    "productName": "Zlo Agent",
+    "directories": { "output": "release" },
+    "files": ["out/main/**/*", "out/preload/**/*", "out/renderer/**/*", "resources/icon.png", "LICENSE", "THIRD-PARTY-NOTICES.md", "licenses/**/*"],
+    "win": {
+      "icon": "resources/icon.png",
+      "target": [{ "target": "portable", "arch": ["x64"] }],
+      "signExecutable": false,
+      "artifactName": "Zlo-Agent-${version}-win-${arch}-portable.${ext}"
+    }
+  }
+}

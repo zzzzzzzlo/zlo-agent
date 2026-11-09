@@ -1,0 +1,85 @@
+import { useRef, useState } from 'react'
+import type { MouseEvent } from 'react'
+import { MessageSquare, MoreHorizontal, PanelLeft, Pencil, Plus, Settings2, Trash2 } from 'lucide-react'
+import { useWorkspace } from '../../stores/workspace'
+import type { Session } from '../../features/sessions/model'
+import { Glass } from '../glass/Glass'
+import { IconButton } from '../ui/IconButton'
+
+export type SessionAction = { type: 'rename' | 'delete'; session: Session }
+
+export function Sidebar({ onSettings, onSessionAction }: {
+  onSettings: () => void
+  onSessionAction: (action: SessionAction) => void
+}) {
+  const sessions = useWorkspace((state) => state.sessions)
+  const activeId = useWorkspace((state) => state.activeId)
+  const create = useWorkspace((state) => state.createSession)
+  const select = useWorkspace((state) => state.selectSession)
+  const toggle = useWorkspace((state) => state.toggleSidebar)
+  const popover = useRef<HTMLDivElement>(null)
+  const [menuId, setMenuId] = useState<string>()
+  const target = sessions.find(({ id }) => id === menuId)
+
+  function openMenu(event: MouseEvent<HTMLButtonElement>, id: string) {
+    const menu = popover.current
+    if (!menu) return
+    const rect = event.currentTarget.getBoundingClientRect()
+    if (menu.matches(':popover-open')) {
+      menu.hidePopover()
+      if (menuId === id) return
+    }
+    menu.style.left = `${Math.min(rect.right - 140, innerWidth - 160)}px`
+    menu.style.top = `${Math.min(rect.bottom + 4, innerHeight - 100)}px`
+    setMenuId(id)
+    menu.showPopover()
+    menu.querySelector('button')?.focus()
+  }
+
+  function act(type: SessionAction['type']) {
+    if (!target) return
+    popover.current?.hidePopover()
+    onSessionAction({ type, session: target })
+  }
+
+  return (
+    <aside className="sidebar" aria-label="会话导航">
+      <Glass variant="panel" material="frost" className="sidebar-glass" contentClassName="sidebar-content">
+        <div className="sidebar-top">
+          <button className="new-session" onClick={create}>
+            <Plus size={17} /><span>新建会话</span><kbd>Ctrl N</kbd>
+          </button>
+          <div className="sidebar-label"><span>会话历史</span><span className="mono">{String(sessions.length).padStart(2, '0')}</span></div>
+        </div>
+        <nav className="session-list" aria-label="会话历史">
+          {sessions.length === 0 && <p className="list-empty">暂无会话</p>}
+          {sessions.map((session) => (
+            <div className={`session-row ${session.id === activeId ? 'is-selected' : ''}`} key={session.id}>
+              <button className="session-select" onClick={() => select(session.id)} aria-current={session.id === activeId ? 'page' : undefined} title={session.title}>
+                <MessageSquare size={14} />
+                <span>{session.title}</span>
+                {session.turns.at(-1)?.status === 'running' && <i className="live-dot" aria-label="运行中" />}
+              </button>
+              <IconButton label={`${session.title}的会话操作`} className="session-more" aria-haspopup="dialog" onClick={(event) => openMenu(event, session.id)}>
+                <MoreHorizontal size={16} />
+              </IconButton>
+            </div>
+          ))}
+        </nav>
+        <div className="sidebar-footer">
+          <button className="settings-entry" onClick={onSettings}>
+            <span className="settings-tile"><Settings2 size={16} /></span>
+            <span><strong>设置</strong><small>外观与偏好</small></span>
+          </button>
+          <IconButton className="mobile-sidebar-close" label="关闭会话导航" onClick={toggle}><PanelLeft size={16} /></IconButton>
+        </div>
+      </Glass>
+      <div className="session-popover" ref={popover} popover="auto" role="dialog" aria-label="会话操作">
+        <Glass variant="popover" elevated contentClassName="session-menu">
+          <button onClick={() => act('rename')}><Pencil size={14} />重命名</button>
+          <button className="danger-text" onClick={() => act('delete')}><Trash2 size={14} />删除会话</button>
+        </Glass>
+      </div>
+    </aside>
+  )
+}
