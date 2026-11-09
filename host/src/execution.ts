@@ -23,6 +23,7 @@ export type RuntimeEvent =
 
 export interface ExecutionConfig {
   cwd: string
+  role?: 'root' | 'worker'
   sessionDirectory: string
   session?: SessionRef
   route?: ModelRoute

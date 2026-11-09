@@ -306,7 +306,10 @@ export class TaskEngine {
       if (task.worker?.id !== nodeId || task.worker.status !== 'running') return
       this.#save({ ...task, worker: { ...task.worker, status: result?.resultStatus ?? 'ready', result } })
       this.#finishAttempt(task.worker.attemptId, result?.resultStatus ?? 'interrupted')
-      this.#event(task, 'task.worker_settled', { workerNodeId: nodeId, status: result?.resultStatus ?? 'interrupted' })
+      this.#db.append({
+        taskId, taskRunId: task.attemptId, taskNodeId: nodeId, taskAttemptId: task.worker.attemptId,
+        type: 'task.worker_settled', payload: { status: result?.resultStatus ?? 'interrupted' },
+      })
     })
   }
 
@@ -343,6 +346,14 @@ export class TaskEngine {
   verify(taskId: string, verification: VerificationResult): TaskSnapshot {
     return this.#db.transaction(() => {
       const task = this.get(taskId)
+      if (task.status !== 'verifying') throw new Error('Invalid task transition from ' + task.status + ' to verified')
+      if (task.worker?.status === 'ready' || task.worker?.status === 'running' ||
+        (task.worker?.status === 'failed' && verification.passed)) {
+        throw new Error('Worker outcome prevents task acceptance')
+      }
+      if (this.operations(taskId).some((operation) => operation.status === 'started' || operation.status === 'unknown_effect')) {
+        throw new Error('Tool receipts prevent task acceptance')
+      }
       this.#event(task, 'verification.finished', { ...verification })
       return this.#finish({ ...task, verification }, verification.passed ? 'succeeded' : 'failed',
         verification.passed ? undefined : 'verification_failed')
