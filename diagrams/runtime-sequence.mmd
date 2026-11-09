@@ -1,0 +1,31 @@
+sequenceDiagram
+    actor User
+    participant UI as Local UI
+    participant TE as Task Engine
+    participant O as Orchestrator
+    participant S as Model Scheduler
+    participant EX as Pi Execution
+    participant P as Persistence
+    participant B as EventBus
+    User->>UI: submit task
+    UI->>TE: createTask(requestId)
+    TE->>P: save task + event atomically
+    TE-->>UI: taskId
+    TE->>O: dispatch ready task
+    O->>S: select ModelRoute
+    S-->>O: route / reason
+    O->>EX: start AgentRun
+    EX-->>B: model/tool/progress events
+    User->>UI: stop root task
+    UI->>TE: requestStop(requestId)
+    TE->>P: persist stop intent
+    TE->>O: drain / stop spawning
+    O->>EX: stop at safe boundary / abort if necessary
+    EX->>P: flush session + execution receipt
+    O->>P: persist child settlement
+    TE->>P: commit STOPPED state
+    TE-->>B: root stopped event
+    User->>UI: resume task
+    UI->>TE: resumeTask(requestId)
+    TE->>P: reconcile interrupted/unknown operations
+    TE->>O: schedule eligible work

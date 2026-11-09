@@ -1,0 +1,33 @@
+flowchart TD
+    USER[User] --> UI[Local UI / CLI]
+    UI -->|commands| CMD[Host Command API]
+    CMD --> TE[Task Engine / Dynamic DAG]
+    TE <-->|plan, escalation| ROOT[Root Supervisor / Pi Agent]
+    TE -->|ready work| ORCH[Multi-Agent Orchestrator]
+    ROOT -->|propose delegation| ORCH
+    ORCH --> AT[Agent Tree / Team Manager]
+    ORCH --> CC[Convergence Controller]
+    ORCH --> CB[Context Builder]
+    ORCH --> MS[Model Resource Scheduler]
+    CB --> MEM[Memory Core port]
+    CB --> ART[ArtifactStore]
+    CB --> TE
+    MS --> REG[Model Registry / Quota + Budget]
+    ORCH --> EX[Agent Execution / Pi SDK Adapter]
+    CB --> EX
+    MS --> EX
+    EX --> TOOL[Tool Gateway / Capability Gate]
+    TOOL --> WS[Workspace + Sandbox Port]
+    EX --> VE[Verification]
+    VE -->|verified outcome| TE
+    J[Judgment Kernel / rule + Jev shadow] -.-> ORCH
+    J -.-> CB
+    J -.-> MS
+    EX --> EB[(Durable event / outbox)]
+    TE --> EB
+    ORCH --> EB
+    MEM --> EB
+    MS --> EB
+    EB --> UI
+    EB --> OBS[Observability / Evaluation]
+    OBS -.->|versioned performance profile, optional| REG
