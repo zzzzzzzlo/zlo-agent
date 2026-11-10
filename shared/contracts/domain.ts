@@ -3,10 +3,18 @@ export interface ModelRoute {
   model: string
 }
 
-export interface VerificationCheck {
+export type WorkspaceAccess = 'read' | 'write' | 'trusted'
+
+export const projectCommands = ['npm_test', 'npm_build', 'npm_lint', 'npm_typecheck', 'node_script'] as const
+export interface ProjectCommand {
+  command: typeof projectCommands[number]
   path: string
-  contains?: string
+  args?: string[]
 }
+
+export type VerificationCheck =
+  | { path: string; contains?: string; command?: never }
+  | { path?: never; contains?: never; command: ProjectCommand }
 
 export interface VerificationResult {
   passed: boolean

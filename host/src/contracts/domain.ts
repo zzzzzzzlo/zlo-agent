@@ -1,4 +1,5 @@
-export type { EndReason, ModelRoute, TaskStatus, VerificationCheck, VerificationResult } from '../../../shared/contracts/domain.ts'
+export type { EndReason, ModelRoute, ProjectCommand, TaskStatus, VerificationCheck, VerificationResult, WorkspaceAccess } from '../../../shared/contracts/domain.ts'
+export { projectCommands } from '../../../shared/contracts/domain.ts'
 
 export interface SessionRef {
   id: string
