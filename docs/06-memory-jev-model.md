@@ -2,7 +2,7 @@
 
 ## Memory Core
 
-长期记忆服务独立于 Session/Task/Observability：原始执行历史在原有权威数据源；Memory 保存提炼后的事实、经验、项目决策及来源引用。首轮可实现 `NoopMemoryCore` + 端口契约和可测 stub，不应创建复杂向量库或图谱。
+长期记忆服务独立于 Session、Task 和 Observability。Memory Core 从已验收证据提取事实和经验，记录引用及版本，按作用域持久化和词项召回。原始执行历史由所属模块保管。
 
 建议未来的生命周期：Session/Task 证据 → 候选事实/经验 → 去重与冲突整合 → 版本化长期记忆 → 根据 Task Scope 检索/注入 → 使用效果反馈。借鉴 Codex 的两阶段异步管线、Claude 的简短索引+按需读取、Hy-Memory 的 Facts/Experiences 与代码 Diff 链。记忆与执行 Trace 不属于同一业务表。
 
@@ -23,7 +23,7 @@
 
 **明确不使用 Jev 授权的事项**：沙箱越权、文件路径 ACL、额度是否足够、委派深度、并发上限、DAG 无环校验、工具合法性、危险副作用。Jev 可以额外提示风险，不能使不允许的操作变为允许。
 
-使用方式：`off` 不调用、`shadow` 运行但不能改变业务决策、`active` 参与选择但仍受硬约束。先做规则实现，Jev 未来插件化；不要首轮要求在线 Jev 或真实模型。
+默认 `off` 执行规则并记录结果，`shadow` 额外记录候选，`active` 可采用合法候选。Jev 可通过已实现的可替换 Judge 接入，见 [接入说明](15-jev-integration.md)。
 
 ## Model Resource Scheduler
 

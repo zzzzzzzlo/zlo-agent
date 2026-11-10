@@ -35,7 +35,7 @@ Desktop UI / local Web UI：发送命令（创建任务、追加说明/任务、
 | Agent identity、父子关系、执行运行状态 | Orchestrator | SQLite，通过 Port 维护 |
 | 事件日志 / 出站通知 | Event Store / Host | SQLite append-only/outbox，供订阅与回放 |
 | 任务产物与 Diff 引用 | ArtifactStore | 文件系统 + SQLite 元数据 |
-| 长期事实与经验 | MemoryCore | 其自身仓储，首轮 Stub |
+| 长期事实与经验 | MemoryCore | 独立 SQLite 命名空间，按作用域存储来源和版本 |
 | Provider Route/资源容量/预算预留 | ModelResourceScheduler | SQLite/Provider Adapter |
 | 评测结果和统计视图 | Observability | 独立投影，不是业务状态权威 |
 

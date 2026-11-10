@@ -1,8 +1,8 @@
 # Zlo Agent · Local-first 桌面 Coding Agent
 
-**项目定位**：通用 Agent 架构，首个落地场景为 Windows 本地 Coding Agent。基于 Pi，不改写 Pi Agent Loop。首轮目标是让一个真实、可恢复、可观测的任务执行闭环跑通，而不是一口气实现最终全部模块。
+Zlo Agent 是基于 Pi 的本地优先通用 Agent，首个场景为 Windows Coding。Electron 和 Host 分离，Task Engine 统一管理持久化任务状态。
 
-**优先入口**：将本包内容复制进你的项目后，把 `CODEX_START.md` 的内容发送给 Codex；也可让它先读本包根目录的 `AGENTS.md`。
+从 [桌面启动](ui/README.md) 或 [Host CLI](host/README.md) 开始。开发约束在 [AGENTS.md](AGENTS.md)，实施记录按轮次保存。
 
 ## 文件索引
 
@@ -19,17 +19,17 @@
 | `docs/07-security-and-observability.md` | 权限、Sandbox 接口、中台事件、脱敏 |
 | `docs/08-implementation-plan.md` | 首轮实施顺序、测试与验收清单 |
 | `docs/09-upstream-references.md` | 源码和官方文档参考及核验原则 |
+| `docs/14-core-development.md` | 第三轮差距与实施顺序 |
+| `docs/15-jev-integration.md` | Jev 与六个判断点接入 |
+| `docs/16-observability-contract.md` | 中台事件与证据契约 |
+| `docs/17-core-verification.md` | 第三轮交付与验收 |
 | `diagrams/system.mmd` | 可渲染的 Mermaid 系统架构图 |
 | `diagrams/runtime-sequence.mmd` | 可渲染的运行与停止流程图 |
 
-## 本轮完成定义
-
-运行本地 Agent Host，能够：创建 Coding 任务；调用 Pi 的真实 Agent Session（有凭证时），在无凭证时用确定性测试替身走通相同契约；持久化任务、会话关联与事件；通过 IPC/RPC/HTTP + SSE 之一查询与流式订阅；接收追加说明和追加任务；执行优雅停止并恢复；至少一个受控子任务委派路径；稳定的编译、单元测试、恢复测试。
-
-**首轮不实现**：全量 Agent Team、跨提供商订阅额度统一结算、Jev 实际在线部署、长期记忆智能提炼、真实沙箱产品化、移动端和跨设备同步、大而全的观测仪表盘。
-
-> 注：接口应预留，但**不可**声称缺失的沙箱或权限能力已经提供了安全保障。高风险工具默认拒绝/受限执行。
-
 ## 当前桌面版
 
-桌面版由 Electron 自动启动本地 Agent Host。支持多轮对话、工具和用量事件、停止、追加指令与重启恢复。参阅 [桌面启动](ui/README.md)、[Host CLI](host/README.md)、[Sprint 4 接口与事件](docs/11-desktop-protocol.md) 和 [Sprint 4 验收](docs/12-sprint4-verification.md)。首轮记录仍可在 [Sprint 0–3](docs/10-sprint-execution.md) 查阅。
+选定工作区后可授权文件写入，验收文件可选。用户明确选择信任项目后，Agent 可运行受控的 Node/npm 命令和本地 Git 检查，并以实际执行结果验收。Activity Panel 展示工具、模型用量和 Team/Worker 进度。
+
+Host 提供版本化 Task DAG、Root/Team/Worker 分层执行、模型预留和用量核销、上下文压缩、证据记忆和规则判断。Pi 保留 Session 与单 Agent Loop。Task 与 Conversation 可重放事件支持中断后核对和恢复。
+
+信任项目的命令按当前系统账户运行。隔离、恢复和模型路由的边界见 [第三轮验收](docs/17-core-verification.md)。旧版桌面协议和实施记录见 [Sprint 4](docs/11-desktop-protocol.md) 与 [Sprint 0–3](docs/10-sprint-execution.md)。

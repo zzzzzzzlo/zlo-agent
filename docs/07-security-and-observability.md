@@ -22,7 +22,7 @@
 
 `task.created`, `task.state_changed`, `task.stop_requested`, `task.stopped`, `task.resumed`, `task.plan_changed`, `agent.started`, `agent.finished`, `model.request_started`, `model.usage`, `tool.started`, `tool.finished`, `verification.finished`, `model.route_changed`, `operation.reconciliation_required`。
 
-仅保留接口（不必真调用）: `memory.recalled / memory.captured / judgment.evaluated / sandbox.denied`。
+第三轮增加 `memory.recalled`、`memory.captured`、`judgment.evaluated` 及模型预留和 DAG 节点事件。完整事件和证据见 [中台数据契约](16-observability-contract.md)。受信任项目命令在当前系统账户运行，系统级沙箱仍需独立实现。
 
 ## 指标与数据脱敏
 

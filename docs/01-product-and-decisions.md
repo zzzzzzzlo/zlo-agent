@@ -14,7 +14,7 @@
 - **上下文**：Context Builder 只向子任务传必要目标、约束、来源和 Artifact 引用；不默认复制父 Session。持久 Agent 可恢复自己的 Session。
 - **Jev**：独立 Judgment Kernel/Decision Registry，可为策略提供可替换判定；rule baseline、shadow/off/active、实验记录；不替代强制权限。
 - **模型**：Model Resource Scheduler 独立支持热切换、子 Agent 选模与预算。不同 provider 的 API、授权、订阅额度可用性必须真实区分；未知值保留 unknown。
-- **Memory**：独立 Memory Core；保存过去发生的事情并提炼可复用经验，事实和经验分开，追溯来源；初版可以接口/简单存储，自动提炼后续。
+- **Memory**：独立 Memory Core；事实与经验分开保存并追溯来源。第三轮从通过验收的操作和检查提取证据，持久化后按任务作用域召回。
 - **用户交互**：用户可追加说明或任务、停止整个任务、恢复、热切换模型、查看事件与用量；不需要细粒度 Worker 管理或为每个常规工具调用点按钮。
 - **停止含义**：协作式优雅停止（quiesce + checkpoint + resume）。不能对所有运行中外部动作承诺绝对即时停止；挂起或无法确认的副作用应明确标记。
 - **中台**：独立 Observatory/Evaluation（检测器）；订阅事件、统计任务结果/工具/模型/Token/记忆，不负责储存长期记忆，也不是 Task 状态权威。
@@ -22,7 +22,7 @@
 
 ## 被推迟但需预留
 
-完整 Team Task Board、循环依赖跨模块协调、多 provider 订阅实时额度聚合、Jev 在线模型对照、异步 Memory 提取/整合、SandboxProvider 可用实现、远程 Agent Host、跨设备同步、完整 Dashboard、自动化评测套件。
+完整 Team Task Board、多 Provider 订阅实时额度聚合、Jev 在线模型对照、模型驱动的异步记忆提炼、系统级 SandboxProvider、远程 Agent Host、跨设备同步、完整 Dashboard、自动化评测套件。第三轮已落地的范围与边界见 [实施报告](17-core-verification.md)。
 
 ## 关键架构约束
 

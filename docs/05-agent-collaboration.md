@@ -12,7 +12,7 @@
 1. **Orchestrator/Worker**：主 Agent（或 Team Agent）通过协作工具请求 Worker；Worker 接收边界清晰的任务与 Context Package；结果结构化回传后释放执行资源。
 2. **Persistent Agent Team**：Frontend/Order/Payment 等专业 Agent 长期保留 AgentId 和会话引用；Idle 不空转消耗 Token；新任务唤醒；成员可以受控创建自己的临时 Worker。
 
-第一轮仅实现单个 Root + 一个临时 Worker 的完整链路，端口支持未来升级。长期 Team 在下个阶段实现，不要首轮把整套 Team UI、消息系统、Agent Tree 数据库全做完。
+首轮的单叶委派协议仍兼容。第三轮新增版本化 DAG、可复用的 Team Session 和两级委派。桌面活动面板从事件和历史展示节点状态，完整 Team 管理面板仍是独立范围。执行边界见 [实施报告](17-core-verification.md)。
 
 ## 委派与收敛
 
