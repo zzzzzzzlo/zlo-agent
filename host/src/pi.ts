@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { writeHostDiagnostic } from '../../shared/diagnostics.ts'
 import { mkdir, open, readFile, realpath } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
 import { InMemoryCredentialStore, type AssistantMessage } from '@earendil-works/pi-ai'
@@ -32,7 +33,7 @@ export class PiExecution implements AgentExecution {
   private async getRuntime(): Promise<ModelRuntime> {
     this.runtime ??= this.createRuntime().catch(() => {
       this.runtime = undefined
-      throw new ModelUnavailableError('Pi could not load its model and credential configuration')
+      throw modelUnavailable('Pi could not load its model and credential configuration')
     })
     return this.runtime
   }
@@ -42,16 +43,16 @@ export class PiExecution implements AgentExecution {
   }
 
   private async resolveModel(runtime: ModelRuntime, route?: ModelRoute) {
-    if (!route) throw new ModelUnavailableError('Choose a Pi provider and model explicitly')
+    if (!route) throw modelUnavailable('Choose a Pi provider and model explicitly')
     // These built-ins use direct environment credentials. Bedrock and Vertex can
     // also discover file/profile credentials even with an empty credential store.
     if (this.environmentOnly && !['openai', 'anthropic', 'google', 'deepseek'].includes(route.provider)) {
-      throw new ModelUnavailableError('This Pi provider is not enabled for environment authentication')
+      throw modelUnavailable('This Pi provider is not enabled for environment authentication')
     }
     const model = runtime.getModel(route.provider, route.model)
-    if (!model) throw new ModelUnavailableError('Unknown Pi model route')
+    if (!model) throw modelUnavailable('Unknown Pi model route')
     const auth = await runtime.checkAuth(model.provider).catch(() => undefined)
-    if (!auth) throw new ModelUnavailableError('Pi model provider has no configured authentication')
+    if (!auth) throw modelUnavailable('Pi model provider has no configured authentication')
     return model
   }
 
@@ -61,7 +62,7 @@ export class PiExecution implements AgentExecution {
     const directory = await realpath(config.sessionDirectory)
     const modelRuntime = await this.getRuntime()
     let model = config.route && await this.resolveModel(modelRuntime, config.route)
-    if (!config.session && !model) throw new ModelUnavailableError('Choose a Pi provider and model explicitly')
+    if (!config.session && !model) throw modelUnavailable('Choose a Pi provider and model explicitly')
 
     const path = config.session?.path ?? join(directory, `${randomUUID()}.jsonl`)
     if (config.session) {
@@ -76,6 +77,7 @@ export class PiExecution implements AgentExecution {
     const previousRoute = manager.getBranch().findLast(entry => entry.type === 'model_change')
     model ??= await this.resolveModel(modelRuntime, previousRoute && { provider: previousRoute.provider, model: previousRoute.modelId })
     const ref = { id: manager.getSessionId(), path }
+    const traceId = config.correlationId ?? randomUUID()
     const route = { provider: model.provider, model: model.id }
     let stopping = false
     const customTools = config.tools.map(tool => asPiTool(tool, () => stopping))
@@ -115,11 +117,21 @@ export class PiExecution implements AgentExecution {
     }
     const stream = session.agent.streamFunction
     session.agent.streamFunction = async (model, context, options) => {
-      const response = await stream(model, context, options)
-      // Pi may report a runtime exception as a synthetic assistant error. Track the
-      // actual provider responses without subscribing to or consuming their events.
-      void response.result().then(message => providerMessages.add(message), () => {})
-      return response
+      writeHostDiagnostic('host.model_started', traceId)
+      const requestFailed = () => writeHostDiagnostic(options?.signal?.aborted ? 'host.model_interrupted' : 'host.model_failed', traceId)
+      try {
+        const response = await stream(model, context, options)
+        // Inspect only the completion category. Provider errors may contain request data.
+        void response.result().then((message) => {
+          providerMessages.add(message)
+          writeHostDiagnostic(message.stopReason === 'aborted' ? 'host.model_interrupted'
+            : message.stopReason === 'error' || message.stopReason === 'length' ? 'host.model_failed' : 'host.model_completed', traceId)
+        }, requestFailed)
+        return response
+      } catch (error) {
+        requestFailed()
+        throw error
+      }
     }
     const unsubscribe = session.subscribe(event => {
       if (event.type === 'agent_start' && stopping) void session.abort().catch(() => {})
@@ -208,6 +220,11 @@ export class PiExecution implements AgentExecution {
       },
     }
   }
+}
+
+function modelUnavailable(message: string): ModelUnavailableError {
+  writeHostDiagnostic('host.model_unavailable')
+  return new ModelUnavailableError(message)
 }
 
 function explicitResources(systemPrompt: string): ResourceLoader {

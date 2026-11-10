@@ -2,6 +2,9 @@ import { spawn } from 'node:child_process'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
+import { diagnostic } from '../../../shared/diagnostics.ts'
+import type { DiagnosticCode, DiagnosticEntry } from '../../../shared/diagnostics.ts'
+import { collectHostDiagnostics } from './diagnostic-log.ts'
 import type { ConversationEvent, DesktopCommand, DesktopErrorCode, DesktopHostStatus, HostMode } from '../../../shared/contracts/desktop.ts'
 
 const startupTimeoutMs = 15_000
@@ -36,6 +39,7 @@ interface PendingRequest {
 
 interface Connection {
   child: ChildProcessWithoutNullStreams
+  correlationId: string
   state: 'starting' | 'ready' | 'stopping'
   ready: Promise<DesktopHostStatus>
   resolveReady(status: DesktopHostStatus): void
@@ -50,6 +54,7 @@ interface Connection {
 interface ManagerOptions {
   mode: HostMode
   spawnChild: () => ChildProcessWithoutNullStreams
+  diagnostic?: (entry: DiagnosticEntry) => void
   startupTimeoutMs?: number
   requestTimeoutMs?: number
   shutdownTimeoutMs?: number
@@ -119,29 +124,32 @@ export class HostProcessManager {
 
     const ready = Promise.withResolvers<DesktopHostStatus>()
     const closed = Promise.withResolvers<void>()
+    const correlationId = randomUUID()
+    this.#log('desktop.host_starting', correlationId)
     let child: ChildProcessWithoutNullStreams
     try {
       child = this.#options.spawnChild()
     } catch {
+      this.#log('desktop.host_spawn_failed', correlationId)
       this.#setStatus('offline', '无法启动 Agent Host。')
       return Promise.resolve(this.#status)
     }
     const connection: Connection = {
-      child, state: 'starting', ready: ready.promise, resolveReady: ready.resolve,
+      child, correlationId, state: 'starting', ready: ready.promise, resolveReady: ready.resolve,
       closed: closed.promise, resolveClosed: closed.resolve, pending: new Map(), incompleteLine: '',
     }
     this.#connection = connection
-    child.once('error', () => { this.#fail(connection, 'Agent Host 进程无法运行。') })
+    child.once('error', () => { this.#fail(connection, 'desktop.host_spawn_failed', 'Agent Host 进程无法运行。') })
     child.once('close', (code) => { this.#closed(connection, code) })
-    child.stdin.on('error', () => { this.#fail(connection, 'Agent Host 的输入通道已中断。') })
-    child.stdout.on('error', () => { this.#fail(connection, 'Agent Host 的输出通道已中断。') })
+    child.stdin.on('error', () => { this.#fail(connection, 'desktop.host_channel_failed', 'Agent Host 的输入通道已中断。') })
+    child.stdout.on('error', () => { this.#fail(connection, 'desktop.host_channel_failed', 'Agent Host 的输出通道已中断。') })
     child.stdout.setEncoding('utf8')
     child.stdout.on('data', (chunk: string) => { this.#read(connection, chunk) })
-    // Provider errors can contain request data. Drain stderr without relaying it to Renderer or logs.
-    child.stderr.on('error', () => {})
-    child.stderr.resume()
+    collectHostDiagnostics(child.stderr,
+      (item) => this.#log(item.code, correlationId),
+      () => this.#log('desktop.host_stderr_ignored', correlationId))
     connection.startupTimer = setTimeout(() => {
-      this.#fail(connection, 'Agent Host 启动超时。')
+      this.#fail(connection, 'desktop.host_startup_timeout', 'Agent Host 启动超时。')
     }, this.#options.startupTimeoutMs ?? startupTimeoutMs)
     this.#setStatus('starting')
     return connection.ready
@@ -158,15 +166,18 @@ export class HostProcessManager {
     if (line.length > 65_536) throw new HostTransportError('INVALID_INPUT', '请求超过长度上限。')
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
-        this.#settle(connection, commandId)?.reject(unavailable('等待 Agent Host 响应超时。'))
+        const pending = this.#settle(connection, commandId)
+        if (!pending) return
+        this.#log('desktop.host_request_timeout', connection.correlationId)
+        pending.reject(unavailable('等待 Agent Host 响应超时。'))
       }, this.#options.requestTimeoutMs ?? requestTimeoutMs)
       connection.pending.set(commandId, { type: command.type, resolve: (result) => resolve(result as T), reject, timer })
       try {
         connection.child.stdin.write(line, 'utf8', (error) => {
-          if (error) this.#fail(connection, 'Agent Host 的输入通道已中断。')
+          if (error) this.#fail(connection, 'desktop.host_channel_failed', 'Agent Host 的输入通道已中断。')
         })
       } catch {
-        this.#fail(connection, 'Agent Host 的输入通道已中断。')
+        this.#fail(connection, 'desktop.host_channel_failed', 'Agent Host 的输入通道已中断。')
       }
     })
   }
@@ -199,6 +210,7 @@ export class HostProcessManager {
       connection.child.stdin.end(JSON.stringify({ schemaVersion: 1, type: 'exit' }) + '\n')
     }
     if (await waitForClose(connection, this.#options.shutdownTimeoutMs ?? shutdownTimeoutMs)) return
+    this.#log('desktop.host_shutdown_timeout', connection.correlationId)
     connection.child.kill()
     if (!await waitForClose(connection, 2_000)) {
       throw unavailable('Agent Host 未能在关闭期限内退出。')
@@ -210,7 +222,7 @@ export class HostProcessManager {
     const lines = (connection.incompleteLine + chunk).split('\n')
     connection.incompleteLine = lines.pop() ?? ''
     if (connection.incompleteLine.length > maxLineLength || lines.some((line) => line.length > maxLineLength)) {
-      this.#fail(connection, 'Agent Host 的协议数据超出长度上限。')
+      this.#fail(connection, 'desktop.host_protocol_invalid', 'Agent Host 的协议数据超出长度上限。')
       return
     }
     for (const line of lines) {
@@ -224,25 +236,26 @@ export class HostProcessManager {
     try {
       message = JSON.parse(line)
     } catch {
-      this.#fail(connection, 'Agent Host 返回了无效的协议数据。')
+      this.#fail(connection, 'desktop.host_protocol_invalid', 'Agent Host 返回了无效的协议数据。')
       return
     }
     if (!isObject(message) || message.schemaVersion !== 1) {
-      this.#fail(connection, 'Agent Host 协议版本不匹配。')
+      this.#fail(connection, 'desktop.host_protocol_invalid', 'Agent Host 协议版本不匹配。')
       return
     }
     if (message.kind === 'ready') {
       if (connection.state !== 'starting' || message.mode !== this.#options.mode) {
-        this.#fail(connection, 'Agent Host 启动模式不匹配。')
+        this.#fail(connection, 'desktop.host_protocol_invalid', 'Agent Host 启动模式不匹配。')
         return
       }
       connection.state = 'ready'
       clearTimeout(connection.startupTimer)
+      this.#log('desktop.host_ready', connection.correlationId)
       this.#setStatus('ready')
       connection.resolveReady(this.#status)
     } else if (message.kind === 'conversation.event' && connection.state === 'ready') {
       if (!isEvent(message.event)) {
-        this.#fail(connection, 'Agent Host 返回了无效的会话事件。')
+        this.#fail(connection, 'desktop.host_protocol_invalid', 'Agent Host 返回了无效的会话事件。')
         return
       }
       emit(this.#events, message.event)
@@ -257,6 +270,7 @@ export class HostProcessManager {
         && typeof message.error.message === 'string' && message.error.message.length <= 1_000) {
         pending.reject(new HostTransportError(message.error.code as DesktopErrorCode, message.error.message))
       } else {
+        this.#log('desktop.host_protocol_invalid', connection.correlationId)
         pending.reject(new HostTransportError('INTERNAL', 'Agent Host 返回了无效的命令响应。'))
       }
     }
@@ -275,10 +289,11 @@ export class HostProcessManager {
     for (const id of connection.pending.keys()) this.#settle(connection, id)?.reject(error)
   }
 
-  #fail(connection: Connection, reason: string): void {
+  #fail(connection: Connection, code: DiagnosticCode, reason: string): void {
     if (this.#connection !== connection || connection.state === 'stopping') return
     connection.state = 'stopping'
     connection.failure = reason
+    this.#log(code, connection.correlationId)
     clearTimeout(connection.startupTimer)
     this.#rejectPending(connection, unavailable(reason))
     connection.child.kill()
@@ -291,6 +306,8 @@ export class HostProcessManager {
     if (this.#connection !== connection) return
     this.#connection = undefined
     clearTimeout(connection.startupTimer)
+    this.#log(connection.failure || connection.state !== 'stopping' || code !== 0
+      ? 'desktop.host_crashed' : 'desktop.host_exited', connection.correlationId)
     const message = connection.failure ?? (connection.state === 'stopping' ? undefined
       : code === null ? 'Agent Host 意外退出。' : 'Agent Host 已退出（代码 ' + code + '）。')
     this.#rejectPending(connection, unavailable(message))
@@ -302,6 +319,14 @@ export class HostProcessManager {
     if (state === this.#status.state && message === this.#status.message) return
     this.#status = { state, mode: this.#options.mode, ...(message ? { message } : {}) }
     emit(this.#statuses, this.#status)
+  }
+
+  #log(code: DiagnosticCode, correlationId: string): void {
+    try {
+      this.#options.diagnostic?.(diagnostic(code, correlationId))
+    } catch {
+      // Diagnostics cannot break the Host transport.
+    }
   }
 }
 

@@ -17,6 +17,7 @@ export type RuntimeEvent =
 
 export interface ExecutionConfig {
   cwd: string
+  correlationId?: string
   role?: 'root' | 'worker'
   sessionDirectory: string
   session?: SessionRef

@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { writeHostDiagnostic } from '../../shared/diagnostics.ts'
 import { existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import type { AgentExecution } from './execution.ts'
@@ -11,6 +12,7 @@ import type {
 import {
   ConversationError, ConversationService, parseConversationAction, parseCreateConversation, parseSendMessage, parseSetConversationModel, parseSteer,
 } from './conversation.ts'
+import { installTaskDiagnostics } from './diagnostics.ts'
 import { MultiAgentOrchestrator, executionFailure, sameRoute } from './orchestrator.ts'
 import { BaselineJudgment, CodingCapabilities, defaultCodingProfile, LocalContextBuilder, LocalModelScheduler } from './policies.ts'
 import type { CodingProfile } from './policies.ts'
@@ -91,6 +93,7 @@ export class LocalAgentHost {
       }
       this.#engine = new TaskEngine(this.#store)
       this.#conversations = new ConversationService(this.#store, () => this.#failStorage())
+      installTaskDiagnostics(this.#store)
       this.#scheduler = new LocalModelScheduler(options.execution)
       this.#orchestrator = new MultiAgentOrchestrator({
         store: this.#store, tasks: this.#engine, execution: options.execution, scheduler: this.#scheduler,
@@ -456,6 +459,7 @@ export class LocalAgentHost {
   }
 
   #failStorage(): void {
+    if (!this.#storageFailure) writeHostDiagnostic('host.runtime_failed', this.#active?.taskId)
     this.#storageFailure = new Error('Host persistence failed. Inspect the data directory before continuing.')
     this.#active?.abort.abort()
   }

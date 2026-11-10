@@ -226,7 +226,8 @@ export class MultiAgentOrchestrator {
       const tools = workspace.tools('worker').map((tool) =>
         this.#wrap(tool, () => event, signal, () => this.#capabilities.authorize('worker', tool.effect), evidence, artifacts))
       session = await this.#execution.open({
-        cwd: workspace.root, role: 'worker', sessionDirectory: join(this.#sessions, task.id), route,
+        cwd: workspace.root, role: 'worker', correlationId: event.agentRunId,
+        sessionDirectory: join(this.#sessions, task.id), route,
         tools,
         systemPrompt: 'You are a temporary read-only coding worker. Use tools for evidence and return a short summary.',
         onEvent: (runtime) => {
@@ -379,7 +380,8 @@ export class MultiAgentOrchestrator {
       },
     })
     const config = (route: ModelRoute | undefined, ref?: SessionRef): ExecutionConfig => ({
-      cwd: workspace.root, role: 'root', sessionDirectory: join(this.#sessions, agentKey), session: ref, route, tools,
+      cwd: workspace.root, role: 'root', correlationId: event.agentRunId,
+      sessionDirectory: join(this.#sessions, agentKey), session: ref, route, tools,
       systemPrompt: task.check
         ? 'You are a local coding agent. Use the listed tools for scoped text changes. A deterministic file check decides acceptance. Do not request credentials.'
         : 'You are a local assistant. Workspace access is read-only. Respond directly to the user and do not request credentials.',

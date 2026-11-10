@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
+import type { DiagnosticEntry } from '../../shared/diagnostics.ts'
 import { HostProcessManager, HostTransportError } from '../electron/main/host-process.ts'
 import type { ConversationEvent } from '../../shared/contracts/desktop.ts'
 
@@ -63,13 +64,17 @@ test('manager observes crash, rejects pending work and restarts a fresh connecti
 
 test('manager rejects the wrong startup mode and bounds startup and command waits', async (t) => {
   for (const variant of ['bad-mode', 'no-ready'] as const) {
+    const entries: DiagnosticEntry[] = []
     const manager = new HostProcessManager({
       mode: 'faux', spawnChild: () => startFixture(variant), startupTimeoutMs: 500,
+      diagnostic: (entry) => entries.push(entry),
     })
     t.after(() => manager.shutdown())
     const status = await manager.start()
     assert.equal(status.state, 'offline')
     assert.match(status.message ?? '', variant === 'bad-mode' ? /模式/ : /超时/)
+    assert.ok(entries.some(({ code }) => code === (variant === 'bad-mode'
+      ? 'desktop.host_protocol_invalid' : 'desktop.host_startup_timeout')))
   }
   const manager = new HostProcessManager({
     mode: 'faux', spawnChild: () => startFixture('ready'), requestTimeoutMs: 250,
@@ -80,6 +85,36 @@ test('manager rejects the wrong startup mode and bounds startup and command wait
     schemaVersion: 1, type: 'getConversationHistory', conversationId: 'c',
   }), { code: 'HOST_UNAVAILABLE' })
   assert.equal(manager.status.state, 'ready')
+  assert.deepEqual(await manager.request(list), ['first'])
+})
+
+test('manager preserves allowlisted diagnostics and excludes raw or forged stderr', async (t) => {
+  const entries: DiagnosticEntry[] = []
+  const manager = new HostProcessManager({
+    mode: 'faux', spawnChild: () => startFixture('diagnostic'),
+    diagnostic: (entry) => entries.push(entry),
+  })
+  t.after(() => manager.shutdown())
+  assert.equal((await manager.start()).state, 'ready')
+  assert.deepEqual(await manager.request(list), ['first'])
+  await manager.shutdown()
+  const codes = entries.map(({ code }) => code)
+  assert.deepEqual([...codes].sort(), [
+    'desktop.host_starting', 'desktop.host_ready', 'desktop.host_stderr_ignored',
+    'host.model_failed', 'desktop.host_exited',
+  ].sort())
+  assert.equal(new Set(entries.map(({ correlationId }) => correlationId)).size, 1)
+  assert.notEqual(entries[0]?.correlationId, 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+  assert.doesNotMatch(JSON.stringify(entries), /private-prompt/)
+})
+
+test('manager operation does not depend on the diagnostic sink', async (t) => {
+  const manager = new HostProcessManager({
+    mode: 'faux', spawnChild: () => startFixture('ready'),
+    diagnostic: () => { throw new Error('fixture log write failed') },
+  })
+  t.after(() => manager.shutdown())
+  assert.equal((await manager.start()).state, 'ready')
   assert.deepEqual(await manager.request(list), ['first'])
 })
 

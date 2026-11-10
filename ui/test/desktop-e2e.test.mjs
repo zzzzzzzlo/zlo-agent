@@ -86,7 +86,7 @@ async function crashTestHost(app, data) {
 }
 
 test('Windows Electron uses the Pi Host for coding, model switch, steering, stop and history recovery',
-  { skip: process.platform !== 'win32', timeout: 90000 }, async () => {
+  { skip: process.platform !== 'win32', timeout: 90000 }, async (t) => {
     const root = await mkdtemp(join(tmpdir(), 'zlo-electron-e2e-'))
     const workspace = join(root, 'selected-workspace')
     const data = join(root, 'desktop-data')
@@ -217,6 +217,20 @@ test('Windows Electron uses the Pi Host for coding, model switch, steering, stop
       assert.equal(snapshot.turns[5].taskAttemptId, beforeCrash.taskAttemptId)
       assert.equal(snapshot.turns[5].taskRunId, beforeCrash.taskRunId)
       assert.equal(snapshot.conversation.piSessionId, sessionId)
+
+      await app.close()
+      app = undefined
+      const log = await readFile(join(data, 'logs', 'diagnostics.jsonl'), 'utf8')
+      const diagnostics = log.trim().split('\n').map((line) => JSON.parse(line))
+      for (const code of ['desktop.host_ready', 'desktop.host_crashed', 'host.model_started', 'host.tool_completed']) {
+        assert.ok(diagnostics.some((entry) => entry.code === code), 'Missing desktop diagnostic ' + code)
+      }
+      assert.doesNotMatch(log, /请简要总结修改|仅保留现有验证码控件|login\.html|unavailable-test-model/)
+    } catch (error) {
+      const trace = await readFile(join(data, 'logs', 'diagnostics.jsonl'), 'utf8').catch(() => '')
+      const codes = trace.match(/"code":"(?:desktop|host)\.[a-z_]+"/g)
+      if (codes?.length) t.diagnostic(codes.slice(-12).join(', '))
+      throw error
     } finally {
       await app?.close()
       await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })

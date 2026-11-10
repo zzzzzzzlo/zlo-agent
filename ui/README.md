@@ -27,8 +27,11 @@ npm.cmd run pack:win
 
 - 新建会话时可指定模型。Coding 会话还需通过系统选择器指定工作区，并填入相对验收文件。可以附加必含文本。只读对话用有内容的模型回复作为执行检查。
 - Enter 发送，Shift + Enter 换行。运行中可以追加指令或停止。任务完成后，在原会话发送新消息会创建新 Task 并继续使用原 Pi Session。
+- 标题栏的会话模型设置支持同 Provider 换模。已连接的会话会先显示待应用模型，确认后更新当前模型。
 - 活动面板显示工具、状态与 Token 用量。停止完成后可以恢复。未知写入会单独显示为待核对状态。
 - 重启应用会加载 Host 中的对话历史。会话菜单支持重命名和归档。外观、当前选择及草稿保存在本地 UI 偏好。
+
+脱敏诊断保存在 `userData/logs/diagnostics.jsonl`，含当前文件和两份轮转文件。
 
 ## 开发验收
 
@@ -44,3 +47,4 @@ npm.cmd run test:desktop
 - [共享协议](../docs/11-desktop-protocol.md)
 - [验收与代码审查](../docs/12-sprint4-verification.md)
 - [许可和第三方说明](THIRD-PARTY-NOTICES.md)
+- [第二轮遗留问题修复报告](../docs/13-sprint4-repair-report.md)

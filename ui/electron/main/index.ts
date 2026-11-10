@@ -6,6 +6,7 @@ import type { IpcMainInvokeEvent } from 'electron'
 import { windowChannels } from '../window-api'
 import { localDirectory } from './agent-input.ts'
 import { registerAgentIpc } from './agent-ipc.ts'
+import { createDiagnosticLog } from './diagnostic-log.ts'
 import { HostProcessManager, spawnAgentHost } from './host-process.ts'
 
 const developmentData = app.isPackaged ? undefined : process.env.ZLO_AGENT_DESKTOP_DATA
@@ -18,8 +19,10 @@ const hostMode = !app.isPackaged && process.env.ZLO_AGENT_DESKTOP_MODE === 'faux
 const hostRoot = app.isPackaged ? join(process.resourcesPath, 'agent-host') : resolve(app.getAppPath(), '../host')
 const userData = app.getPath('userData')
 const defaultWorkspace = join(userData, 'workspace')
+const diagnostics = createDiagnosticLog(join(userData, 'logs'))
 const host = new HostProcessManager({
   mode: hostMode,
+  diagnostic: diagnostics.write,
   spawnChild() {
     mkdirSync(defaultWorkspace, { recursive: true })
     return spawnAgentHost({
@@ -113,7 +116,8 @@ app.on('before-quit', (event) => {
   quitting = true
   void host.shutdown().catch(() => {
     console.error('Agent Host did not exit within the shutdown deadline.')
-  }).finally(() => {
+  }).finally(async () => {
+    await diagnostics.flush(250)
     hostClosed = true
     app.quit()
   })
