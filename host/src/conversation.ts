@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type {
   ArchiveConversationInput, ConversationAction, ConversationEvent, ConversationHistory, ConversationMessage,
   ConversationSummary, ConversationTool, ConversationTurn, CreateConversationInput, DesktopErrorCode,
-  HistoryInput, RenameConversationInput, SendMessageInput, SendMessageResult, SteerInput, UsageTotals,
+  HistoryInput, RenameConversationInput, SendMessageInput, SendMessageResult, SetConversationModelInput, SteerInput, UsageTotals,
 } from '../../shared/contracts/desktop.ts'
 import type { AgentEvent, EndReason, EventDraft, ModelRoute, TaskStatus } from './contracts/domain.ts'
 import type { LocalStore } from './store.ts'
@@ -119,6 +119,18 @@ export function parseConversationAction(input: ConversationAction): Conversation
 
 export function parseSteer(input: SteerInput): SteerInput {
   return { ...parseConversationAction(input), text: text(input.text, 'instruction', 8000) }
+}
+
+export function parseSetConversationModel(input: SetConversationModelInput): SetConversationModelInput {
+  const body = object(input, 'conversation model')
+  return {
+    conversationId: entityId(body.conversationId), requestId: requestId(body.requestId),
+    route: body.route === null ? null : parseRoute(body.route),
+  }
+}
+
+function sameRoute(left?: ModelRoute, right?: ModelRoute): boolean {
+  return left?.provider === right?.provider && left?.model === right?.model
 }
 
 function summary(record: StoredConversation): ConversationSummary {
@@ -312,6 +324,33 @@ export class ConversationService {
     })
   }
 
+  #modelSignature(input: SetConversationModelInput): string {
+    return JSON.stringify(['model', input.conversationId, input.route])
+  }
+
+  modelRequest(input: SetConversationModelInput): ConversationSummary | undefined {
+    return this.#receipt(input.requestId, this.#modelSignature(input))
+  }
+
+  /** Write the request receipt with the Task preference when the Task is still mutable. */
+  recordModelRequest(input: SetConversationModelInput, route?: ModelRoute, pendingRoute?: ModelRoute): ConversationSummary {
+    const signature = this.#modelSignature(input)
+    const previous = this.#receipt<ConversationSummary>(input.requestId, signature)
+    if (previous) return previous
+    const record = this.#record(input.conversationId)
+    let next = record
+    if (!sameRoute(record.route, route) || !sameRoute(record.pendingRoute, pendingRoute)) {
+      if (record.latestTaskId) this.#flushInTransaction(record.latestTaskId)
+      const { route: _route, pendingRoute: _pending, ...fields } = record
+      next = { ...fields, updatedAt: Date.now(), ...(route ? { route } : {}), ...(pendingRoute ? { pendingRoute } : {}) }
+      this.#saveConversation(next)
+      this.#event(record.id, 'conversation.model_requested', { conversation: summary(next) })
+    }
+    const result = summary(next)
+    this.#store.put(requests, input.requestId, { signature, value: result })
+    return result
+  }
+
   #sendSignature(input: SendMessageInput): string {
     return JSON.stringify(['send', input.conversationId, input.text])
   }
@@ -483,10 +522,15 @@ export class ConversationService {
       this.#projectStatus(binding, source)
     } else if (type === 'model.route_changed') {
       const conversation = this.#record(conversationId)
-      const next = { ...conversation, route: parseRoute(source.payload.route) }
+      const next = this.#appliedModel(conversation, parseRoute(source.payload.route))
       this.#saveConversation(next)
       this.#event(conversationId, type, { conversation: summary(next) }, source)
     }
+  }
+
+  #appliedModel(conversation: StoredConversation, route: ModelRoute): StoredConversation {
+    const { pendingRoute, ...record } = conversation
+    return { ...record, route, ...(pendingRoute && !sameRoute(pendingRoute, route) ? { pendingRoute } : {}) }
   }
 
   #projectAgent(conversationId: string, source: AgentEvent): void {
@@ -498,7 +542,7 @@ export class ConversationService {
     }
     if (source.type === 'agent.started' && payload.agentRole === 'root' && source.sessionId) {
       const conversation = this.#record(conversationId)
-      const next = { ...conversation, piSessionId: source.sessionId, route: parseRoute(source.payload.route) }
+      const next = { ...this.#appliedModel(conversation, parseRoute(source.payload.route)), piSessionId: source.sessionId }
       this.#saveConversation(next)
       payload.conversation = summary(next)
     }

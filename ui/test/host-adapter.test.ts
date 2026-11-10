@@ -3,7 +3,7 @@ import { test } from 'node:test'
 import { registerHooks } from 'node:module'
 import { setImmediate } from 'node:timers/promises'
 import type {
-  ConversationEvent, ConversationHistory, ConversationSummary, ConversationTurn, DesktopHostApi, DesktopHostStatus,
+  ConversationEvent, ConversationHistory, ConversationSummary, ConversationTurn, DesktopHostApi, DesktopHostStatus, SetConversationModelInput,
 } from '../../shared/contracts/desktop.ts'
 import { HostAgentAdapter } from '../src/integrations/agent/HostAgentAdapter.ts'
 import { applyHistory, applyHostEvent, applyOlderHistory, isBusy } from '../src/integrations/agent/conversationProjection.ts'
@@ -42,7 +42,7 @@ function testApi(getHistory: DesktopHostApi['getHistory'], watchConversation?: D
     onStatus(listener) { receiveStatus = listener; return () => { receiveStatus = () => {} } },
     createConversation: unavailable, listConversations: async () => [conversation], getConversation: unavailable,
     sendMessage: unavailable, steerConversation: unavailable, stopConversation: unavailable,
-    resumeConversation: unavailable, renameConversation: unavailable, archiveConversation: unavailable,
+    resumeConversation: unavailable, renameConversation: unavailable, setConversationModel: unavailable, archiveConversation: unavailable,
     chooseWorkspace: unavailable, restart: unavailable,
   }
   return { api, actions, emit: (value: ConversationEvent) => receive(value), status: (value: DesktopHostStatus) => receiveStatus(value) }
@@ -176,7 +176,7 @@ test('projection retains cached history across a disjoint snapshot and fills the
   assert.equal(applyHistory(numberedPage(130, 199), view), view)
 })
 
-test('Zustand retains older pages on reconnect and refreshes overlapping turns from the latest snapshot', async () => {
+async function loadWorkspaceFactory() {
   // Node's test loader resolves the same local TypeScript modules that Vite resolves.
   const hook = registerHooks({
     resolve(specifier, context, nextResolve) {
@@ -184,9 +184,12 @@ test('Zustand retains older pages on reconnect and refreshes overlapping turns f
       return nextResolve(localSource && !specifier.endsWith('.ts') ? specifier + '.ts' : specifier, context)
     },
   })
-  let storeFactory: typeof import('../src/stores/workspace.ts').createWorkspace
-  try { ({ createWorkspace: storeFactory } = await import('../src/stores/workspace.ts')) }
+  try { return (await import('../src/stores/workspace.ts')).createWorkspace }
   finally { hook.deregister() }
+}
+
+test('Zustand retains older pages on reconnect and refreshes overlapping turns from the latest snapshot', async () => {
+  const storeFactory = await loadWorkspaceFactory()
   let total = 65
   let cursor = 100
   const { api, actions, emit, status } = testApi(async ({ before }) => numberedPage(total, cursor, before))
@@ -213,6 +216,48 @@ test('Zustand retains older pages on reconnect and refreshes overlapping turns f
     emit(delta)
     emit(delta)
     assert.equal(store.getState().sessions[0].turns.at(-1)?.response, 'snapshot-140 replay')
+  } finally {
+    close()
+    adapter.dispose()
+  }
+})
+
+test('Zustand projects confirmed and pending models from events and sends null for cancellation', async () => {
+  const storeFactory = await loadWorkspaceFactory()
+  const a = { provider: 'faux', model: 'a' }
+  const b = { provider: 'faux', model: 'b' }
+  const c = { provider: 'faux', model: 'c' }
+  const starting = { ...conversation, route: a }
+  const { api, emit } = testApi(async () => ({ ...history(4), conversation: starting }))
+  const requests: SetConversationModelInput[] = []
+  api.setConversationModel = async (input) => {
+    requests.push(input)
+    if (input.route?.model === b.model) {
+      const pending = { ...starting, pendingRoute: b }
+      emit(event(5, 'conversation.model_requested', { conversation: pending }))
+      emit(event(6, 'model.route_changed', { conversation: { ...starting, route: b } }))
+      return pending // The original acknowledgement precedes the application event.
+    }
+    const updated = { ...starting, route: b, pendingRoute: input.route ?? undefined }
+    emit(event(5 + requests.length, 'conversation.model_requested', { conversation: updated }))
+    return updated
+  }
+  const adapter = new HostAgentAdapter(api)
+  const store = storeFactory(adapter, false)
+  const close = store.getState().initialize()
+  try {
+    await setImmediate()
+    assert.deepEqual(store.getState().sessions[0].route, a)
+    assert.equal(await store.getState().setConversationModel(conversation.id, b), true)
+    assert.deepEqual(store.getState().sessions[0].route, b)
+    assert.equal(store.getState().sessions[0].pendingRoute, undefined)
+    assert.equal(await store.getState().setConversationModel(conversation.id, c), true)
+    assert.deepEqual(store.getState().sessions[0].route, b)
+    assert.deepEqual(store.getState().sessions[0].pendingRoute, c)
+    assert.equal(await store.getState().setConversationModel(conversation.id, null), true)
+    assert.equal(requests.at(-1)?.route, null)
+    assert.deepEqual(store.getState().sessions[0].route, b)
+    assert.equal(store.getState().sessions[0].pendingRoute, undefined)
   } finally {
     close()
     adapter.dispose()

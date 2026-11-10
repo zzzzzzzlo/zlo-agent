@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type {
-  CreateConversationInput, DesktopHostStatus, SendMessageInput, SteerInput,
+  CreateConversationInput, DesktopHostStatus, ModelRoute, SendMessageInput, SetConversationModelInput, SteerInput,
 } from '../../../shared/contracts/desktop.ts'
 import { HostAgentAdapter } from '../integrations/agent/HostAgentAdapter'
 import { MockDesktopHost } from '../integrations/agent/MockDesktopHost'
@@ -30,6 +30,7 @@ interface Workspace extends Preferences {
   createSession(input?: NewConversation): Promise<boolean>
   selectSession(id: string): void
   renameSession(id: string, title: string): Promise<boolean>
+  setConversationModel(id: string, route: ModelRoute | null): Promise<boolean>
   deleteSession(id: string): Promise<boolean>
   loadOlder(): Promise<boolean>
   setTheme(theme: Theme): void
@@ -76,6 +77,7 @@ export function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boo
     let connection = 0
     let pendingMessage: SendMessageInput | SteerInput | undefined
     let pendingCreate: { signature: string; requestId: string } | undefined
+    let pendingModel: SetConversationModelInput | undefined
 
     function persist() {
       const { activeId, theme, strength, sidebar, drafts } = get()
@@ -254,6 +256,24 @@ export function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boo
         return mutate(async () => {
           const summary = await commands!.renameConversation({ conversationId: id, requestId: crypto.randomUUID(), title })
           updateSession(id, (session) => ({ ...session, title: summary.title }))
+        })
+      },
+      setConversationModel(id, route) {
+        return mutate(async () => {
+          const previous = pendingModel
+          const sameRoute = previous?.route?.provider === route?.provider && previous?.route?.model === route?.model
+          const request = previous?.conversationId === id && sameRoute
+            ? previous
+            : { conversationId: id, requestId: crypto.randomUUID(), route }
+          pendingModel = request
+          try {
+            // The durable conversation event owns the projection. A delayed or retried receipt can be older.
+            await commands!.setConversationModel(request)
+            pendingModel = undefined
+          } catch (error) {
+            if (rejected(error)) pendingModel = undefined
+            throw error
+          }
         })
       },
       deleteSession(id) {

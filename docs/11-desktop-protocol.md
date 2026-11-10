@@ -26,6 +26,7 @@ Phase 1 冻结接口在 `shared/contracts/domain.ts` 与 `shared/contracts/deskt
 | `sendMessage` | `conversationId`、`requestId` 和 `text`。返回独立的 `taskId` 与 `taskRunId` |
 | `steerConversation` | 对当前 `taskId` 追加 `text`，在接受后持久化并在可用时送入 Pi 的 steering 队列 |
 | `stopConversation`、`resumeConversation` | `conversationId`、`taskId`、`requestId`。返回接受结果与当时状态 |
+| `setConversationModel` | `conversationId`、`requestId`、`route`。路由为 null 时撤销待应用请求。返回会话摘要 |
 | `renameConversation`、`archiveConversation` | 按 `conversationId` 更新摘要，归档保留历史 |
 | `subscribeConversation`、`unsubscribeConversation` | 按会话订阅或移除订阅。订阅的 `after` 排除该序号 |
 
@@ -37,6 +38,7 @@ Preload 将 `getHistory`、`watchConversation`、`unwatchConversation` 映射到
 
 | 事件 | 数据 |
 | --- | --- |
+| `conversation.model_requested`、`model.route_changed` | 请求或已应用路由的会话摘要 |
 | `conversation.created/updated/archived` | Conversation 摘要 |
 | `message.created` | 持久用户消息或追加说明、关联 Task 与当前轮次 |
 | `message.delta` | 助理消息 ID 与持久文本增量 |
@@ -48,3 +50,5 @@ Preload 将 `getHistory`、`watchConversation`、`unwatchConversation` 映射到
 | `run.interrupted/finished` | 结束状态及可选原因 |
 
 Pi 消费追加指令后由 SDK 事件确认，Host 在会话检查点刷盘后核销。尚未确认的追加说明留作恢复时的待处理指令。未确认的文件写入进入人工核对，拒绝同一 Conversation 继续执行。
+
+模型配置区分 `route` 与 `pendingRoute`。创建后尚未建立 Session 时可设置首选路由。已有 Session 的换模在后续自然的 Pi 轮次或下一条用户消息应用，沿用原 Pi Session。换模不单独发起模型请求。跨 Provider 以及会话正在打开、停止、待核对时的请求会被拒绝。

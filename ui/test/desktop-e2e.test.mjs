@@ -85,7 +85,7 @@ async function crashTestHost(app, data) {
   process.kill(pid, 'SIGKILL')
 }
 
-test('Windows Electron uses the Pi Host for coding, steering, stop and history recovery',
+test('Windows Electron uses the Pi Host for coding, model switch, steering, stop and history recovery',
   { skip: process.platform !== 'win32', timeout: 90000 }, async () => {
     const root = await mkdtemp(join(tmpdir(), 'zlo-electron-e2e-'))
     const workspace = join(root, 'selected-workspace')
@@ -144,6 +144,25 @@ test('Windows Electron uses the Pi Host for coding, steering, stop and history r
       assert.notEqual(snapshot.turns[1].taskRunId, snapshot.turns[1].taskAttemptId)
       assert.match(await readFile(join(workspace, 'login.html'), 'utf8'), /name="captcha"/)
 
+      await page.getByRole('button', { name: '会话模型设置' }).click()
+      const modelDialog = page.getByRole('dialog', { name: '会话模型' })
+      await modelDialog.getByLabel('模型 ID').fill('unavailable-test-model')
+      await modelDialog.getByRole('button', { name: '保存模型' }).click()
+      await modelDialog.getByRole('alert').waitFor()
+      const unchanged = await history(page, id)
+      assert.equal(unchanged.conversation.route.model, 'desktop-test')
+      assert.equal(unchanged.conversation.piSessionId, sessionId)
+      assert.equal(unchanged.conversation.pendingRoute, undefined)
+      await modelDialog.getByLabel('模型 ID').fill('desktop-alt')
+      await modelDialog.getByRole('button', { name: '保存模型' }).click()
+      await modelDialog.waitFor({ state: 'hidden' })
+      await page.locator('[data-model-pending]').waitFor()
+      assert.match(await page.locator('[data-model-pending]').textContent(), /desktop-alt/)
+      const pending = await history(page, id)
+      assert.equal(pending.turns.length, 2)
+      assert.equal(pending.conversation.route.model, 'desktop-test')
+      assert.equal(pending.conversation.pendingRoute.model, 'desktop-alt')
+
       await send(page, '[steer] 检查当前页面')
       await page.getByRole('button', { name: '停止生成' }).waitFor()
       await waitForPartial(page, id, '[steer]')
@@ -151,6 +170,10 @@ test('Windows Electron uses the Pi Host for coding, steering, stop and history r
       await page.getByRole('button', { name: '追加指令' }).click()
       await waitForRun(page, id, 3, 'succeeded')
       snapshot = await history(page, id)
+      assert.equal(snapshot.conversation.route.model, 'desktop-alt')
+      assert.equal(snapshot.conversation.pendingRoute, undefined)
+      assert.equal(snapshot.conversation.piSessionId, sessionId)
+      await eventually(async () => (await page.locator('[data-model-current]').textContent()).includes('desktop-alt'), 'applied desktop model')
       assert.equal(snapshot.turns[2].instructions[0].text, '仅保留现有验证码控件')
       assert.match(snapshot.turns[2].assistant.text, /已应用追加指令：仅保留现有验证码控件/)
 

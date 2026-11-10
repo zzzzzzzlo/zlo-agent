@@ -240,11 +240,12 @@ export class TaskEngine {
     })
   }
 
-  switchRoute(taskId: string, requestId: string, route: ModelRoute): { accepted: true } {
+  switchRoute(taskId: string, requestId: string, route: ModelRoute | undefined, onAccepted?: () => void): { accepted: true } {
     return this.#command(requestId, ['switch', taskId, route], () => {
       const task = this.get(taskId)
       if (!['ready', 'running', 'verifying', 'stopped', 'blocked'].includes(task.status)) throw new Error('Task does not accept a model change')
       this.#save({ ...task, route })
+      onAccepted?.()
       this.#event(task, 'model.switch_requested', { route }, requestId)
       return { accepted: true }
     })

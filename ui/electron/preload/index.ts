@@ -31,6 +31,7 @@ const agentHost: DesktopHostApi = {
   steerConversation: (input) => ipcRenderer.invoke(agentChannels.steerConversation, input),
   stopConversation: (input) => ipcRenderer.invoke(agentChannels.stopConversation, input),
   resumeConversation: (input) => ipcRenderer.invoke(agentChannels.resumeConversation, input),
+  setConversationModel: (input) => ipcRenderer.invoke(agentChannels.setConversationModel, input),
   renameConversation: (input) => ipcRenderer.invoke(agentChannels.renameConversation, input),
   archiveConversation: (input) => ipcRenderer.invoke(agentChannels.archiveConversation, input),
   watchConversation: (input) => ipcRenderer.invoke(agentChannels.watchConversation, input),

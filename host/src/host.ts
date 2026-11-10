@@ -6,12 +6,12 @@ import type { AgentEvent, ModelRoute, TaskStatus, VerificationCheck } from './co
 import type {
   ActionResult, ArchiveConversationInput, ConversationAction, ConversationEvent, ConversationHistory,
   ConversationSummary, CreateConversationInput, CursorInput, DesktopCommand, HistoryInput,
-  RenameConversationInput, SendMessageInput, SendMessageResult, SteerInput,
+  RenameConversationInput, SendMessageInput, SendMessageResult, SetConversationModelInput, SteerInput,
 } from '../../shared/contracts/desktop.ts'
 import {
-  ConversationError, ConversationService, parseConversationAction, parseCreateConversation, parseSendMessage, parseSteer,
+  ConversationError, ConversationService, parseConversationAction, parseCreateConversation, parseSendMessage, parseSetConversationModel, parseSteer,
 } from './conversation.ts'
-import { MultiAgentOrchestrator, executionFailure } from './orchestrator.ts'
+import { MultiAgentOrchestrator, executionFailure, sameRoute } from './orchestrator.ts'
 import { BaselineJudgment, CodingCapabilities, defaultCodingProfile, LocalContextBuilder, LocalModelScheduler } from './policies.ts'
 import type { CodingProfile } from './policies.ts'
 import { LocalStore } from './store.ts'
@@ -205,6 +205,56 @@ export class LocalAgentHost {
     return this.#conversations.archive(input)
   }
 
+  #modelChangeSource(conversation: ConversationSummary, target: ModelRoute | null): ModelRoute | undefined {
+    if (conversation.archived || conversation.latestStatus === 'needs_reconciliation' ||
+      (conversation.latestStatus && isStopping(conversation.latestStatus))) {
+      throw new ConversationError('CONFLICT', 'The conversation is not accepting a model change')
+    }
+    if (this.#orchestrator.isOpeningConversation(conversation.id)) {
+      throw new ConversationError('CONFLICT', 'The Pi session is opening. Wait for it to finish before changing the model.')
+    }
+    const current = this.#orchestrator.conversationRoute(conversation.id) ?? conversation.route
+    if (current && target && !this.#scheduler.canSwitch(current, target)) {
+      throw new ConversationError('CONFLICT', 'Cross-provider context transfer is disabled')
+    }
+    return current
+  }
+
+  async setConversationModel(input: SetConversationModelInput): Promise<ConversationSummary> {
+    this.#assertOpen()
+    const command = parseSetConversationModel(input)
+    const previous = this.#conversations.modelRequest(command)
+    if (previous) return previous
+    this.#modelChangeSource(this.#conversations.get(command.conversationId), command.route)
+    if (command.route) {
+      try {
+        await this.#scheduler.validateRoute(command.route)
+      } catch {
+        throw new ConversationError('MODEL_UNAVAILABLE', 'The selected model route is unavailable')
+      }
+    }
+    this.#assertOpen()
+    const duplicate = this.#conversations.modelRequest(command)
+    if (duplicate) return duplicate
+    const conversation = this.#conversations.get(command.conversationId)
+    const current = this.#modelChangeSource(conversation, command.route)
+    const status = conversation.latestStatus
+    const active = status === 'ready' || status === 'running' || status === 'verifying'
+    const deferred = Boolean(conversation.piSessionId) || active
+    const pending = deferred && command.route && (!current || !sameRoute(current, command.route)) ? command.route : undefined
+    const selected = deferred ? current : command.route ?? current
+    const commit = () => this.#conversations.recordModelRequest(command, selected, pending)
+    if (conversation.latestTaskId && (active || status === 'blocked' || status === 'stopped')) {
+      let result: ConversationSummary | undefined
+      this.#engine.switchRoute(conversation.latestTaskId, desktopRequestId(command.requestId), pending ?? selected, () => {
+        result = commit()
+      })
+      if (!result) throw new Error('Conversation model request receipt is missing')
+      return result
+    }
+    return this.#store.transaction(commit)
+  }
+
   async sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
     this.#assertOpen()
     const command = parseSendMessage(input)
@@ -217,7 +267,7 @@ export class LocalAgentHost {
     } catch {
       throw new ConversationError('INVALID_INPUT', 'The conversation workspace is unavailable')
     }
-    const route = conversation.route ?? this.#defaultRoute
+    const route = conversation.pendingRoute ?? conversation.route ?? this.#defaultRoute
     if (route) {
       try {
         await this.#scheduler.validateRoute(route)
@@ -231,7 +281,7 @@ export class LocalAgentHost {
     const current = this.#conversations.canSend(command.conversationId)
     this.#engine.create({
       requestId: desktopRequestId(command.requestId), conversationId: current.id, goal: command.text,
-      cwd: current.workspace, check: current.check, route: current.route ?? this.#defaultRoute,
+      cwd: current.workspace, check: current.check, route: current.pendingRoute ?? current.route ?? this.#defaultRoute,
     }, (task) => this.#conversations.attachTask(command, task))
     const sent = this.#conversations.sent(command)
     if (!sent) throw new Error('Conversation task receipt is missing')
@@ -398,6 +448,7 @@ export class LocalAgentHost {
       case 'steerConversation': return this.steerConversation(command)
       case 'stopConversation': return this.stopConversation(command)
       case 'resumeConversation': return this.resumeConversation(command)
+      case 'setConversationModel': return this.setConversationModel(command)
       case 'renameConversation': return this.renameConversation(command)
       case 'archiveConversation': return this.archiveConversation(command)
       default: throw new Error('Unknown command')
@@ -459,7 +510,7 @@ export class LocalAgentHost {
       }
       const latest = this.#engine.get(task.id)
       if (latest.instructions.some((item) => !item.delivered) || latest.worker?.status === 'ready' ||
-        (latest.route && (latest.route.model !== result.route.model || latest.route.provider !== result.route.provider))) {
+        (!latest.conversationId && latest.route && !sameRoute(latest.route, result.route))) {
         this.#engine.continueExecution(task.id)
         continue
       }

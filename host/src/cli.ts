@@ -34,7 +34,7 @@ const send = (message: object): void => { process.stdout.write(JSON.stringify(me
 const desktopTypes = new Set([
   'createConversation', 'listConversations', 'getConversation', 'getConversationHistory', 'sendMessage',
   'steerConversation', 'stopConversation', 'resumeConversation', 'renameConversation', 'archiveConversation',
-  'subscribeConversation', 'unsubscribeConversation',
+  'setConversationModel', 'subscribeConversation', 'unsubscribeConversation',
 ])
 const stopOutput = host.subscribeOutput((event) => {
   if (subscriptions.has(event.taskId)) send({ schemaVersion: 1, kind: 'output', event })

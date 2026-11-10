@@ -9,7 +9,7 @@ import type { HostProcessManager } from './host-process.ts'
 
 const commands = [
   'createConversation', 'listConversations', 'getConversation', 'getHistory', 'sendMessage',
-  'steerConversation', 'stopConversation', 'resumeConversation', 'renameConversation',
+  'steerConversation', 'stopConversation', 'resumeConversation', 'setConversationModel', 'renameConversation',
   'archiveConversation', 'watchConversation', 'unwatchConversation',
 ] as const
 

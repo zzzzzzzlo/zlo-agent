@@ -4,6 +4,7 @@ import { useWorkspace, activeSession } from '../../stores/workspace'
 import { IconButton } from '../ui/IconButton'
 import { BrandMark } from '../ui/BrandMark'
 import { Glass } from '../glass/Glass'
+import { ConversationModelDialog, routeLabel } from './ConversationModelDialog'
 
 export function TitleBar({ activity, onActivity, notify }: {
   activity: boolean
@@ -12,10 +13,15 @@ export function TitleBar({ activity, onActivity, notify }: {
 }) {
   const sidebar = useWorkspace((state) => state.sidebar)
   const toggle = useWorkspace((state) => state.toggleSidebar)
-  const title = useWorkspace((state) => activeSession(state)?.title ?? '新会话')
-  const route = useWorkspace((state) => activeSession(state)?.route)
+  const session = useWorkspace(activeSession)
+  const ready = useWorkspace((state) => state.host.state === 'ready')
+  const busy = useWorkspace((state) => state.pending)
   const mock = useWorkspace((state) => state.mock)
-  const modelLabel = mock ? 'Mock 模型' : route ? route.provider + '/' + route.model : 'Host 默认模型'
+  const [modelDialogId, setModelDialogId] = useState<string>()
+  const modelLabel = mock ? 'Mock 模型' : routeLabel(session?.route)
+  const pendingLabel = session?.pendingRoute ? '待应用 · ' + routeLabel(session.pendingRoute) : undefined
+  const modelStatus = session?.turns.at(-1)?.status ?? session?.latestStatus
+  const canChangeModel = Boolean(session?.loaded && ready && !busy && modelStatus !== 'stopping' && modelStatus !== 'reconciliation')
   return (
     <header className="titlebar">
       <div className={`title-brand ${sidebar ? '' : 'is-collapsed'}`}>
@@ -23,17 +29,22 @@ export function TitleBar({ activity, onActivity, notify }: {
         <IconButton label={sidebar ? '收起侧栏' : '展开侧栏'} aria-expanded={sidebar} onClick={toggle}><PanelLeft size={17} /></IconButton>
       </div>
       <div className="title-main">
-        <div className="title-location"><span>工作区</span><span aria-hidden="true">/</span><strong>{title}</strong></div>
+        <div className="title-location"><span>工作区</span><span aria-hidden="true">/</span><strong>{session?.title ?? '新会话'}</strong></div>
         <div className="title-actions">
           <Glass variant="control" className="model-shell">
-            <button className="model-button" title={modelLabel} onClick={() => notify(modelLabel + ' · 可在新建会话时选择模型')}>
-              <Box size={13} /><span>{modelLabel}</span>
+            <button className="model-button" aria-label="会话模型设置" aria-haspopup={mock ? undefined : 'dialog'}
+              title={pendingLabel ? modelLabel + ' / ' + pendingLabel : modelLabel}
+              disabled={!mock && !canChangeModel}
+              onClick={() => { if (mock) notify('界面演示使用固定模型。'); else setModelDialogId(session?.id) }}>
+              <Box size={13} /><span data-model-current>{modelLabel}</span>
+              {pendingLabel && <span className="status-stopping" data-model-pending>{pendingLabel}</span>}
             </button>
           </Glass>
           <IconButton label={activity ? '收起活动面板' : '展开活动面板'} aria-expanded={activity} className={activity ? 'is-on' : ''} onClick={onActivity}><PanelRight size={17} /></IconButton>
         </div>
       </div>
       <WindowControls />
+      {session && modelDialogId === session.id && <ConversationModelDialog key={session.id} session={session} onClose={() => setModelDialogId(undefined)} />}
     </header>
   )
 }

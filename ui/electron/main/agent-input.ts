@@ -4,7 +4,7 @@ import { HostTransportError } from './host-process.ts'
 
 type ApiMethod = 'createConversation' | 'listConversations' | 'getConversation' | 'getHistory' |
   'sendMessage' | 'steerConversation' | 'stopConversation' | 'resumeConversation' |
-  'renameConversation' | 'archiveConversation' | 'watchConversation' | 'unwatchConversation'
+  'setConversationModel' | 'renameConversation' | 'archiveConversation' | 'watchConversation' | 'unwatchConversation'
 
 type Input = Record<string, unknown>
 
@@ -63,6 +63,14 @@ export function directoryOverlaps(left: string, right: string): boolean {
   return contains(left, right) || contains(right, left)
 }
 
+function modelRoute(value: unknown) {
+  const route = object(value, ['provider', 'model'])
+  const provider = text(route.provider, 80)
+  const model = text(route.model, 200)
+  if (!/^[\w-]+$/.test(provider) || !/^[\w.:/-]+$/.test(model)) return invalid()
+  return { provider, model }
+}
+
 function createInput(value: unknown, allowedWorkspace: (path: string) => boolean): CreateConversationInput {
   const input = object(value, ['requestId', 'title', 'workspace', 'route', 'check'])
   const result: CreateConversationInput = { requestId: requestId(input.requestId) }
@@ -74,13 +82,7 @@ function createInput(value: unknown, allowedWorkspace: (path: string) => boolean
     }
     result.workspace = workspace
   }
-  if (input.route !== undefined) {
-    const route = object(input.route, ['provider', 'model'])
-    const provider = text(route.provider, 80)
-    const model = text(route.model, 200)
-    if (!/^[\w-]+$/.test(provider) || !/^[\w.:/-]+$/.test(model)) return invalid()
-    result.route = { provider, model }
-  }
+  if (input.route !== undefined) result.route = modelRoute(input.route)
   if (input.check !== undefined) {
     if (!result.workspace) return invalid()
     const check = object(input.check, ['path', 'contains'])
@@ -101,6 +103,13 @@ export function desktopCommand(
   const schemaVersion = 1
   switch (method) {
     case 'createConversation': return { schemaVersion, type: method, ...createInput(value, allowedWorkspace) }
+    case 'setConversationModel': {
+      const input = object(value, ['conversationId', 'requestId', 'route'])
+      return {
+        schemaVersion, type: method, ...ref(input), requestId: requestId(input.requestId),
+        route: input.route === null ? null : modelRoute(input.route),
+      }
+    }
     case 'listConversations':
       noInput(value)
       return { schemaVersion, type: method }

@@ -136,6 +136,10 @@ export class MockDesktopHost implements DesktopHostApi {
     return { ...summary }
   }
 
+  async setConversationModel(): Promise<ConversationSummary> {
+    throw new Error('界面演示使用固定模型。')
+  }
+
   async archiveConversation(input: ArchiveConversationInput) {
     const summary = this.#get(input.conversationId)
     if (summary.latestStatus === 'running') throw new Error('请先结束正在运行的任务。')

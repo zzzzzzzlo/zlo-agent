@@ -13,7 +13,10 @@ export class FauxExecution extends PiExecution {
       const runtime = await ModelRuntime.create({
         credentials: new InMemoryCredentialStore(), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false,
       })
-      const provider = fauxProvider({ models: [{ id: 'desktop-test' }], tokensPerSecond: 180, tokenSize: { min: 3, max: 3 } })
+      const provider = fauxProvider({
+        models: [{ id: 'desktop-test' }, { id: 'desktop-alt' }],
+        tokensPerSecond: 180, tokenSize: { min: 3, max: 3 },
+      })
       const respond: FauxResponseFactory = (context) => {
         provider.appendResponses([respond])
         const tool = (name: string, args: Record<string, string>) =>

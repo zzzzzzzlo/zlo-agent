@@ -27,6 +27,7 @@ export interface Session {
   latestStatus?: RunStatus
   workspace?: string
   route?: ConversationSummary['route']
+  pendingRoute?: ConversationSummary['pendingRoute']
   check?: ConversationSummary['check']
 }
 

@@ -10,6 +10,7 @@ export const agentChannels = {
   steerConversation: 'agent-host:steer',
   stopConversation: 'agent-host:stop',
   resumeConversation: 'agent-host:resume',
+  setConversationModel: 'agent-host:set-model',
   renameConversation: 'agent-host:rename',
   archiveConversation: 'agent-host:archive',
   watchConversation: 'agent-host:watch',

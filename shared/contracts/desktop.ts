@@ -10,6 +10,7 @@ export interface ConversationSummary {
   archived: boolean
   workspace: string
   route?: ModelRoute
+  pendingRoute?: ModelRoute
   check?: VerificationCheck
   piSessionId?: string
   latestTaskId?: string
@@ -70,6 +71,7 @@ export interface SendMessageResult { taskId: string; taskRunId: string }
 export interface ConversationAction { conversationId: string; taskId: string; requestId: string }
 export interface SteerInput extends ConversationAction { text: string }
 export interface RenameConversationInput { conversationId: string; requestId: string; title: string }
+export interface SetConversationModelInput { conversationId: string; requestId: string; route: ModelRoute | null }
 export interface ArchiveConversationInput { conversationId: string; requestId: string }
 export interface HistoryInput { conversationId: string; before?: number }
 export interface CursorInput { conversationId: string; after: number }
@@ -127,6 +129,7 @@ export interface DesktopHostApi {
   stopConversation(input: ConversationAction): Promise<ActionResult>
   resumeConversation(input: ConversationAction): Promise<ActionResult>
   renameConversation(input: RenameConversationInput): Promise<ConversationSummary>
+  setConversationModel(input: SetConversationModelInput): Promise<ConversationSummary>
   archiveConversation(input: ArchiveConversationInput): Promise<ConversationSummary>
   watchConversation(input: CursorInput): Promise<true>
   unwatchConversation(input: ConversationRef): Promise<true>
@@ -144,6 +147,7 @@ export type DesktopCommand =
   | Request<'steerConversation', SteerInput>
   | Request<'stopConversation' | 'resumeConversation', ConversationAction>
   | Request<'renameConversation', RenameConversationInput>
+  | Request<'setConversationModel', SetConversationModelInput>
   | Request<'archiveConversation', ArchiveConversationInput>
   | Request<'subscribeConversation', CursorInput>
   | Request<'unsubscribeConversation', ConversationRef>

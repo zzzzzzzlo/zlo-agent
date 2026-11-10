@@ -23,6 +23,13 @@ test('IPC input maps business calls to versioned commands', () => {
   assert.deepEqual(desktopCommand('stopConversation', { conversationId, taskId, requestId: 'req' }, denied), {
     schemaVersion: 1, type: 'stopConversation', conversationId, taskId, requestId: 'req',
   })
+  const modelRequest = { conversationId, requestId: 'model-change', route: { provider: 'openai', model: 'gpt-4.1-mini' } }
+  assert.deepEqual(desktopCommand('setConversationModel', modelRequest, denied), {
+    schemaVersion: 1, type: 'setConversationModel', ...modelRequest,
+  })
+  assert.deepEqual(desktopCommand('setConversationModel', { ...modelRequest, route: null }, denied), {
+    schemaVersion: 1, type: 'setConversationModel', ...modelRequest, route: null,
+  })
   assert.equal(new Set(Object.values(agentChannels)).size, Object.keys(agentChannels).length)
 })
 
@@ -39,6 +46,10 @@ test('IPC rejects malformed inputs and prevents Renderer command and path inject
   assert.throws(() => desktopCommand('watchConversation', { conversationId, after: Infinity }, denied), invalid)
   assert.throws(() => desktopCommand('createConversation', { requestId: 'c', route: { provider: 'x', model: 'x', key: 'hidden' } }, denied), invalid)
   assert.throws(() => desktopCommand('createConversation', { requestId: 'c', workspace }, denied), invalid)
+  const model = { conversationId, requestId: 'model-change' }
+  assert.throws(() => desktopCommand('setConversationModel', model, denied), invalid)
+  assert.throws(() => desktopCommand('setConversationModel', { ...model, route: { provider: 'x', model: 'x', token: 'hidden' } }, denied), invalid)
+  assert.throws(() => desktopCommand('setConversationModel', { ...model, route: null, taskId }, denied), invalid)
 })
 
 test('IPC grants selected workspace and limits file verification to a relative path', () => {

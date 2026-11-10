@@ -52,6 +52,7 @@ export class MultiAgentOrchestrator {
   readonly #onCheckpoint?: (taskId: string) => void
   readonly #outputSinks = new Set<(event: OutputEvent) => void | Promise<void>>()
   readonly #steering = new Map<string, (id: string, text: string) => Promise<boolean>>()
+  readonly #openingConversations = new Set<string>()
 
   constructor(ports: {
     store: LocalStore; tasks: TaskEngine; execution: AgentExecution; scheduler: ModelResourceScheduler;
@@ -84,6 +85,10 @@ export class MultiAgentOrchestrator {
 
   conversationRoute(conversationId: string): ModelRoute | undefined {
     return this.#db.get<AgentRecord>('agents', conversationId)?.route
+  }
+
+  isOpeningConversation(conversationId: string): boolean {
+    return this.#openingConversations.has(conversationId)
   }
 
   steer(taskId: string, instructionId: string, text: string): Promise<boolean> {
@@ -393,16 +398,18 @@ export class MultiAgentOrchestrator {
         }
       },
     })
-    const closeSession = async () => {
+    const closeSession = async (saveCheckpoint = true) => {
       if (!session) return
       const current = session
       session = undefined
       try {
         await unwatch?.()
-        await current.checkpoint()
-        this.#onCheckpoint?.(task.id)
-        this.#tasks.markDelivered(task.id, [...seenSteers])
-        seenSteers.clear()
+        if (saveCheckpoint) {
+          await current.checkpoint()
+          this.#onCheckpoint?.(task.id)
+          this.#tasks.markDelivered(task.id, [...seenSteers])
+          seenSteers.clear()
+        }
       } catch (error) {
         checkpointFailed = true
         throw error
@@ -415,9 +422,21 @@ export class MultiAgentOrchestrator {
         }
       }
     }
+    const conversationId = task.conversationId
+    const lockRoute = () => { if (conversationId) this.#openingConversations.add(conversationId) }
+    const unlockRoute = () => { if (conversationId) this.#openingConversations.delete(conversationId) }
+    const confirmOpenedRoute = async (candidate: ExecutionSession) => {
+      try {
+        await candidate.checkpoint()
+      } catch (error) {
+        checkpointFailed = true
+        throw error
+      }
+    }
     let openingSavedSession = false
     try {
-      const initialRoute = task.route ?? saved?.route
+      lockRoute()
+      const initialRoute = this.#tasks.get(task.id).route ?? saved?.route
       if (saved && initialRoute && !this.#scheduler.canSwitch(saved.route, initialRoute)) return { status: 'model_error' }
       if (initialRoute) {
         try {
@@ -429,10 +448,14 @@ export class MultiAgentOrchestrator {
       if (signal.aborted) return { status: 'interrupted' }
       openingSavedSession = Boolean(saved)
       session = await this.#execution.open(config(initialRoute, saved?.session))
-      openingSavedSession = false
-      if (saved && saved.session.id !== session.ref.id) {
+      if ((saved && (saved.session.id !== session.ref.id || saved.session.path !== session.ref.path)) ||
+        (initialRoute && !sameRoute(initialRoute, session.route))) {
         outcome = { status: 'checkpoint_error' }
+        await closeSession(false)
       } else {
+        if (saved && !sameRoute(saved.route, session.route)) await confirmOpenedRoute(session)
+        openingSavedSession = false
+        signal.throwIfAborted()
         unwatch = this.#watchStop(session, signal)
         event = this.#register(task, session, event, agentKey, 'root')
         registered = true
@@ -453,6 +476,7 @@ export class MultiAgentOrchestrator {
           const route = session.route
           this.#db.transaction(() => { this.#db.append({ ...event, type: 'model.route_changed', payload: { route } }) })
         }
+        unlockRoute()
         let nextPrompt = saved?.taskId === task.id
           ? 'Resume the task using the saved conversation. Recheck current workspace state before new edits and avoid repeating confirmed changes.\n\nOriginal task goal: ' + task.goal
           : task.goal
@@ -460,16 +484,20 @@ export class MultiAgentOrchestrator {
           const current = this.#tasks.get(task.id)
           if (current.route && !sameRoute(current.route, session.route)) {
             if (!this.#scheduler.canSwitch(session.route, current.route)) throw new ModelUnavailableError('Route conflicts with current provider')
+            lockRoute()
             const ref = session.ref
             await closeSession()
             if (signal.aborted) break
             openingSavedSession = true
             session = await this.#execution.open(config(current.route, ref))
-            openingSavedSession = false
-            if (session.ref.id !== ref.id) {
+            if (session.ref.id !== ref.id || session.ref.path !== ref.path || !sameRoute(current.route, session.route)) {
               outcome = { status: 'checkpoint_error' }
+              await closeSession(false)
               break
             }
+            await confirmOpenedRoute(session)
+            openingSavedSession = false
+            if (signal.aborted) break
             unwatch = this.#watchStop(session, signal)
             const applied = session.route
             this.#db.transaction(() => {
@@ -477,11 +505,14 @@ export class MultiAgentOrchestrator {
               this.#db.put('agents', agentKey, { ...agent, route: applied })
               this.#db.append({ ...event, type: 'model.route_changed', payload: { route: applied } })
             })
+            unlockRoute()
           }
           const workerResult = current.worker?.status === 'ready' ? await runWorker(current.worker) : undefined
           if (signal.aborted) break
           if (workerResult) nextPrompt += '\nWorker result:\n' + JSON.stringify(workerResult)
-          const instructions = this.#tasks.get(task.id).instructions.filter((item) => !item.delivered)
+          const latest = this.#tasks.get(task.id)
+          if (conversationId && latest.route && !sameRoute(latest.route, session.route)) continue
+          const instructions = latest.instructions.filter((item) => !item.delivered)
           prompted = new Set(instructions.map(({ id }) => id))
           const prompt = [nextPrompt, ...instructions.map(({ text }) => 'Additional user instruction: ' + text)].join('\n\n')
           streamed = false
@@ -511,7 +542,7 @@ export class MultiAgentOrchestrator {
           queuedSteers.clear()
           const after = this.#tasks.get(task.id)
           const more = after.instructions.some((item) => !item.delivered) || after.worker?.status === 'ready' ||
-            (after.route && !sameRoute(after.route, session.route))
+            (!conversationId && after.route && !sameRoute(after.route, session.route))
           if (!more || hasUnknownWrite()) {
             outcome = { status: 'completed', route: session.route, textProduced }
             break
@@ -529,6 +560,7 @@ export class MultiAgentOrchestrator {
       } catch {
         checkpointFailed = true
       } finally {
+        unlockRoute()
         release()
       }
       if (checkpointFailed || outputFailed) outcome = { status: 'checkpoint_error' }
