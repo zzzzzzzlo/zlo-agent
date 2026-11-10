@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { registerHooks } from 'node:module'
 import { setImmediate } from 'node:timers/promises'
 import type {
-  ConversationEvent, ConversationHistory, ConversationSummary, ConversationTurn, DesktopHostApi,
+  ConversationEvent, ConversationHistory, ConversationSummary, ConversationTurn, DesktopHostApi, DesktopHostStatus,
 } from '../../host/src/contracts/desktop.ts'
 import { HostAgentAdapter } from '../src/integrations/agent/HostAgentAdapter.ts'
-import { applyHistory, applyHostEvent, isBusy } from '../src/integrations/agent/conversationProjection.ts'
+import { applyHistory, applyHostEvent, applyOlderHistory, isBusy } from '../src/integrations/agent/conversationProjection.ts'
 
 const conversation: ConversationSummary = {
   id: 'conversation', title: 'Example', createdAt: 1, updatedAt: 1, archived: false, workspace: 'D:/workspace',
@@ -27,6 +28,7 @@ function history(cursor: number, text = 'start'): ConversationHistory {
 
 function testApi(getHistory: DesktopHostApi['getHistory'], watchConversation?: DesktopHostApi['watchConversation']) {
   let receive: (event: ConversationEvent) => void = () => {}
+  let receiveStatus: (status: DesktopHostStatus) => void = () => {}
   const actions: string[] = []
   const unavailable = async (): Promise<never> => { throw new Error('Unexpected call') }
   const api: DesktopHostApi = {
@@ -37,13 +39,26 @@ function testApi(getHistory: DesktopHostApi['getHistory'], watchConversation?: D
     },
     unwatchConversation: async () => { actions.push('unwatch'); return true },
     onEvent(listener) { receive = listener; return () => { receive = () => {} } },
-    onStatus: () => () => {},
-    createConversation: unavailable, listConversations: unavailable, getConversation: unavailable,
+    onStatus(listener) { receiveStatus = listener; return () => { receiveStatus = () => {} } },
+    createConversation: unavailable, listConversations: async () => [conversation], getConversation: unavailable,
     sendMessage: unavailable, steerConversation: unavailable, stopConversation: unavailable,
     resumeConversation: unavailable, renameConversation: unavailable, archiveConversation: unavailable,
     chooseWorkspace: unavailable, restart: unavailable,
   }
-  return { api, actions, emit: (value: ConversationEvent) => receive(value) }
+  return { api, actions, emit: (value: ConversationEvent) => receive(value), status: (value: DesktopHostStatus) => receiveStatus(value) }
+}
+
+function numberedPage(total: number, cursor: number, before?: number): ConversationHistory {
+  const newest = Math.min(total, before === undefined ? total : before - 1)
+  const oldest = Math.max(1, newest - 49)
+  const turns = Array.from({ length: newest - oldest + 1 }, (_, index) => {
+    const id = oldest + index
+    return {
+      ...turn, taskId: 'task-' + id, status: 'succeeded' as const,
+      assistant: { ...turn.assistant, id: 'assistant-' + id, text: 'snapshot-' + cursor },
+    }
+  })
+  return { conversation, turns, cursor, nextBefore: oldest > 1 ? oldest : undefined }
 }
 
 test('adapter replays events after a snapshot cursor without duplicate deltas', async () => {
@@ -94,6 +109,25 @@ test('adapter restores a fresh snapshot when there is a gap', async () => {
   adapter.dispose()
 })
 
+test('adapter refuses a gap repair snapshot older than the durable event', async () => {
+  let snapshots = 0
+  const { api, emit, actions } = testApi(async () => history(4))
+  const adapter = new HostAgentAdapter(api)
+  const failures: unknown[] = []
+  adapter.watch(conversation.id, {
+    history: () => { snapshots++ },
+    event: () => assert.fail('out-of-sequence event applied'),
+    error: (error) => failures.push(error),
+  })
+  await setImmediate()
+  emit(event(7))
+  await setImmediate()
+  assert.equal(snapshots, 1)
+  assert.equal(failures.length, 1)
+  assert.deepEqual(actions, ['watch:4', 'unwatch'])
+  adapter.dispose()
+})
+
 test('adapter does not subscribe a selection released while history was pending', async () => {
   let resolveHistory: (value: ConversationHistory) => void = () => {}
   const pending = new Promise<ConversationHistory>((resolve) => { resolveHistory = resolve })
@@ -123,4 +157,64 @@ test('projection preserves partial replies, tool status, usage and the reconcili
   assert.equal(latest.taskRunId, 'cycle')
   assert.equal(latest.attemptId, 'attempt')
   assert.equal(isBusy(latest.status), false)
+})
+
+test('projection retains cached history across a disjoint snapshot and fills the highest gap', () => {
+  let view = applyHistory(numberedPage(60, 100))
+  view = applyOlderHistory(view, numberedPage(60, 100, view.nextBefore))
+  view = applyHistory(numberedPage(130, 200), view)
+  assert.equal(view.turns.length, 110)
+  assert.equal(view.nextBefore, 81)
+  assert.equal(view.turns[60].id, 'task-81')
+  view = applyOlderHistory(view, numberedPage(130, 180, view.nextBefore))
+  assert.deepEqual(view.turns.map(({ id }) => id), Array.from({ length: 130 }, (_, index) => 'task-' + (index + 1)))
+  assert.equal(view.turns[40].response, 'snapshot-100')
+  assert.equal(view.turns[70].response, 'snapshot-180')
+  assert.equal(view.turns[129].response, 'snapshot-200')
+  assert.equal(view.nextBefore, undefined)
+  assert.equal(view.historyCursor, 200)
+  assert.equal(applyHistory(numberedPage(130, 199), view), view)
+})
+
+test('Zustand retains older pages on reconnect and refreshes overlapping turns from the latest snapshot', async () => {
+  // Node's test loader resolves the same local TypeScript modules that Vite resolves.
+  const hook = registerHooks({
+    resolve(specifier, context, nextResolve) {
+      const localSource = context.parentURL?.includes('/ui/src/') && specifier.startsWith('.')
+      return nextResolve(localSource && !specifier.endsWith('.ts') ? specifier + '.ts' : specifier, context)
+    },
+  })
+  let storeFactory: typeof import('../src/stores/workspace.ts').createWorkspace
+  try { ({ createWorkspace: storeFactory } = await import('../src/stores/workspace.ts')) }
+  finally { hook.deregister() }
+  let total = 65
+  let cursor = 100
+  const { api, actions, emit, status } = testApi(async ({ before }) => numberedPage(total, cursor, before))
+  const adapter = new HostAgentAdapter(api)
+  const store = storeFactory(adapter, false)
+  const close = store.getState().initialize()
+  try {
+    await setImmediate()
+    assert.equal(store.getState().sessions[0].turns.length, 50)
+    assert.equal(await store.getState().loadOlder(), true)
+    assert.equal(store.getState().sessions[0].turns.length, 65)
+    status({ state: 'offline', mode: 'faux' })
+    total = 69
+    cursor = 140
+    status({ state: 'ready', mode: 'faux' })
+    await setImmediate()
+    const restored = store.getState().sessions[0]
+    assert.deepEqual(restored.turns.map(({ id }) => id), Array.from({ length: 69 }, (_, index) => 'task-' + (index + 1)))
+    assert.equal(restored.nextBefore, undefined)
+    assert.equal(restored.turns[0].response, 'snapshot-100')
+    assert.equal(restored.turns[64].response, 'snapshot-140')
+    assert.ok(actions.includes('watch:140'))
+    const delta = { ...event(141, 'message.delta', { messageId: 'assistant-69', delta: ' replay' }), taskId: 'task-69' }
+    emit(delta)
+    emit(delta)
+    assert.equal(store.getState().sessions[0].turns.at(-1)?.response, 'snapshot-140 replay')
+  } finally {
+    close()
+    adapter.dispose()
+  }
 })

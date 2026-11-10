@@ -27,8 +27,8 @@ export class HostAgentAdapter {
     this.#disconnect = api.onEvent((event) => this.#receive(event))
   }
 
-  watch(conversationId: string, sink: WatchSink): () => void {
-    const watch: Watch = { sink, cursor: 0, loading: true, buffered: [] }
+  watch(conversationId: string, sink: WatchSink, from = 0): () => void {
+    const watch: Watch = { sink, cursor: from, loading: true, buffered: [] }
     this.#watches.set(conversationId, watch)
     void this.#restore(conversationId, watch)
     return () => {
@@ -57,7 +57,7 @@ export class HostAgentAdapter {
     if (event.seq !== watch.cursor + 1) {
       watch.loading = true
       watch.buffered = [event]
-      void this.#restore(event.conversationId, watch)
+      void this.#restore(event.conversationId, watch, event.seq)
       return
     }
     try {
@@ -68,10 +68,13 @@ export class HostAgentAdapter {
     }
   }
 
-  async #restore(conversationId: string, watch: Watch): Promise<void> {
+  async #restore(conversationId: string, watch: Watch, minCursor = watch.cursor): Promise<void> {
     try {
       const history = await this.#api.getHistory({ conversationId })
       if (this.#watches.get(conversationId) !== watch) return
+      if (history.conversation.id !== conversationId || history.cursor < minCursor) {
+        throw new Error('Host 返回了与当前会话不一致的历史快照。')
+      }
       watch.cursor = history.cursor
       watch.sink.history(history)
       await this.#api.watchConversation({ conversationId, after: history.cursor })

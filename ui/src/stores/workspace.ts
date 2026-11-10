@@ -4,8 +4,8 @@ import type {
 } from '../../../host/src/contracts/desktop.ts'
 import { HostAgentAdapter } from '../integrations/agent/HostAgentAdapter'
 import { MockDesktopHost } from '../integrations/agent/MockDesktopHost'
-import { applyHistory, applyHostEvent, isBusy, toSession, toTurn } from '../integrations/agent/conversationProjection'
-import type { Session } from '../features/sessions/model'
+import { applyHistory, applyHostEvent, applyOlderHistory, isBusy, toSession } from '../integrations/agent/conversationProjection'
+import type { ProjectedSession } from '../integrations/agent/conversationProjection'
 import type { GlassStrength, Theme } from '../features/appearance/preferences'
 
 interface Preferences {
@@ -19,7 +19,7 @@ interface Preferences {
 type NewConversation = Omit<CreateConversationInput, 'requestId'>
 
 interface Workspace extends Preferences {
-  sessions: Session[]
+  sessions: ProjectedSession[]
   host: DesktopHostStatus
   mock: boolean
   pending: boolean
@@ -68,7 +68,7 @@ function rejected(error: unknown): boolean {
   return error instanceof Error && /\[(INVALID_INPUT|NOT_FOUND|CONFLICT|MODEL_UNAVAILABLE)\]/.test(error.message)
 }
 
-function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boolean, storage?: Storage) {
+export function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boolean, storage?: Storage) {
   const preferences = load(storage)
   return create<Workspace>((set, get) => {
     const commands = adapter?.commands
@@ -90,7 +90,7 @@ function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boolean, s
       set({ error: error instanceof Error ? error.message : '桌面 Host 请求失败。' })
     }
 
-    function updateSession(id: string, update: (session: Session) => Session) {
+    function updateSession(id: string, update: (session: ProjectedSession) => ProjectedSession) {
       set(({ sessions }) => ({
         sessions: sessions.map((session) => session.id === id ? update(session) : session),
       }))
@@ -113,6 +113,7 @@ function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boolean, s
 
     function watch(id: string) {
       if (!adapter || watchers.has(id)) return
+      const cursor = get().sessions.find((session) => session.id === id)?.historyCursor
       const close = adapter.watch(id, {
         history: (history) => updateSession(id, (previous) => applyHistory(history, previous)),
         event: (event) => {
@@ -124,7 +125,7 @@ function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boolean, s
           updateSession(id, (session) => ({ ...session, loaded: false }))
           if (id === get().activeId) issue(error)
         },
-      })
+      }, cursor)
       watchers.set(id, close)
     }
 
@@ -140,9 +141,10 @@ function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boolean, s
         const summaries = await commands.listConversations()
         if (generation !== connection) return
         const state = get()
+        const cached = new Map(state.sessions.map((session) => [session.id, session]))
         const sessions = summaries.filter((summary) => !summary.archived)
           .sort((a, b) => b.updatedAt - a.updatedAt)
-          .map((summary) => toSession(summary))
+          .map((summary) => toSession(summary, cached.get(summary.id)))
         const activeId = sessions.some((session) => session.id === state.activeId) ? state.activeId : (sessions[0]?.id ?? null)
         set({ sessions, activeId, host: status, error: undefined })
         persist()
@@ -262,15 +264,14 @@ function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boolean, s
       },
       async loadOlder() {
         const session = activeSession(get())
-        if (!commands || !session?.nextBefore) return false
-        return mutate(async () => {
+        if (!commands || !session?.loaded || !session.nextBefore) return false
+        const generation = connection
+        const loaded = await mutate(async () => {
           const history = await commands.getHistory({ conversationId: session.id, before: session.nextBefore })
-          updateSession(session.id, (current) => {
-            const seen = new Set(current.turns.map(({ id }) => id))
-            const older = history.turns.map(toTurn).filter(({ id }) => !seen.has(id))
-            return { ...current, turns: [...older, ...current.turns], nextBefore: history.nextBefore }
-          })
+          if (generation !== connection) return
+          updateSession(session.id, (current) => applyOlderHistory(current, history))
         })
+        return loaded && generation === connection
       },
       setTheme(theme) { set({ theme }); persist() },
       setStrength(strength) { set({ strength }); persist() },
@@ -316,10 +317,10 @@ function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boolean, s
   })
 }
 
-const mockMode = import.meta.env.DEV && import.meta.env.VITE_ZLO_AGENT_MODE === 'mock'
-const api = mockMode ? new MockDesktopHost() : window.agentHost
+const mockMode = Boolean(import.meta.env?.DEV && import.meta.env.VITE_ZLO_AGENT_MODE === 'mock')
+const api = mockMode ? new MockDesktopHost() : globalThis.window?.agentHost
 const adapter = api ? new HostAgentAdapter(api) : undefined
 if (import.meta.hot) import.meta.hot.dispose(() => adapter?.dispose())
-export const useWorkspace = createWorkspace(adapter, mockMode, window.localStorage)
+export const useWorkspace = createWorkspace(adapter, mockMode, globalThis.window?.localStorage)
 export const activeSession = (state: Workspace) => state.sessions.find(({ id }) => id === state.activeId)
 export const activeDraft = (state: Workspace) => state.drafts[draftKey(state.activeId)] ?? ''

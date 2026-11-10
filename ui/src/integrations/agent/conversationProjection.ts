@@ -5,6 +5,11 @@ import type { EndReason } from '../../../../host/src/contracts/domain.ts'
 import type { Session, Turn } from '../../features/sessions/model'
 import type { RunStatus, ToolUpdate } from './AgentAdapter'
 
+export interface ProjectedSession extends Session {
+  historyCursor: number
+  turnOrder: ReadonlyMap<string, number>
+}
+
 const taskStates: Record<TaskStatus, RunStatus> = {
   ready: 'queued',
   running: 'running',
@@ -52,28 +57,54 @@ export function toTurn(turn: ConversationTurn): Turn {
   }
 }
 
-export function toSession(conversation: ConversationSummary, previous?: Session): Session {
+export function toSession(conversation: ConversationSummary, previous?: ProjectedSession): ProjectedSession {
   return {
     id: conversation.id, title: conversation.title, updatedAt: conversation.updatedAt,
     turns: previous?.turns ?? [], loaded: previous?.loaded ?? false, nextBefore: previous?.nextBefore,
     latestStatus: conversation.latestStatus && taskStates[conversation.latestStatus],
     workspace: conversation.workspace, route: conversation.route, check: conversation.check,
+    historyCursor: previous?.historyCursor ?? 0, turnOrder: previous?.turnOrder ?? new Map(),
   }
 }
 
-export function applyHistory(history: ConversationHistory, previous?: Session): Session {
+function mergePage(session: ProjectedSession, history: ConversationHistory, latest: boolean): ProjectedSession {
+  const turns = new Map(session.turns.map((turn) => [turn.id, turn]))
+  const order = new Map(session.turnOrder)
+  // The Host's exclusive history cursor is the ordinal of the page's first turn.
+  const first = history.nextBefore ?? 1
+  history.turns.forEach((turn, index) => {
+    if (latest || !turns.has(turn.taskId)) turns.set(turn.taskId, toTurn(turn))
+    order.set(turn.taskId, first + index)
+  })
+  const ordered = [...turns.values()].sort((a, b) => order.get(a.id)! - order.get(b.id)!)
+  let nextBefore = order.get(ordered.at(-1)?.id ?? '')
+  for (let index = ordered.length - 2; nextBefore && index >= 0; index--) {
+    if (order.get(ordered[index].id) !== nextBefore - 1) break
+    nextBefore--
+  }
+  return { ...session, turns: ordered, turnOrder: order, nextBefore: nextBefore && nextBefore > 1 ? nextBefore : undefined }
+}
+
+export function applyHistory(history: ConversationHistory, previous?: ProjectedSession): ProjectedSession {
+  if (previous && history.cursor < previous.historyCursor) return previous
   const session = toSession(history.conversation, previous)
-  return {
-    ...session, loaded: true, turns: history.turns.map(toTurn), nextBefore: history.nextBefore,
-  }
+  return mergePage({ ...session, loaded: true, historyCursor: history.cursor }, history, true)
 }
 
-export function applyHostEvent(session: Session, event: ConversationEvent): Session {
+export function applyOlderHistory(session: ProjectedSession, history: ConversationHistory): ProjectedSession {
+  return mergePage(session, history, false)
+}
+
+export function applyHostEvent(session: ProjectedSession, event: ConversationEvent): ProjectedSession {
+  if (event.seq <= session.historyCursor) return session
   const { payload } = event
-  const next = payload.conversation ? toSession(payload.conversation, session) : session
+  const next = { ...(payload.conversation ? toSession(payload.conversation, session) : session), historyCursor: event.seq }
   const taskId = event.taskId ?? payload.turn?.taskId
   if (!taskId) return next
   const current = next.turns.find(({ id }) => id === taskId)
+  const isNewTurn = payload.conversation?.latestTaskId === taskId &&
+    (event.type === 'task.created' || event.type === 'message.created')
+  if (!current && !isNewTurn) return next
   let updated = payload.turn ? toTurn(payload.turn) : current
   if (!updated) return next
   if (!payload.turn && event.type === 'message.delta' && payload.messageId === updated.assistantId && payload.delta) {
@@ -93,9 +124,12 @@ export function applyHostEvent(session: Session, event: ConversationEvent): Sess
       ...updated, tools: present ? updated.tools.map((item) => item.id === tool.id ? tool : item) : [...updated.tools, tool],
     }
   }
+  const previousLatest = next.turns.at(-1)
+  const turnOrder = current ? next.turnOrder
+    : new Map(next.turnOrder).set(taskId, (previousLatest ? next.turnOrder.get(previousLatest.id)! : 0) + 1)
   return {
     ...next, turns: current ? next.turns.map((turn) => turn.id === taskId ? updated : turn) : [...next.turns, updated],
-    latestStatus: !current || current === next.turns.at(-1) ? updated.status : next.latestStatus,
+    turnOrder, latestStatus: !current || current === previousLatest ? updated.status : next.latestStatus,
   }
 }
 
