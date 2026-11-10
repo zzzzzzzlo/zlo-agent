@@ -13,6 +13,9 @@ const conversations = 'conversations'
 const taskBindings = 'conversation-task-bindings'
 const requests = 'conversation-requests'
 const historyPageSize = 50
+const deltaBatchMs = 25
+const deltaBatchBytes = 16 * 1024
+const assistantCheckpoints = 'conversation-assistant-checkpoints'
 const live = new Set<TaskStatus>(['ready', 'running', 'verifying', 'stop_requested', 'stopping'])
 const transitions = new Set(['task.created', 'task.state_changed', 'task.stop_requested', 'task.stopped', 'task.resumed'])
 
@@ -23,6 +26,21 @@ interface StoredConversation extends ConversationSummary {
 interface TurnBinding {
   conversationId: string
   ordinal: number
+}
+
+interface AssistantCheckpoint {
+  text: string
+  through: number
+}
+
+interface PendingDelta {
+  source: EventDraft
+  binding: TurnBinding
+  messageId: string
+  chunks: string[]
+  bytes: number
+  timer: NodeJS.Timeout
+  flushing: boolean
 }
 
 export class ConversationError extends Error {
@@ -141,9 +159,12 @@ function accumulate(previous: UsageTotals, payload: EventDraft['payload']): Usag
 /** Owns conversation records and an ordered read projection of TaskEngine and runtime events. */
 export class ConversationService {
   readonly #store: LocalStore
+  readonly #pending = new Map<string, PendingDelta>()
+  readonly #onPersistenceFailure: () => void
 
-  constructor(store: LocalStore) {
+  constructor(store: LocalStore, onPersistenceFailure: () => void = () => {}) {
     this.#store = store
+    this.#onPersistenceFailure = onPersistenceFailure
     store.projectEvents((event) => this.#projectTask(event))
   }
 
@@ -165,6 +186,27 @@ export class ConversationService {
     const turn = this.#store.get<ConversationTurn>(turnNamespace(binding.conversationId), ordinalKey(binding.ordinal))
     if (!turn) throw new Error('Conversation history projection is missing')
     return turn
+  }
+
+  #readAssistant(conversationId: string, turn: ConversationTurn): AssistantCheckpoint | undefined {
+    const checkpoint = this.#store.get<AssistantCheckpoint>(assistantCheckpoints, turn.taskId)
+    if (!checkpoint || !live.has(turn.status)) return checkpoint
+    const deltas = this.#store.messageDeltas(conversationStream(conversationId), turn.assistant.id, checkpoint.through)
+    return deltas.length
+      ? { text: checkpoint.text + deltas.map(({ delta }) => delta).join(''), through: deltas.at(-1)!.seq }
+      : checkpoint
+  }
+
+  #displayTurn(conversationId: string, turn: ConversationTurn): ConversationTurn {
+    const assistant = this.#readAssistant(conversationId, turn)
+    return assistant ? { ...turn, assistant: { ...turn.assistant, text: assistant.text } } : turn
+  }
+
+  #compactAssistant(conversationId: string, turn: ConversationTurn): void {
+    const previous = this.#store.get<AssistantCheckpoint>(assistantCheckpoints, turn.taskId)
+    if (!previous) return
+    const latest = this.#readAssistant(conversationId, turn)!
+    if (latest.through > previous.through) this.#store.put(assistantCheckpoints, turn.taskId, latest)
   }
 
   #event(id: string, type: string, payload: ConversationEvent['payload'], source?: Partial<EventDraft>): void {
@@ -226,7 +268,7 @@ export class ConversationService {
     const rows = this.#store.listBefore<ConversationTurn>(
       turnNamespace(conversationId), before === undefined ? null : ordinalKey(before), historyPageSize + 1,
     )
-    const turns = rows.slice(0, historyPageSize).reverse()
+    const turns = rows.slice(0, historyPageSize).reverse().map((turn) => this.#displayTurn(conversationId, turn))
     const newest = Math.min(conversation.turnCount, before === undefined ? conversation.turnCount : before - 1)
     return {
       conversation: summary(conversation), turns, cursor: this.#store.eventCursor(conversationStream(conversationId)),
@@ -337,30 +379,84 @@ export class ConversationService {
   attachInstruction(input: SteerInput): void {
     this.assertCurrentTask(input)
     const binding = this.#store.get<TurnBinding>(taskBindings, input.taskId)!
+    this.#flushInTransaction(input.taskId)
     const turn = this.#turn(binding)
     const instruction = message('user', input.text, Date.now())
     turn.instructions.push(instruction)
     this.#saveTurn(binding, turn)
-    this.#event(input.conversationId, 'message.created', { turn, messageId: instruction.id }, {
+    this.#event(input.conversationId, 'message.created', { turn: this.#displayTurn(input.conversationId, turn), messageId: instruction.id }, {
       taskId: input.taskId, taskRunId: turn.taskRunId, taskAttemptId: turn.taskAttemptId,
     })
   }
 
   recordDelta(source: EventDraft, delta: string): void {
     if (!delta) return
-    const binding = this.#store.get<TurnBinding>(taskBindings, source.taskId)
+    const taskId = source.taskId
+    let pending = this.#pending.get(taskId)
+    if (pending && pending.source.agentRunId !== source.agentRunId) {
+      this.#store.transaction(() => this.#flushInTransaction(taskId))
+      pending = undefined
+    }
+    if (!pending) {
+      const binding = this.#store.get<TurnBinding>(taskBindings, taskId)
+      if (!binding) return
+      const turn = this.#turn(binding)
+      if (!live.has(turn.status)) return
+      const timer = setTimeout(() => {
+        try {
+          this.#store.transaction(() => this.#flushInTransaction(taskId))
+        } catch {
+          this.#onPersistenceFailure()
+        }
+      }, deltaBatchMs)
+      timer.unref()
+      pending = { source, binding, messageId: turn.assistant.id, chunks: [], bytes: 0, timer, flushing: false }
+      this.#pending.set(taskId, pending)
+    }
+    pending.chunks.push(delta)
+    pending.bytes += Buffer.byteLength(delta)
+    if (pending.bytes >= deltaBatchBytes) this.#store.transaction(() => this.#flushInTransaction(taskId))
+  }
+
+  checkpointOutput(taskId: string): void {
+    const binding = this.#store.get<TurnBinding>(taskBindings, taskId)
     if (!binding) return
     this.#store.transaction(() => {
-      const turn = this.#turn(binding)
-      turn.assistant.text += delta
-      this.#saveTurn(binding, turn)
-      this.#event(binding.conversationId, 'message.delta', { delta, messageId: turn.assistant.id }, source)
+      this.#flushInTransaction(taskId)
+      this.#compactAssistant(binding.conversationId, this.#turn(binding))
     })
+  }
+
+  #flushInTransaction(taskId: string): void {
+    const pending = this.#pending.get(taskId)
+    if (!pending || pending.flushing) return
+    const { binding, messageId, chunks, source, timer } = pending
+    pending.flushing = true
+    this.#store.onTransactionSettled((committed) => {
+      pending.flushing = false
+      if (committed) {
+        clearTimeout(timer)
+        this.#pending.delete(taskId)
+      }
+    })
+    if (!this.#store.get<AssistantCheckpoint>(assistantCheckpoints, taskId)) {
+      const turn = this.#turn(binding)
+      // Legacy turns already contain all deltas through this point.
+      this.#store.put(assistantCheckpoints, taskId, {
+        text: turn.assistant.text, through: this.#store.eventCursor(conversationStream(binding.conversationId)),
+      } satisfies AssistantCheckpoint)
+      if (turn.assistant.text) {
+        turn.assistant.text = ''
+        this.#saveTurn(binding, turn)
+      }
+    }
+    this.#event(binding.conversationId, 'message.delta', { delta: chunks.join(''), messageId }, source)
   }
 
   #projectTask(source: AgentEvent): void {
     const binding = this.#store.get<TurnBinding>(taskBindings, source.taskId)
     if (!binding) return
+    this.#flushInTransaction(source.taskId)
     const { conversationId } = binding
     const type = source.type
     if (type === 'agent.started' || type === 'agent.finished') {
@@ -427,6 +523,7 @@ export class ConversationService {
     const turn = this.#turn(binding)
     const status = source.payload.status as TaskStatus
     const terminal = !live.has(status)
+    if (terminal) this.#compactAssistant(conversation.id, turn)
     turn.status = status
     turn.reason = source.payload.reason as EndReason | undefined
     turn.taskAttemptId = source.taskAttemptId
@@ -440,9 +537,10 @@ export class ConversationService {
       conversation.updatedAt = Date.now()
       this.#saveConversation(conversation)
     }
-    const payload = { conversation: summary(conversation), turn, status, reason: turn.reason }
+    const displayed = this.#displayTurn(conversation.id, turn)
+    const payload = { conversation: summary(conversation), turn: displayed, status, reason: turn.reason }
     this.#event(conversation.id, source.type === 'task.created' ? 'task.created' : 'task.updated', payload, source)
-    if (status === 'succeeded' || (status === 'failed' && turn.verification && turn.assistant.text)) {
+    if (status === 'succeeded' || (status === 'failed' && turn.verification && displayed.assistant.text)) {
       this.#event(conversation.id, 'message.completed', { messageId: turn.assistant.id, status }, source)
     }
     if (terminal) {

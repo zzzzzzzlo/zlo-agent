@@ -26,6 +26,7 @@ export class LocalStore {
   readonly #subscriptions = new Map<string, Set<Subscription>>();
   readonly #projectors = new Set<(event: AgentEvent) => void>();
   #changedTasks: Set<string> | undefined;
+  #settlements: ((committed: boolean) => void)[] | undefined;
 
   constructor(databasePath: string) {
     const path = databasePath === ':memory:' ? databasePath : canonicalPath(databasePath);
@@ -66,8 +67,11 @@ export class LocalStore {
     if (this.#changedTasks) throw new Error('Nested store transactions are unsupported');
     this.#db.exec('BEGIN IMMEDIATE');
     const changedTasks = new Set<string>();
+    const settlements: ((committed: boolean) => void)[] = [];
     this.#changedTasks = changedTasks;
+    this.#settlements = settlements;
     let result: T;
+    let committed = false;
     try {
       result = callback();
       if (isThenable(result)) {
@@ -75,11 +79,14 @@ export class LocalStore {
         throw new Error('Store transaction callback must be synchronous');
       }
       this.#db.exec('COMMIT');
+      committed = true;
     } catch (error) {
       if (this.#db.isTransaction) this.#db.exec('ROLLBACK');
       throw error;
     } finally {
       this.#changedTasks = undefined;
+      this.#settlements = undefined;
+      for (const settle of settlements) settle(committed);
     }
     for (const taskId of changedTasks) {
       for (const subscription of this.#subscriptions.get(taskId) ?? []) {
@@ -87,6 +94,12 @@ export class LocalStore {
       }
     }
     return result;
+  }
+
+  /** Settle in-memory state alongside a synchronous write, including on rollback. */
+  onTransactionSettled(settle: (committed: boolean) => void): void {
+    this.#requireTransaction();
+    this.#settlements!.push(settle);
   }
 
   get<T>(namespace: string, id: string): T | undefined {
@@ -144,6 +157,17 @@ export class LocalStore {
   events(taskId: string, after = 0): AgentEvent[] {
     validateCursor(after);
     return this.#readEvents(taskId, after, -1);
+  }
+
+  messageDeltas(streamId: string, messageId: string, after: number): { seq: number; delta: string }[] {
+    return this.#db.prepare(`
+      SELECT seq, json_extract(event, '$.payload.delta') AS delta
+      FROM events
+      WHERE task_id = ? AND seq > ?
+        AND json_extract(event, '$.type') = 'message.delta'
+        AND json_extract(event, '$.payload.messageId') = ?
+      ORDER BY seq
+    `).all(streamId, after, messageId) as { seq: number; delta: string }[];
   }
 
   /** The cursor is exclusive. Sinks are serial per subscriber and run after commit. */

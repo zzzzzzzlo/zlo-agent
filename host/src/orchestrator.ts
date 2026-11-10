@@ -49,6 +49,7 @@ export class MultiAgentOrchestrator {
   readonly #judgment: JudgmentKernel
   readonly #sessions: string
   readonly #onOutput?: (event: EventDraft, delta: string) => void
+  readonly #onCheckpoint?: (taskId: string) => void
   readonly #outputSinks = new Set<(event: OutputEvent) => void | Promise<void>>()
   readonly #steering = new Map<string, (id: string, text: string) => Promise<boolean>>()
 
@@ -56,6 +57,7 @@ export class MultiAgentOrchestrator {
     store: LocalStore; tasks: TaskEngine; execution: AgentExecution; scheduler: ModelResourceScheduler;
     capabilities: CapabilityGateway; profile: Readonly<CodingProfile>; context: ContextBuilder; judgment: JudgmentKernel; sessions: string;
     onOutput?: (event: EventDraft, delta: string) => void
+    onCheckpoint?: (taskId: string) => void
   }) {
     this.#db = ports.store
     this.#tasks = ports.tasks
@@ -67,6 +69,7 @@ export class MultiAgentOrchestrator {
     this.#judgment = ports.judgment
     this.#sessions = ports.sessions
     this.#onOutput = ports.onOutput
+    this.#onCheckpoint = ports.onCheckpoint
   }
 
   subscribeOutput(sink: (event: OutputEvent) => void | Promise<void>): () => void {
@@ -397,6 +400,7 @@ export class MultiAgentOrchestrator {
       try {
         await unwatch?.()
         await current.checkpoint()
+        this.#onCheckpoint?.(task.id)
         this.#tasks.markDelivered(task.id, [...seenSteers])
         seenSteers.clear()
       } catch (error) {
@@ -497,6 +501,7 @@ export class MultiAgentOrchestrator {
           }
           try {
             await session.checkpoint()
+            this.#onCheckpoint?.(task.id)
           } catch (error) {
             checkpointFailed = true
             throw error

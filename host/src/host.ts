@@ -90,7 +90,7 @@ export class LocalAgentHost {
         })
       }
       this.#engine = new TaskEngine(this.#store)
-      this.#conversations = new ConversationService(this.#store)
+      this.#conversations = new ConversationService(this.#store, () => this.#failStorage())
       this.#scheduler = new LocalModelScheduler(options.execution)
       this.#orchestrator = new MultiAgentOrchestrator({
         store: this.#store, tasks: this.#engine, execution: options.execution, scheduler: this.#scheduler,
@@ -98,6 +98,7 @@ export class LocalAgentHost {
         context: new LocalContextBuilder(), judgment: new BaselineJudgment(),
         sessions: join(this.#directory, 'sessions'),
         onOutput: (event, delta) => this.#conversations.recordDelta(event, delta),
+        onCheckpoint: (taskId) => this.#conversations.checkpointOutput(taskId),
       })
       this.#recover()
     } catch (error) {
