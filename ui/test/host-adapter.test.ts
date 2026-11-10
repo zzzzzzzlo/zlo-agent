@@ -159,6 +159,24 @@ test('projection preserves partial replies, tool status, usage and the reconcili
   assert.equal(isBusy(latest.status), false)
 })
 
+test('projection retains workspace grants and upserts durable team and worker progress', () => {
+  const team = { id: 'team-node', role: 'team', status: 'running' } as const
+  const worker = { id: 'worker-node', parentNodeId: team.id, role: 'worker', status: 'running' } as const
+  let view = applyHistory({ ...history(1), conversation: { ...conversation, workspaceAccess: 'trusted' } })
+  view = applyHostEvent(view, event(2, 'agent.started', { node: team }))
+  view = applyHostEvent(view, event(3, 'agent.started', { node: worker }))
+  view = applyHostEvent(view, event(4, 'agent.finished', { node: { ...worker, status: 'succeeded' } }))
+  assert.equal(view.workspaceAccess, 'trusted')
+  assert.deepEqual(view.turns[0].nodes, [team, { ...worker, status: 'succeeded' }])
+  assert.equal(applyHostEvent(view, event(4, 'agent.started', { node: worker })), view)
+  const recovered = applyHistory({
+    conversation: { ...conversation, workspaceAccess: 'trusted' },
+    cursor: 5,
+    turns: [{ ...turn, nodes: [{ ...team, status: 'interrupted' }, { ...worker, status: 'succeeded' }] }],
+  }, view)
+  assert.deepEqual(recovered.turns[0].nodes, [{ ...team, status: 'interrupted' }, { ...worker, status: 'succeeded' }])
+})
+
 test('projection retains cached history across a disjoint snapshot and fills the highest gap', () => {
   let view = applyHistory(numberedPage(60, 100))
   view = applyOlderHistory(view, numberedPage(60, 100, view.nextBefore))

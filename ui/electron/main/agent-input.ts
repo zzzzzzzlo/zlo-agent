@@ -1,5 +1,7 @@
 import { isAbsolute, relative, sep } from 'node:path'
 import type { ConversationAction, ConversationRef, CreateConversationInput, DesktopCommand } from '../../../shared/contracts/desktop.ts'
+import { projectCommands } from '../../../shared/contracts/domain.ts'
+import type { VerificationCheck } from '../../../shared/contracts/domain.ts'
 import { HostTransportError } from './host-process.ts'
 
 type ApiMethod = 'createConversation' | 'listConversations' | 'getConversation' | 'getHistory' |
@@ -71,8 +73,33 @@ function modelRoute(value: unknown) {
   return { provider, model }
 }
 
+function relativePath(value: unknown, allowRoot = false): string {
+  const path = text(value, 512)
+  if (allowRoot && path === '.') return path
+  if (/^[\\/]|[<>:"|?*\u0000-\u001f\u007f]/u.test(path) ||
+    path.split(/[\\/]/u).some((part) => !part || part === '.' || part === '..')) return invalid()
+  return path
+}
+
+function verificationCheck(value: unknown, trusted: boolean): VerificationCheck {
+  const check = object(value, ['path', 'contains', 'command'])
+  if (!Object.hasOwn(check, 'command')) {
+    const path = relativePath(check.path)
+    return { path, ...(check.contains === undefined ? {} : { contains: text(check.contains, 16_000) }) }
+  }
+  if (!trusted || Object.hasOwn(check, 'path') || Object.hasOwn(check, 'contains')) return invalid()
+  const input = object(check.command, ['command', 'path', 'args'])
+  const command = projectCommands.find((candidate) => candidate === input.command)
+  if (!command) return invalid()
+  const path = relativePath(input.path, command !== 'node_script')
+  if (input.args === undefined) return { command: { command, path } }
+  if (command !== 'node_script' || !Array.isArray(input.args) || input.args.length > 16 ||
+    !input.args.every((arg) => typeof arg === 'string' && arg.length <= 1024 && !arg.includes('\0'))) return invalid()
+  return { command: { command, path, args: [...input.args] } }
+}
+
 function createInput(value: unknown, allowedWorkspace: (path: string) => boolean): CreateConversationInput {
-  const input = object(value, ['requestId', 'title', 'workspace', 'route', 'check'])
+  const input = object(value, ['requestId', 'title', 'workspace', 'workspaceAccess', 'route', 'check'])
   const result: CreateConversationInput = { requestId: requestId(input.requestId) }
   if (input.title !== undefined) result.title = text(input.title, 120)
   if (input.workspace !== undefined) {
@@ -82,13 +109,16 @@ function createInput(value: unknown, allowedWorkspace: (path: string) => boolean
     }
     result.workspace = workspace
   }
+  const access = input.workspaceAccess
+  if (access !== undefined) {
+    if (access !== 'read' && access !== 'write' && access !== 'trusted') return invalid()
+    if (access !== 'read' && !result.workspace) return invalid()
+    result.workspaceAccess = access
+  }
   if (input.route !== undefined) result.route = modelRoute(input.route)
   if (input.check !== undefined) {
     if (!result.workspace) return invalid()
-    const check = object(input.check, ['path', 'contains'])
-    const path = text(check.path, 512)
-    if (/^[\\/]|:/.test(path) || path.split(/[\\/]/).some((part) => !part || part === '.' || part === '..')) return invalid()
-    result.check = { path, ...(check.contains === undefined ? {} : { contains: text(check.contains, 16_000) }) }
+    result.check = verificationCheck(input.check, access === 'trusted')
   }
   return result
 }

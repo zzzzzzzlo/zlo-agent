@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
-import { mkdtemp, mkdir, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
@@ -226,6 +226,90 @@ test('Windows Electron uses the Pi Host for coding, model switch, steering, stop
         assert.ok(diagnostics.some((entry) => entry.code === code), 'Missing desktop diagnostic ' + code)
       }
       assert.doesNotMatch(log, /请简要总结修改|仅保留现有验证码控件|login\.html|unavailable-test-model/)
+    } catch (error) {
+      const trace = await readFile(join(data, 'logs', 'diagnostics.jsonl'), 'utf8').catch(() => '')
+      const codes = trace.match(/"code":"(?:desktop|host)\.[a-z_]+"/g)
+      if (codes?.length) t.diagnostic(codes.slice(-12).join(', '))
+      throw error
+    } finally {
+      await app?.close()
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+    }
+  })
+
+test('Windows Electron authorizes a writable workspace without a file check and confirms trusted project execution',
+  { skip: process.platform !== 'win32', timeout: 60000 }, async (t) => {
+    const root = await mkdtemp(join(tmpdir(), 'zlo-electron-grants-'))
+    const writable = join(root, 'writable')
+    const trusted = join(root, 'trusted')
+    const data = join(root, 'desktop-data')
+    await Promise.all([mkdir(writable), mkdir(trusted)])
+    await writeFile(join(trusted, 'package.json'), JSON.stringify({ private: true, scripts: { test: 'node verify.cjs' } }))
+    await writeFile(join(trusted, 'verify.cjs'), 'require("node:fs").writeFileSync("tested.txt", "verified")\n')
+    let app
+    try {
+      app = await launch(data)
+      const page = await ready(app)
+      await app.evaluate(({ dialog }, path) => {
+        dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] })
+        dialog.showMessageBox = async () => { throw new Error('Unexpected trust request for file-only access') }
+      }, writable)
+      await page.getByRole('button', { name: /新建会话/ }).click()
+      await page.getByLabel('会话名称').fill('独立写入授权')
+      await page.getByRole('button', { name: '选择工作区' }).click()
+      assert.equal(await page.getByLabel('工作区权限').inputValue(), 'write')
+      assert.equal(await page.getByLabel('验收文件（相对路径）').inputValue(), '')
+      await page.getByRole('button', { name: '创建会话' }).click()
+      await page.getByRole('button', { name: '创建会话' }).waitFor({ state: 'hidden' })
+      const [writeConversation] = await page.evaluate(() => window.agentHost.listConversations())
+      assert.equal(writeConversation.workspaceAccess, 'write')
+      assert.equal(writeConversation.check, undefined)
+      await send(page, '帮我创建一个简单的登录页面')
+      await waitForRun(page, writeConversation.id, 1, 'succeeded')
+      assert.match(await readFile(join(writable, 'login.html'), 'utf8'), /name="username"/)
+      assert.ok((await history(page, writeConversation.id)).turns[0].tools
+        .some(({ name, status }) => name === 'create_text_file' && status === 'succeeded'))
+      await send(page, '[team-check] 请用团队核对登录页')
+      await waitForRun(page, writeConversation.id, 2, 'succeeded')
+      const teamTurn = (await history(page, writeConversation.id)).turns[1]
+      assert.deepEqual(teamTurn.nodes?.map(({ role, status }) => [role, status]), [['team', 'succeeded'], ['worker', 'succeeded']])
+      await page.getByRole('button', { name: '展开活动面板' }).click()
+      await page.getByRole('complementary', { name: '活动面板' }).getByText('Team Agent', { exact: true }).waitFor()
+
+      // Exercise the trusted consent handler for both responses while leaving the
+      // Renderer, Preload, IPC, Host and real local project command paths intact.
+      await app.evaluate(({ dialog }, path) => {
+        dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] })
+        dialog.showMessageBox = async (_window, options) => {
+          if (!options.detail.includes(path) || options.defaultId !== 0 || options.cancelId !== 0) {
+            throw new Error('Unsafe trust prompt')
+          }
+          return { response: 0 }
+        }
+      }, trusted)
+      await page.getByRole('button', { name: /新建会话/ }).click()
+      await page.getByLabel('会话名称').fill('受信任项目验收')
+      await page.getByRole('button', { name: '选择工作区' }).click()
+      await page.getByLabel('工作区权限').selectOption('trusted')
+      await page.getByLabel('验收方式').selectOption('command')
+      assert.equal(await page.getByLabel('验收命令').inputValue(), 'npm_test')
+      await page.getByRole('button', { name: '创建会话' }).click()
+      await page.getByRole('dialog', { name: '新建会话' }).getByText(/已取消运行项目代码的授权/).waitFor()
+      assert.equal((await page.evaluate(() => window.agentHost.listConversations())).length, 1)
+      await app.evaluate(({ dialog }) => {
+        dialog.showMessageBox = async () => ({ response: 1 })
+      })
+      await page.getByRole('button', { name: '创建会话' }).click()
+      await page.getByRole('button', { name: '创建会话' }).waitFor({ state: 'hidden' })
+      const trustedConversation = (await page.evaluate(() => window.agentHost.listConversations()))
+        .find(({ title }) => title === '受信任项目验收')
+      assert.equal(trustedConversation.workspaceAccess, 'trusted')
+      assert.deepEqual(trustedConversation.check, { command: { command: 'npm_test', path: '.' } })
+      await send(page, '帮我创建一个简单的登录页面')
+      await waitForRun(page, trustedConversation.id, 1, 'succeeded')
+      const result = await history(page, trustedConversation.id)
+      assert.deepEqual(result.turns[0].verification, { passed: true, evidence: 'workspace_command_passed' })
+      assert.equal(await readFile(join(trusted, 'tested.txt'), 'utf8'), 'verified')
     } catch (error) {
       const trace = await readFile(join(data, 'logs', 'diagnostics.jsonl'), 'utf8').catch(() => '')
       const codes = trace.match(/"code":"(?:desktop|host)\.[a-z_]+"/g)

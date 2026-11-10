@@ -1,8 +1,18 @@
 import { Activity, X } from 'lucide-react'
+import { workspaceAccessLabels } from '../../features/sessions/model'
+import type { Turn } from '../../features/sessions/model'
+import type { RunStatus } from '../../integrations/agent/AgentAdapter'
 import { useWorkspace, activeSession } from '../../stores/workspace'
 import { Glass } from '../glass/Glass'
 import { IconButton } from '../ui/IconButton'
 import { RunBadge, ToolCard } from '../chat/ToolCard'
+
+const nodeStates: Record<NonNullable<Turn['nodes']>[number]['status'], RunStatus> = {
+  running: 'running',
+  succeeded: 'completed',
+  failed: 'error',
+  interrupted: 'stopped',
+}
 
 export function ActivityPanel({ onClose }: { onClose: () => void }) {
   const turn = useWorkspace((state) => activeSession(state)?.turns.at(-1))
@@ -26,6 +36,20 @@ export function ActivityPanel({ onClose }: { onClose: () => void }) {
                 </dl>
               )}
               {session?.workspace && <p className="activity-workspace" title={session.workspace}>{session.workspace}</p>}
+              {session?.workspaceAccess && <p>工作区权限 · {workspaceAccessLabels[session.workspaceAccess]}</p>}
+              {turn.nodes && turn.nodes.length > 0 && (
+                <>
+                  <h3 id="activity-collaboration">协作进度</h3>
+                  <ul aria-labelledby="activity-collaboration">
+                    {turn.nodes.map((node) => (
+                      <li className="activity-run" key={node.id} title={node.id}>
+                        <span>{node.role === 'team' ? 'Team Agent' : '临时 Worker'}</span>
+                        <RunBadge status={nodeStates[node.status]} />
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
               <h3>工具</h3>
               {turn.tools.length ? turn.tools.map((tool) => <ToolCard key={tool.id} tool={tool} />) : <p>本轮暂无工具记录。</p>}
             </>

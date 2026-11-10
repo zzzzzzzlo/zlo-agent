@@ -13,6 +13,21 @@ const commands = [
   'archiveConversation', 'watchConversation', 'unwatchConversation',
 ] as const
 
+interface DirectoryIdentity {
+  dev: bigint
+  ino: bigint
+}
+
+async function directoryIdentity(workspace: string): Promise<DirectoryIdentity | undefined> {
+  try {
+    if (await realpath(workspace) !== workspace) return undefined
+    const identity = await stat(workspace, { bigint: true })
+    if (identity.isDirectory()) return { dev: identity.dev, ino: identity.ino }
+  } catch {
+    return undefined
+  }
+}
+
 export function registerAgentIpc(options: {
   host: HostProcessManager
   rendererUrl: string
@@ -20,7 +35,39 @@ export function registerAgentIpc(options: {
   protectedPaths: string[]
 }): void {
   const { host } = options
-  const selectedDirectories = new WeakMap<WebContents, Set<string>>()
+  const selectedDirectories = new WeakMap<WebContents, Map<string, DirectoryIdentity>>()
+  const pendingTrust = new WeakSet<WebContents>()
+
+  async function checkWorkspace(window: BrowserWindow, workspace: string, expected?: DirectoryIdentity): Promise<DirectoryIdentity> {
+    const current = await directoryIdentity(workspace)
+    const selected = window.isDestroyed() ? undefined : selectedDirectories.get(window.webContents)?.get(workspace)
+    if (!current || !selected || current.dev !== selected.dev || current.ino !== selected.ino ||
+      (expected && selected !== expected) || window.webContents.getURL() !== options.rendererUrl) {
+      throw new HostTransportError('INVALID_INPUT', '工作区路径已改变，请重新选择。')
+    }
+    return selected
+  }
+
+  async function confirmTrustedWorkspace(window: BrowserWindow, workspace: string): Promise<void> {
+    const contents = window.webContents
+    if (pendingTrust.has(contents)) throw new HostTransportError('CONFLICT', '请先处理正在等待的项目授权。')
+    pendingTrust.add(contents)
+    try {
+      const { response } = await dialog.showMessageBox(window, {
+        type: 'warning',
+        title: '授权运行项目代码',
+        message: '是否允许本会话运行此工作区的项目脚本？',
+        detail: workspace + '\n\n项目脚本以当前用户身份运行，可以访问该用户有权访问的文件和网络。仅对你信任的项目授权。',
+        buttons: ['取消', '信任并允许执行'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      })
+      if (response !== 1) throw new HostTransportError('INVALID_INPUT', '已取消运行项目代码的授权。')
+    } finally {
+      pendingTrust.delete(contents)
+    }
+  }
 
   function register(channel: string, invoke: (window: BrowserWindow, value: unknown) => unknown) {
     ipcMain.handle(channel, async (event, ...args: unknown[]) => {
@@ -52,21 +99,22 @@ export function registerAgentIpc(options: {
     if (canceled || !filePaths[0] || window.isDestroyed()) return null
     const workspace = await realpath(filePaths[0])
     const protectedPaths = await Promise.all(options.protectedPaths.map((path) => realpath(path).catch(() => path)))
-    if (!localDirectory(workspace) || workspace === parse(workspace).root || !(await stat(workspace)).isDirectory()
+    const identity = await directoryIdentity(workspace)
+    if (!localDirectory(workspace) || workspace === parse(workspace).root || !identity
       || protectedPaths.some((path) => directoryOverlaps(path, workspace))) {
       throw new HostTransportError('INVALID_INPUT', '请选择本地磁盘上的独立工作区目录。')
     }
     if (window.isDestroyed() || window.webContents.getURL() !== options.rendererUrl) return null
     let selected = selectedDirectories.get(window.webContents)
     if (!selected) {
-      selected = new Set()
+      selected = new Map()
       selectedDirectories.set(window.webContents, selected)
       const contents = window.webContents
       contents.on('did-start-navigation', (details) => {
         if (details.isMainFrame && !details.isSameDocument) selectedDirectories.get(contents)?.clear()
       })
     }
-    selected.add(workspace)
+    selected.set(workspace, identity)
     return workspace
   })
 
@@ -74,9 +122,12 @@ export function registerAgentIpc(options: {
     register(agentChannels[method], async (window, input) => {
       const selected = selectedDirectories.get(window.webContents)
       const command = desktopCommand(method, input, (workspace) => selected?.has(workspace) ?? false)
-      if (command.type === 'createConversation' && command.workspace
-        && (await realpath(command.workspace).catch(() => undefined)) !== command.workspace) {
-        throw new HostTransportError('INVALID_INPUT', '工作区路径已改变，请重新选择。')
+      if (command.type === 'createConversation' && command.workspace) {
+        const grant = await checkWorkspace(window, command.workspace)
+        if (command.workspaceAccess === 'trusted') {
+          await confirmTrustedWorkspace(window, command.workspace)
+          await checkWorkspace(window, command.workspace, grant)
+        }
       }
       return host.request(command)
     })

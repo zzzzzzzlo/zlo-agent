@@ -1,5 +1,5 @@
 import type { RunStatus, ToolUpdate } from '../../integrations/agent/AgentAdapter'
-import type { ConversationMessage, ConversationSummary, ConversationTurn, TaskStatus } from '../../../../shared/contracts/desktop.ts'
+import type { ConversationMessage, ConversationSummary, ConversationTurn, TaskStatus, WorkspaceAccess } from '../../../../shared/contracts/desktop.ts'
 
 export interface Turn {
   id: string
@@ -15,6 +15,7 @@ export interface Turn {
   instructions?: ConversationMessage[]
   usage?: ConversationTurn['usage']
   verification?: ConversationTurn['verification']
+  nodes?: ConversationTurn['nodes']
 }
 
 export interface Session {
@@ -26,12 +27,19 @@ export interface Session {
   nextBefore?: number
   latestStatus?: RunStatus
   workspace?: string
+  workspaceAccess?: WorkspaceAccess
   route?: ConversationSummary['route']
   pendingRoute?: ConversationSummary['pendingRoute']
   check?: ConversationSummary['check']
 }
 
 export const newTitle = '新会话'
+
+export const workspaceAccessLabels: Record<WorkspaceAccess, string> = {
+  read: '只读',
+  write: '受控文件写入',
+  trusted: '受信任项目执行',
+}
 
 export function demoSessions(): Session[] {
   const now = Date.now()

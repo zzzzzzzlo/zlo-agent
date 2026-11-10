@@ -53,7 +53,8 @@ export function toTurn(turn: ConversationTurn): Turn {
     id: turn.taskId, taskRunId: turn.taskRunId, attemptId: turn.taskAttemptId,
     assistantId: turn.assistant.id, prompt: turn.user.text, response: turn.assistant.text,
     status: taskStates[turn.status], taskStatus: turn.status, error: turn.reason && reasons[turn.reason],
-    instructions: turn.instructions, tools: turn.tools.map(toTool), usage: turn.usage, verification: turn.verification,
+    instructions: turn.instructions, tools: turn.tools.map(toTool), usage: turn.usage,
+    verification: turn.verification, nodes: turn.nodes,
   }
 }
 
@@ -62,7 +63,8 @@ export function toSession(conversation: ConversationSummary, previous?: Projecte
     id: conversation.id, title: conversation.title, updatedAt: conversation.updatedAt,
     turns: previous?.turns ?? [], loaded: previous?.loaded ?? false, nextBefore: previous?.nextBefore,
     latestStatus: conversation.latestStatus && taskStates[conversation.latestStatus],
-    workspace: conversation.workspace, route: conversation.route, pendingRoute: conversation.pendingRoute, check: conversation.check,
+    workspace: conversation.workspace, workspaceAccess: conversation.workspaceAccess,
+    route: conversation.route, pendingRoute: conversation.pendingRoute, check: conversation.check,
     historyCursor: previous?.historyCursor ?? 0, turnOrder: previous?.turnOrder ?? new Map(),
   }
 }
@@ -122,6 +124,16 @@ export function applyHostEvent(session: ProjectedSession, event: ConversationEve
     const present = updated.tools.some(({ id }) => id === tool.id)
     updated = {
       ...updated, tools: present ? updated.tools.map((item) => item.id === tool.id ? tool : item) : [...updated.tools, tool],
+    }
+  }
+  if (!payload.turn && payload.node) {
+    const node = payload.node
+    const nodes = updated.nodes ?? []
+    updated = {
+      ...updated,
+      nodes: nodes.some(({ id }) => id === node.id)
+        ? nodes.map((item) => item.id === node.id ? node : item)
+        : [...nodes, node],
     }
   }
   const previousLatest = next.turns.at(-1)

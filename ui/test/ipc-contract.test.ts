@@ -69,3 +69,35 @@ test('IPC grants selected workspace and limits file verification to a relative p
   assert.equal(directoryOverlaps(join(workspace, 'child'), workspace), true)
   assert.equal(directoryOverlaps(workspace, workspace + '-different'), false)
 })
+
+test('workspace writes are independent of acceptance and only trusted workspaces can use project checks', () => {
+  const request = { requestId: 'workspace-grant', workspace }
+  const invalid = { code: 'INVALID_INPUT' }
+  assert.deepEqual(desktopCommand('createConversation', { ...request, workspaceAccess: 'write' }, allowed), {
+    schemaVersion: 1, type: 'createConversation', ...request, workspaceAccess: 'write',
+  })
+  const trusted = { ...request, workspaceAccess: 'trusted' }
+  const npm = { command: { command: 'npm_test', path: '.' } }
+  assert.deepEqual(desktopCommand('createConversation', { ...trusted, check: npm }, allowed), {
+    schemaVersion: 1, type: 'createConversation', ...trusted, check: npm,
+  })
+  assert.throws(() => desktopCommand('createConversation', { requestId: 'r', workspaceAccess: 'write' }, allowed), invalid)
+  assert.throws(() => desktopCommand('createConversation', { requestId: 'r', workspaceAccess: 'trusted' }, allowed), invalid)
+  assert.throws(() => desktopCommand('createConversation', { ...request, workspaceAccess: 'admin' }, allowed), invalid)
+  assert.throws(() => desktopCommand('createConversation', { ...trusted, check: npm }, denied), invalid)
+  for (const workspaceAccess of [undefined, 'read', 'write']) {
+    assert.throws(() => desktopCommand('createConversation', { ...request, workspaceAccess, check: npm }, allowed), invalid)
+  }
+  for (const check of [
+    { command: { command: 'cmd.exe', path: '.' } },
+    { command: { command: 'npm_test', path: '../outside' } },
+    { command: { command: 'npm_test', path: '.', args: ['--prefix', '../outside'] } },
+    { command: { command: 'npm_test', path: '.', shell: true } },
+    { command: { command: 'node_script', path: '.' } },
+    { command: { command: 'node_script', path: 'test.mjs', args: ['nul\0byte'] } },
+    { command: { command: 'node_script', path: 'test.mjs', args: Array(17).fill('arg') } },
+    { command: npm.command, path: 'unexpected.html' },
+  ]) {
+    assert.throws(() => desktopCommand('createConversation', { ...trusted, check }, allowed), invalid)
+  }
+})
