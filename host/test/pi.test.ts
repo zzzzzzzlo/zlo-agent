@@ -12,10 +12,10 @@ import { ModelUnavailableError, type ExecutionConfig, type RuntimeEvent } from '
 const firstRoute = { provider: 'faux', model: 'test-a' }
 const nextRoute = { provider: 'faux', model: 'test-b' }
 
-async function fixture(t: TestContext) {
+async function fixture(t: TestContext, contextWindow?: number) {
   const cwd = await mkdtemp(join(tmpdir(), 'zlo-pi-'))
   t.after(() => rm(cwd, { recursive: true, force: true }))
-  const faux = fauxProvider({ models: [{ id: firstRoute.model }, { id: nextRoute.model }] })
+  const faux = fauxProvider({ models: [{ id: firstRoute.model, contextWindow }, { id: nextRoute.model }] })
   const execution = new PiExecution(async () => {
     const runtime = await ModelRuntime.create({ authPath: join(cwd, 'auth.json'), modelsPath: null })
     runtime.registerNativeProvider(faux.provider)
@@ -32,6 +32,26 @@ async function fixture(t: TestContext) {
   }
   return { execution, config, faux, events }
 }
+
+test('Pi compacts an existing transcript at a request boundary and meters each provider call', async t => {
+  const { execution, config, faux, events } = await fixture(t, 4096)
+  const requests: string[] = []
+  config.reserveRequest = ({ kind }) => { requests.push(kind) }
+  faux.setResponses(Array.from({ length: 16 }, () => fauxAssistantMessage('verified detail '.repeat(130))))
+  const session = await execution.open(config)
+  try {
+    for (let turn = 0; turn < 5; turn++) {
+      assert.equal((await session.run('Keep this distinct context: ' + turn + ' ' + 'project evidence '.repeat(130))).status, 'completed')
+    }
+    await session.checkpoint()
+    assert.ok(requests.includes('compaction'))
+    assert.equal(events.filter(event => event.type === 'model.usage').length, requests.length)
+    assert.ok(events.some(event => event.type === 'context.compacted'))
+    assert.match(await readFile(session.ref.path, 'utf8'), /"type":"compaction"/)
+  } finally {
+    await session.dispose()
+  }
+})
 
 test('Pi executes an allowlisted tool, streams output and restores its transcript with a new model', async t => {
   const { execution, config, faux, events } = await fixture(t)

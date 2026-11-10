@@ -6,6 +6,7 @@ import { InMemoryCredentialStore, type AssistantMessage } from '@earendil-works/
 import {
   createAgentSession,
   createExtensionRuntime,
+  estimateTokens,
   ModelRuntime,
   SessionManager,
   SettingsManager,
@@ -13,7 +14,9 @@ import {
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent'
 import { ModelUnavailableError } from './execution.ts'
-import type { AgentExecution, ExecutionConfig, ExecutionResult, ExecutionSession, ExecutionTool, ModelRoute, RuntimeEvent, SessionRef } from './execution.ts'
+import type { AgentExecution, ExecutionConfig, ExecutionResult, ExecutionSession, ExecutionTool, ModelCandidate, ModelRoute, RuntimeEvent, SessionRef } from './execution.ts'
+
+const environmentProviders = ['openai', 'anthropic', 'google', 'deepseek']
 
 export class PiExecution implements AgentExecution {
   private runtime?: Promise<ModelRuntime>
@@ -42,11 +45,23 @@ export class PiExecution implements AgentExecution {
     await this.resolveModel(await this.getRuntime(), route)
   }
 
+  async discoverModels(provider?: string): Promise<ModelCandidate[]> {
+    const runtime = await this.getRuntime()
+    const candidates = runtime.getModels(provider).filter(model =>
+      (!this.environmentOnly || environmentProviders.includes(model.provider)) && model.input.includes('text'))
+    const authorized = new Set((await Promise.all([...new Set(candidates.map(model => model.provider))].map(async id =>
+      await runtime.checkAuth(id).catch(() => undefined) ? id : undefined))).filter(Boolean))
+    return candidates.filter(model => authorized.has(model.provider)).map(model => ({
+      route: { provider: model.provider, model: model.id }, contextWindow: model.contextWindow,
+      input: model.input, reasoning: model.reasoning, estimatedCost: model.cost.input + model.cost.output,
+    }))
+  }
+
   private async resolveModel(runtime: ModelRuntime, route?: ModelRoute) {
     if (!route) throw modelUnavailable('Choose a Pi provider and model explicitly')
     // These built-ins use direct environment credentials. Bedrock and Vertex can
     // also discover file/profile credentials even with an empty credential store.
-    if (this.environmentOnly && !['openai', 'anthropic', 'google', 'deepseek'].includes(route.provider)) {
+    if (this.environmentOnly && !environmentProviders.includes(route.provider)) {
       throw modelUnavailable('This Pi provider is not enabled for environment authentication')
     }
     const model = runtime.getModel(route.provider, route.model)
@@ -87,7 +102,7 @@ export class PiExecution implements AgentExecution {
       model,
       sessionManager: manager,
       settingsManager: SettingsManager.inMemory({
-        compaction: { enabled: false },
+        compaction: { enabled: false, keepRecentTokens: Math.min(12_000, Math.floor(model.contextWindow / 4)) },
         retry: { enabled: false, provider: { maxRetries: 0 } },
         cacheWarming: 'off',
         enableAnalytics: false,
@@ -101,29 +116,36 @@ export class PiExecution implements AgentExecution {
     let active: Promise<ExecutionResult> | undefined
     let stop: Promise<void> | undefined
     let lastAssistant: AssistantMessage | undefined
+    let compacting = false
     const providerMessages = new WeakSet<AssistantMessage>()
     const steering = new Map<string, string>()
     const emit = (event: RuntimeEvent): void => {
       try { config.onEvent(event) } catch { /* A subscriber cannot break the Pi loop. */ }
     }
-    const prepareRequest = session.agent.prepareRequest
-    session.agent.prepareRequest = async (request, signal) => {
-      signal?.throwIfAborted()
-      const prepared = await prepareRequest?.(request, signal)
-      signal?.throwIfAborted()
-      if (!stopping) emit({ type: 'model.request_started' })
+    const reserve = (estimatedInputTokens: number, maxOutputTokens: number, kind: 'prompt' | 'compaction') => {
       if (stopping) throw new Error('Run is stopping')
-      return prepared ?? undefined
+      config.reserveRequest?.({ route, estimatedInputTokens, maxOutputTokens, kind })
+      emit({ type: 'model.request_started' })
     }
     const stream = session.agent.streamFunction
     session.agent.streamFunction = async (model, context, options) => {
+      options?.signal?.throwIfAborted()
+      if (model.provider !== route.provider || model.id !== route.model) throw modelUnavailable('Provider route changed inside the session')
+      const maxTokens = Math.min(options?.maxTokens ?? model.maxTokens, 4096)
+      reserve(Buffer.byteLength(JSON.stringify(context)), maxTokens, compacting ? 'compaction' : 'prompt')
       writeHostDiagnostic('host.model_started', traceId)
       const requestFailed = () => writeHostDiagnostic(options?.signal?.aborted ? 'host.model_interrupted' : 'host.model_failed', traceId)
       try {
-        const response = await stream(model, context, options)
+        const response = await stream(model, context, { ...options, maxTokens })
         // Inspect only the completion category. Provider errors may contain request data.
         void response.result().then((message) => {
           providerMessages.add(message)
+          const { input, output, cacheRead, cacheWrite, cost } = message.usage
+          if (input || output || cacheRead || cacheWrite || !['aborted', 'error'].includes(message.stopReason)) {
+            const estimate = cost?.total
+            emit({ type: 'model.usage', input, output, cacheRead, cacheWrite,
+              ...(Number.isFinite(estimate) && estimate > 0 ? { estimatedCostUsd: estimate } : {}) })
+          }
           writeHostDiagnostic(message.stopReason === 'aborted' ? 'host.model_interrupted'
             : message.stopReason === 'error' || message.stopReason === 'length' ? 'host.model_failed' : 'host.model_completed', traceId)
         }, requestFailed)
@@ -140,8 +162,6 @@ export class PiExecution implements AgentExecution {
       }
       if (event.type === 'message_end' && event.message.role === 'assistant') {
         lastAssistant = event.message
-        const { input, output, cacheRead, cacheWrite } = event.message.usage
-        emit({ type: 'model.usage', input, output, cacheRead, cacheWrite })
       }
       if (event.type === 'message_end' && event.message.role === 'user') {
         const content = event.message.content
@@ -188,6 +208,17 @@ export class PiExecution implements AgentExecution {
         lastAssistant = undefined
         active = (async (): Promise<ExecutionResult> => {
           try {
+            const contextTokens = session.messages.reduce((sum, message) => sum + estimateTokens(message), 0)
+            if (session.messages.length > 6 && contextTokens > model.contextWindow * 0.7) {
+              compacting = true
+              try {
+                const compacted = await session.compact('Keep task constraints, verified changes, and pending work with their references.')
+                emit({ type: 'context.compacted', tokensBefore: compacted.tokensBefore, estimatedTokensAfter: compacted.estimatedTokensAfter })
+              } finally {
+                compacting = false
+              }
+            }
+            if (stopping) return { status: 'interrupted' }
             await session.prompt(prompt, { expandPromptTemplates: false })
           } catch {
             return { status: stopping ? 'interrupted' : 'runtime_error' }

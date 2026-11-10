@@ -1,98 +1,8 @@
-import type { AgentExecution } from './execution.ts'
-import type { ContextPackage, ModelRoute } from './contracts/domain.ts'
+import type { VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
+import { workspaceTarget } from './workspace.ts'
+import type { CodingWorkspace, WorkspaceTool } from './workspace.ts'
 
-export interface ModelResourceScheduler {
-  validateRoute(route: ModelRoute): Promise<void>
-  canSwitch(current: ModelRoute, target: ModelRoute): boolean
-  reserve(taskId: string, role: 'root' | 'worker'): () => void
-  getRouteStatus(): { quota: 'unknown'; activeReservations: number }
-}
-
-export class LocalModelScheduler implements ModelResourceScheduler {
-  readonly #execution: AgentExecution
-  readonly #active = new Set<string>()
-
-  constructor(execution: AgentExecution) { this.#execution = execution }
-
-  validateRoute(route: ModelRoute): Promise<void> {
-    if (typeof route?.provider !== 'string' || typeof route.model !== 'string' ||
-      !/^[\w-]{1,80}$/.test(route.provider) || !/^[\w.:/-]{1,200}$/.test(route.model)) {
-      throw new Error('Invalid model route')
-    }
-    return this.#execution.validateRoute(route)
-  }
-
-  canSwitch(current: ModelRoute, target: ModelRoute): boolean {
-    return current.provider === target.provider
-  }
-
-  reserve(taskId: string, role: 'root' | 'worker'): () => void {
-    const key = taskId + ':' + role
-    if (this.#active.has(key)) throw new Error('Agent capacity exhausted')
-    this.#active.add(key)
-    return () => { this.#active.delete(key) }
-  }
-
-  getRouteStatus() { return { quota: 'unknown' as const, activeReservations: this.#active.size } }
-}
-
-export interface ContextBuilder {
-  worker(context: ContextPackage): string
-}
-
-export class LocalContextBuilder implements ContextBuilder {
-  worker(context: ContextPackage): string {
-    return [
-      'Investigate this scoped task in the supplied workspace using the read-only tools.',
-      'Return a concise factual summary with relative file references and remaining risks.',
-      'Task goal: ' + context.goal,
-      'Constraints: ' + context.constraints.join(' '),
-      'Available tools: ' + context.availableTools.join(', '),
-      'Model request budget: ' + context.maxModelRequests,
-      ...(context.artifactRefs.length ? ['Relevant workspace artifacts: ' + context.artifactRefs.join(', ')] : []),
-    ].join('\n')
-  }
-}
-
-export interface MemoryCore {
-  recall(query: { taskId: string; scope: string }): Promise<{ text: string; sourceRefs: string[] }[]>
-  proposeCapture(source: { taskId: string; evidenceRefs: string[] }): Promise<void>
-}
-
-export class NoopMemoryCore implements MemoryCore {
-  async recall() { return [] }
-  async proposeCapture() {}
-}
-
-export interface DecisionSpec<I, O> {
-  id: string
-  schemaVersion: 1
-  mode: 'off' | 'shadow' | 'active'
-  baseline(input: I): O
-}
-
-export interface DecisionResult<O> {
-  schemaVersion: 1
-  id: string
-  mode: DecisionSpec<never, O>['mode']
-  baseline: O
-  output: O
-  elapsedMs: number
-  evidenceRefs: string[]
-  shadow?: O
-}
-
-export interface JudgmentKernel {
-  evaluate<I, O>(spec: DecisionSpec<I, O>, input: I, evidenceRefs: string[]): Promise<DecisionResult<O>>
-}
-
-export class BaselineJudgment implements JudgmentKernel {
-  async evaluate<I, O>(spec: DecisionSpec<I, O>, input: I, evidenceRefs: string[]): Promise<DecisionResult<O>> {
-    const started = performance.now()
-    const baseline = spec.baseline(input)
-    return { schemaVersion: 1, id: spec.id, mode: spec.mode, output: baseline, baseline, evidenceRefs, elapsedMs: performance.now() - started }
-  }
-}
+export type AgentRole = 'root' | 'team' | 'worker'
 
 export interface SandboxProvider {
   prepare(policy: { cwd: string; network: 'deny' }): Promise<{ supported: false } | { supported: true; dispose(): Promise<void> }>
@@ -102,10 +12,6 @@ export class UnsupportedSandbox implements SandboxProvider {
   async prepare() { return { supported: false as const } }
 }
 
-export interface CapabilityGateway {
-  authorize(role: 'root' | 'worker', effect: 'read' | 'write'): boolean
-}
-
 export interface CodingProfile {
   workspaceWrites: boolean
   delegation: boolean
@@ -113,12 +19,124 @@ export interface CodingProfile {
 
 export const defaultCodingProfile: Readonly<CodingProfile> = { workspaceWrites: true, delegation: true }
 
-export class CodingCapabilities implements CapabilityGateway {
+export interface CapabilityPlugin {
+  id: string
+  tools(workspace: CodingWorkspace, role: AgentRole, access: WorkspaceAccess): WorkspaceTool[]
+}
+
+export interface WorkflowPack {
+  id: string
+  systemPrompt(role: AgentRole, access: WorkspaceAccess, check?: VerificationCheck): string
+  verify(workspace: CodingWorkspace, check: VerificationCheck, signal: AbortSignal, access: WorkspaceAccess): Promise<VerificationResult>
+}
+
+export interface AgentProfile extends CodingProfile {
+  id: string
+  plugins: readonly string[]
+  workflow: string
+}
+
+const workspacePlugin: CapabilityPlugin = {
+  id: 'workspace',
+  tools: (workspace, role, access) => workspace.tools(role, access),
+}
+
+const codingWorkflow: WorkflowPack = {
+  id: 'coding',
+  systemPrompt(role, access, check) {
+    return [
+      role === 'root' ? 'You are the local coding agent and task coordinator.'
+        : role === 'team' ? 'You are a persistent team specialist responsible for your assigned node.'
+          : 'You are a temporary worker. Complete only your assigned node.',
+      access === 'read' ? 'Workspace access is read-only.' : 'Make scoped workspace changes using the listed tools.',
+      check ? 'Acceptance requires the configured deterministic workspace check.' : 'Use tool results as evidence and summarize confirmed changes.',
+      'Never request credentials or bypass the tool scope.',
+    ].join(' ')
+  },
+  verify: (workspace, check, signal, access) => workspace.verify(check, signal, access),
+}
+
+/** Only the trusted Host composition root registers executable plugins and workflows. */
+export class ExtensionRegistry {
+  readonly #plugins = new Map<string, CapabilityPlugin>()
+  readonly #workflows = new Map<string, WorkflowPack>()
+  readonly #profiles = new Map<string, AgentProfile>()
+
+  constructor() {
+    this.registerPlugin(workspacePlugin)
+    this.registerWorkflow(codingWorkflow)
+    this.registerProfile({ id: 'coding', plugins: ['workspace'], workflow: 'coding', ...defaultCodingProfile })
+  }
+
+  #add<T extends { id: string }>(entries: Map<string, T>, item: T): void {
+    if (!/^[a-z][a-z0-9_-]{0,63}$/.test(item.id) || entries.has(item.id)) throw new Error('Invalid or duplicate extension ID')
+    entries.set(item.id, item)
+  }
+
+  registerPlugin(plugin: CapabilityPlugin): void { this.#add(this.#plugins, plugin) }
+  registerWorkflow(workflow: WorkflowPack): void { this.#add(this.#workflows, workflow) }
+
+  registerProfile(profile: AgentProfile): void {
+    if (!this.#workflows.has(profile.workflow) || profile.plugins.some(id => !this.#plugins.has(id)) ||
+      new Set(profile.plugins).size !== profile.plugins.length) throw new Error('Unknown or repeated profile extension')
+    this.#add(this.#profiles, { ...profile, plugins: [...profile.plugins] })
+  }
+
+  resolve(profileId: string) {
+    const profile = this.#profiles.get(profileId)
+    if (!profile) throw new Error('Unknown Agent profile')
+    return {
+      profile: { ...profile },
+      workflow: this.#workflows.get(profile.workflow)!,
+      tools: (workspace: CodingWorkspace, role: AgentRole, access: WorkspaceAccess) => {
+        const tools = profile.plugins.flatMap(id => this.#plugins.get(id)!.tools(workspace, role, access))
+        if (new Set(tools.map(tool => tool.name)).size !== tools.length) throw new Error('Duplicate capability name')
+        return tools
+      },
+    }
+  }
+}
+
+export interface CapabilityScope {
+  access: WorkspaceAccess
+  path?: string
+}
+
+export class CodingCapabilities {
   readonly #profile: Readonly<CodingProfile>
 
-  constructor(profile: Readonly<CodingProfile> = defaultCodingProfile) { this.#profile = profile }
-
-  authorize(role: 'root' | 'worker', effect: 'read' | 'write') {
-    return effect === 'read' || (role === 'root' && this.#profile.workspaceWrites)
+  constructor(profile: Readonly<CodingProfile> = defaultCodingProfile) {
+    this.#profile = profile
   }
+
+  root(access: WorkspaceAccess | undefined, legacyCheck: boolean): CapabilityScope {
+    return { access: this.#profile.workspaceWrites ? access ?? (legacyCheck ? 'write' : 'read') : 'read' }
+  }
+
+  child(parent: CapabilityScope, requested?: 'read' | 'write', path?: string): CapabilityScope {
+    if (requested === 'write' && parent.access === 'read') throw new Error('Parent workspace scope cannot write')
+    const target = path === undefined ? parent.path : workspaceTarget({ path })
+    if (path !== undefined && (!target || !within(parent.path, target))) throw new Error('Child workspace scope exceeds its parent')
+    return { access: requested ?? 'read', path: target }
+  }
+
+  describe(scope: CapabilityScope, tool: WorkspaceTool): boolean {
+    return tool.effect === 'read' || scope.access !== 'read'
+  }
+
+  authorize(scope: CapabilityScope, tool: WorkspaceTool, input: unknown): boolean {
+    if (!this.describe(scope, tool)) return false
+    if (!scope.path) return true
+    const target = workspaceTarget(input)
+    return target !== undefined && within(scope.path, target)
+  }
+}
+
+function within(scope: string | undefined, target: string): boolean {
+  if (scope === undefined) return true
+  if (process.platform === 'win32') {
+    scope = scope.toLowerCase()
+    target = target.toLowerCase()
+  }
+  return target === scope || target.startsWith(scope + '/')
 }

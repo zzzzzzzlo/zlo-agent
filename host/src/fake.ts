@@ -13,6 +13,13 @@ export class FakeExecution implements AgentExecution {
     }
   }
 
+  async discoverModels(provider?: string) {
+    if (provider && provider !== 'fake') return []
+    return ['coding', 'alternate'].map(model => ({
+      route: { provider: 'fake', model }, contextWindow: 32_768, input: ['text'], reasoning: false,
+    }))
+  }
+
   async open(config: ExecutionConfig): Promise<ExecutionSession> {
     await mkdir(config.sessionDirectory, { recursive: true })
     const id = randomUUID()
@@ -32,7 +39,7 @@ export class FakeExecution implements AgentExecution {
     const route = config.route ?? defaultRoute
     await this.validateRoute(route)
     const abort = new AbortController()
-    const worker = config.role === 'worker'
+    const worker = config.role === 'worker' || config.role === 'team'
     let active: Promise<Awaited<ReturnType<ExecutionSession['run']>>> | undefined
     const append = async (value: unknown) => {
       const file = await open(ref.path, 'a')
@@ -56,13 +63,15 @@ export class FakeExecution implements AgentExecution {
           try {
             const transcript = await readFile(ref.path, 'utf8')
             await append({ prompt })
+            config.reserveRequest?.({ route, estimatedInputTokens: Buffer.byteLength(prompt), maxOutputTokens: 64, kind: 'prompt' })
             config.onEvent({ type: 'model.request_started' })
             await delay(worker ? 900 : transcript.includes('slow') || prompt.includes('slow') ? 3000 : 80, undefined, { signal: abort.signal })
             if (worker) {
               await execute('read_text_file', { path: 'demo.txt' })
             } else {
               const previous = await execute('read_text_file', { path: 'demo.txt' })
-              if (previous && typeof previous === 'object' && 'ok' in previous && !previous.ok) {
+              if (previous && typeof previous === 'object' && 'ok' in previous && !previous.ok &&
+                config.tools.some(tool => tool.name === 'create_text_file')) {
                 await execute('create_text_file', { path: 'demo.txt', content: 'verified by zlo agent\n' })
               }
               if ((transcript + prompt).includes('delegate')) {
@@ -72,6 +81,7 @@ export class FakeExecution implements AgentExecution {
             abort.signal.throwIfAborted()
             const text = worker ? 'Read the demo marker.' : 'Demo run completed.'
             await append({ text })
+            config.onEvent({ type: 'model.usage', input: 12, output: 8, cacheRead: 0, cacheWrite: 0 })
             config.onEvent({ type: 'message.delta', delta: text })
             return { status: 'completed', text } as const
           } catch {

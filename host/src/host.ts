@@ -1,9 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { writeHostDiagnostic } from '../../shared/diagnostics.ts'
 import { existsSync, mkdirSync, realpathSync } from 'node:fs'
-import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import type { AgentExecution } from './execution.ts'
-import type { AgentEvent, ModelRoute, TaskStatus, VerificationCheck } from './contracts/domain.ts'
+import type { AgentEvent, EventDraft, ModelRoute, TaskStatus, VerificationCheck, WorkspaceAccess } from './contracts/domain.ts'
 import type {
   ActionResult, ArchiveConversationInput, ConversationAction, ConversationEvent, ConversationHistory,
   ConversationSummary, CreateConversationInput, CursorInput, DesktopCommand, HistoryInput,
@@ -13,21 +13,31 @@ import {
   ConversationError, ConversationService, parseConversationAction, parseCreateConversation, parseSendMessage, parseSetConversationModel, parseSteer,
 } from './conversation.ts'
 import { installTaskDiagnostics } from './diagnostics.ts'
-import { MultiAgentOrchestrator, executionFailure, sameRoute } from './orchestrator.ts'
-import { BaselineJudgment, CodingCapabilities, defaultCodingProfile, LocalContextBuilder, LocalModelScheduler } from './policies.ts'
+import { LocalJudgment } from './judgment.ts'
+import type { JudgmentOptions } from './judgment.ts'
+import { LocalMemory, ScopedContext } from './memory.ts'
+import { LocalModelScheduler } from './model-scheduler.ts'
+import type { ModelLimits } from './model-scheduler.ts'
+import { MultiAgentOrchestrator, executionFailure, memoryScope, sameRoute } from './orchestrator.ts'
+import { CodingCapabilities, ExtensionRegistry } from './policies.ts'
 import type { CodingProfile } from './policies.ts'
 import { LocalStore } from './store.ts'
 import { isStopping, TaskEngine } from './task-engine.ts'
-import type { CreateTask, TaskSnapshot } from './task-engine.ts'
+import type { CreateTask, NodeProposal, NodeReplan, TaskSnapshot } from './task-engine.ts'
+import { verifyWorkspace } from './verification.ts'
 import { CodingWorkspace } from './workspace.ts'
 
 export type HostCommand =
-  | { schemaVersion: 1; type: 'createTask'; requestId: string; goal: string; cwd: string; check: VerificationCheck; route?: ModelRoute }
+  | { schemaVersion: 1; type: 'createTask'; requestId: string; goal: string; cwd: string; check?: VerificationCheck; route?: ModelRoute; workspaceAccess?: WorkspaceAccess }
   | { schemaVersion: 1; type: 'getTask' | 'getHistory'; taskId: string }
   | { schemaVersion: 1; type: 'listTasks' | 'getRouteStatus' }
+  | { schemaVersion: 1; type: 'discoverModels'; provider?: string }
+  | { schemaVersion: 1; type: 'getModelBudget'; taskId: string }
   | { schemaVersion: 1; type: 'stop' | 'resume'; taskId: string; requestId: string }
   | { schemaVersion: 1; type: 'addInstruction'; taskId: string; requestId: string; text: string }
   | { schemaVersion: 1; type: 'addTask'; taskId: string; requestId: string; goal: string; expectedVersion: number; dependencies?: string[] }
+  | { schemaVersion: 1; type: 'proposePlan'; taskId: string; requestId: string; expectedVersion: number; nodes: NodeProposal[] }
+  | { schemaVersion: 1; type: 'replanNode'; taskId: string; requestId: string; expectedVersion: number; nodeId: string; update: NodeReplan }
   | { schemaVersion: 1; type: 'requestModelSwitch'; taskId: string; requestId: string; route: ModelRoute }
 
 interface ActiveTask {
@@ -43,6 +53,10 @@ interface HostOptions {
   stopTimeoutMs?: number
   runtimeId?: string
   profile?: CodingProfile
+  extensions?: ExtensionRegistry
+  profileId?: string
+  modelLimits?: Partial<ModelLimits>
+  judgment?: JudgmentOptions
   defaultWorkspace?: string
   defaultRoute?: ModelRoute
 }
@@ -68,6 +82,9 @@ export class LocalAgentHost {
   readonly #scheduler: LocalModelScheduler
   readonly #stopTimeoutMs: number
   readonly #profile: Readonly<CodingProfile>
+  readonly #extensions: ReturnType<ExtensionRegistry['resolve']>
+  readonly #capabilities: CodingCapabilities
+  readonly #memory: LocalMemory
   readonly #defaultWorkspace: string
   readonly #defaultRoute?: ModelRoute
   #active?: ActiveTask
@@ -79,7 +96,9 @@ export class LocalAgentHost {
     mkdirSync(options.directory, { recursive: true, mode: 0o700 })
     this.#directory = realpathSync(options.directory)
     this.#stopTimeoutMs = options.stopTimeoutMs ?? defaultStopTimeoutMs
-    this.#profile = { ...(options.profile ?? defaultCodingProfile) }
+    this.#extensions = (options.extensions ?? new ExtensionRegistry()).resolve(options.profileId ?? 'coding')
+    this.#profile = { ...(options.profile ?? this.#extensions.profile) }
+    this.#capabilities = new CodingCapabilities(this.#profile)
     this.#defaultWorkspace = options.defaultWorkspace ?? this.#directory + '-workspace'
     this.#defaultRoute = options.defaultRoute
     this.#store = new LocalStore(join(this.#directory, 'tasks.sqlite'))
@@ -94,11 +113,13 @@ export class LocalAgentHost {
       this.#engine = new TaskEngine(this.#store)
       this.#conversations = new ConversationService(this.#store, () => this.#failStorage())
       installTaskDiagnostics(this.#store)
-      this.#scheduler = new LocalModelScheduler(options.execution)
+      const judgment = new LocalJudgment(this.#store, options.judgment)
+      this.#memory = new LocalMemory(this.#store)
+      this.#scheduler = new LocalModelScheduler(options.execution, this.#store, judgment, options.modelLimits)
       this.#orchestrator = new MultiAgentOrchestrator({
         store: this.#store, tasks: this.#engine, execution: options.execution, scheduler: this.#scheduler,
-        capabilities: new CodingCapabilities(this.#profile), profile: this.#profile,
-        context: new LocalContextBuilder(), judgment: new BaselineJudgment(),
+        capabilities: this.#capabilities, profile: this.#profile, extensions: this.#extensions,
+        context: new ScopedContext(this.#memory, judgment), judgment,
         sessions: join(this.#directory, 'sessions'),
         onOutput: (event, delta) => this.#conversations.recordDelta(event, delta),
         onCheckpoint: (taskId) => this.#conversations.checkpointOutput(taskId),
@@ -124,7 +145,8 @@ export class LocalAgentHost {
   #workspace(cwd: string): CodingWorkspace {
     if (typeof cwd !== 'string' || !isAbsolute(cwd)) throw new Error('An absolute workspace path is required')
     const workspace = new CodingWorkspace(cwd)
-    if (containsPath(workspace.root, this.#directory) || containsPath(this.#directory, workspace.root)) {
+    if (workspace.root === parse(workspace.root).root ||
+      containsPath(workspace.root, this.#directory) || containsPath(this.#directory, workspace.root)) {
       throw new Error('Workspace and private Host data directory must be separate')
     }
     return workspace
@@ -284,7 +306,8 @@ export class LocalAgentHost {
     const current = this.#conversations.canSend(command.conversationId)
     this.#engine.create({
       requestId: desktopRequestId(command.requestId), conversationId: current.id, goal: command.text,
-      cwd: current.workspace, check: current.check, route: current.pendingRoute ?? current.route ?? this.#defaultRoute,
+      cwd: current.workspace, check: current.check, workspaceAccess: current.workspaceAccess,
+      route: current.pendingRoute ?? current.route ?? this.#defaultRoute,
     }, (task) => this.#conversations.attachTask(command, task))
     const sent = this.#conversations.sent(command)
     if (!sent) throw new Error('Conversation task receipt is missing')
@@ -332,8 +355,8 @@ export class LocalAgentHost {
 
   async createTask(input: Omit<CreateTask, 'conversationId'>): Promise<{ taskId: string }> {
     this.#assertOpen()
-    const { requestId, goal, cwd, check, route } = input
-    const command = { requestId, goal, cwd, check, route }
+    const { requestId, goal, cwd, check, route, workspaceAccess } = input
+    const command = { requestId, goal, cwd, check, route, workspaceAccess }
     const existing = this.#engine.recorded<{ taskId: string }>(command.requestId, ['create', command])
     if (existing) return existing
     const workspace = this.#workspace(command.cwd)
@@ -431,17 +454,28 @@ export class LocalAgentHost {
     if (command?.schemaVersion !== 1) throw new Error('Unsupported command version')
     switch (command.type) {
       case 'createTask': {
-        const { requestId, goal, cwd, check, route } = command
-        return this.createTask({ requestId, goal, cwd, check, route })
+        const { requestId, goal, cwd, check, route, workspaceAccess } = command
+        return this.createTask({ requestId, goal, cwd, check, route, workspaceAccess })
       }
       case 'getTask': return this.getTask(command.taskId)
       case 'getHistory': return this.getHistory(command.taskId)
       case 'listTasks': return this.#engine.list()
       case 'getRouteStatus': return this.#scheduler.getRouteStatus()
+      case 'discoverModels': return this.#scheduler.discoverModels(command.provider)
+      case 'getModelBudget':
+        this.getTask(command.taskId)
+        return this.#scheduler.budget(command.taskId)
       case 'stop': return this.stop(command.taskId, command.requestId)
       case 'resume': return this.resume(command.taskId, command.requestId)
       case 'addInstruction': return this.addInstruction(command.taskId, command.requestId, command.text)
       case 'addTask': return this.addTask(command.taskId, command.requestId, command.goal, command.expectedVersion, command.dependencies)
+      case 'proposePlan':
+      case 'replanNode':
+        this.#assertStandaloneTask(command.taskId)
+        if (!this.#profile.delegation) throw new Error('The profile disables delegation')
+        return command.type === 'proposePlan'
+          ? this.#engine.proposePlan(command.taskId, command.requestId, command.expectedVersion, command.nodes)
+          : this.#engine.replanNode(command.taskId, command.requestId, command.expectedVersion, command.nodeId, command.update)
       case 'requestModelSwitch': return this.requestModelSwitch(command.taskId, command.requestId, command.route)
       case 'createConversation': return this.createConversation(command)
       case 'listConversations': return this.listConversations()
@@ -503,25 +537,50 @@ export class LocalAgentHost {
       }
       this.#engine.beginVerification(task.id)
       const snapshot = this.#engine.get(task.id)
+      const operations = this.#engine.operations(task.id)
+      const confirmedWrite = operations.some(item => item.effect === 'write' && item.status === 'succeeded')
+      const access = this.#capabilities.root(snapshot.workspaceAccess, Boolean(snapshot.check)).access
       const verification = snapshot.worker?.status === 'failed'
         ? { passed: false, evidence: 'worker_verification_failed' }
+        : snapshot.nodes?.some(node => node.status !== 'succeeded')
+          ? { passed: false, evidence: 'dag_not_converged' }
         : task.check
-          ? await workspace.verify(task.check, signal).catch(() => ({ passed: false, evidence: 'verification_error' }))
-          : { passed: result.textProduced, evidence: result.textProduced ? 'assistant_response_present' : 'assistant_response_missing' }
-      if (signal.aborted) {
+          ? await verifyWorkspace(this.#engine, this.#extensions.workflow, workspace, result.event, task.check, signal, access, 'verification')
+          : { passed: result.textProduced || confirmedWrite, evidence: confirmedWrite
+            ? 'confirmed_workspace_operation' : result.textProduced ? 'assistant_response_present' : 'assistant_response_missing' }
+      if (signal.aborted || this.#engine.operations(task.id).some(item => item.status === 'unknown_effect' || item.status === 'started')) {
         this.#engine.end(task.id, 'model_interrupted')
         return
       }
       const latest = this.#engine.get(task.id)
       if (latest.instructions.some((item) => !item.delivered) || latest.worker?.status === 'ready' ||
+        latest.planVersion !== snapshot.planVersion ||
         (!latest.conversationId && latest.route && !sameRoute(latest.route, result.route))) {
         this.#engine.continueExecution(task.id)
         continue
       }
-      this.#engine.verify(task.id, verification)
+      const settled = this.#engine.verify(task.id, verification)
+      if (settled.status === 'succeeded') this.#captureMemory(settled, result.route, result.event)
       return
     }
     this.#engine.end(task.id, 'budget_exhausted')
+  }
+
+  #captureMemory(task: TaskSnapshot, route: ModelRoute, event: EventDraft): void {
+    const writes = this.#engine.operations(task.id).filter(item => item.effect === 'write' && item.status === 'succeeded')
+    const entries = writes.filter(item => item.target).slice(-12).map(item => ({
+      kind: 'fact' as const,
+      text: 'Confirmed workspace operation ' + item.tool + ' on ' + item.target,
+      sourceRefs: [item.id],
+    }))
+    const scope = memoryScope(task, route)
+    this.#memory.capture(event, scope, entries)
+    if (task.check && task.verification?.passed) this.#memory.capture(event, scope, [{
+      kind: 'experience',
+      text: task.check.command ? 'Project verification passed using ' + task.check.command.command
+        : 'A workspace check passed for ' + task.check.path,
+      sourceRefs: [task.id],
+    }])
   }
 
   async idle(): Promise<void> {

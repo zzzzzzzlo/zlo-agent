@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto'
 import type {
-  ArchiveConversationInput, ConversationAction, ConversationEvent, ConversationHistory, ConversationMessage,
+  ArchiveConversationInput, ConversationAction, ConversationEvent, ConversationHistory, ConversationMessage, ConversationNode,
   ConversationSummary, ConversationTool, ConversationTurn, CreateConversationInput, DesktopErrorCode,
   HistoryInput, RenameConversationInput, SendMessageInput, SendMessageResult, SetConversationModelInput, SteerInput, UsageTotals,
 } from '../../shared/contracts/desktop.ts'
 import type { AgentEvent, EndReason, EventDraft, ModelRoute, TaskStatus } from './contracts/domain.ts'
 import type { LocalStore } from './store.ts'
 import type { TaskSnapshot } from './task-engine.ts'
-import { workspaceTarget } from './workspace.ts'
+import { parseProjectCommand, workspaceTarget } from './workspace.ts'
 
 const conversations = 'conversations'
 const taskBindings = 'conversation-task-bindings'
@@ -92,18 +92,34 @@ export function parseRoute(input: unknown): ModelRoute {
 
 export function parseCreateConversation(input: CreateConversationInput): CreateConversationInput {
   const body = object(input, 'conversation')
-  const check = body.check === undefined ? undefined : object(body.check, 'file check')
+  const check = body.check === undefined ? undefined : object(body.check, 'workspace check')
   const workspace = body.workspace === undefined ? undefined : text(body.workspace, 'workspace', 1024)
-  if (check && !workspace) throw new ConversationError('INVALID_INPUT', 'A file check requires a selected workspace')
-  const target = check && workspaceTarget({ path: check.path })
-  if (check && !target) throw new ConversationError('INVALID_INPUT', 'A file check requires an allowed relative path')
+  const access = body.workspaceAccess
+  if (access !== undefined && access !== 'read' && access !== 'write' && access !== 'trusted') {
+    throw new ConversationError('INVALID_INPUT', 'Invalid workspace access')
+  }
+  if ((check || access === 'trusted') && !workspace) throw new ConversationError('INVALID_INPUT', 'Select a workspace for this grant or check')
+  let projectCheck: CreateConversationInput['check']
+  if (check?.command !== undefined) {
+    try {
+      if (access !== 'trusted' || Object.keys(check).length !== 1) throw new Error('Command check requires a trusted workspace')
+      const command = parseProjectCommand(check.command)
+      if (!workspaceTarget(command) && !(command.path === '.' && command.command !== 'node_script')) throw new Error('Invalid command path')
+      projectCheck = { command }
+    } catch {
+      throw new ConversationError('INVALID_INPUT', 'Command verification requires a trusted project and an allowed command')
+    }
+  }
+  const target = check && !projectCheck ? workspaceTarget({ path: check.path }) : undefined
+  if (check && !projectCheck && !target) throw new ConversationError('INVALID_INPUT', 'A file check requires an allowed relative path')
   const contains = check?.contains === undefined ? undefined : text(check.contains, 'verification text', 16000)
   return {
     requestId: requestId(body.requestId),
     title: body.title === undefined ? undefined : text(body.title, 'title', 120).trim(),
     workspace,
+    workspaceAccess: access,
     route: body.route === undefined ? undefined : parseRoute(body.route),
-    check: target ? { path: target, ...(contains !== undefined ? { contains } : {}) } : undefined,
+    check: projectCheck ?? (target ? { path: target, ...(contains !== undefined ? { contains } : {}) } : undefined),
   }
 }
 
@@ -243,7 +259,8 @@ export class ConversationService {
   }
 
   #createSignature(input: CreateConversationInput): string {
-    return JSON.stringify(['create', input.title, input.workspace, input.route, input.check])
+    return JSON.stringify(['create', input.title, input.workspace, input.route, input.check,
+      ...(input.workspaceAccess === undefined ? [] : [input.workspaceAccess])])
   }
 
   created(input: CreateConversationInput): ConversationSummary | undefined {
@@ -256,7 +273,8 @@ export class ConversationService {
       const route = input.route ?? defaultRoute
       const conversation: StoredConversation = {
         id: randomUUID(), title: input.title ?? '新会话', createdAt: now, updatedAt: now, archived: false,
-        workspace, ...(route ? { route } : {}), ...(input.check ? { check: input.check } : {}), turnCount: 0,
+        workspace, workspaceAccess: input.workspaceAccess ?? (input.workspace ? 'write' : 'read'),
+        ...(route ? { route } : {}), ...(input.check ? { check: input.check } : {}), turnCount: 0,
       }
       this.#saveConversation(conversation)
       const result = summary(conversation)
@@ -500,6 +518,8 @@ export class ConversationService {
     const type = source.type
     if (type === 'agent.started' || type === 'agent.finished') {
       this.#projectAgent(conversationId, source)
+    } else if (type === 'task.node_started' || type === 'task.node_settled' || type === 'task.worker_settled') {
+      this.#projectNode(binding, source)
     } else if (type === 'tool.started' || type === 'tool.finished') {
       this.#projectTool(binding, source)
     } else if (type === 'model.usage') {
@@ -536,7 +556,7 @@ export class ConversationService {
   #projectAgent(conversationId: string, source: AgentEvent): void {
     const status = source.payload.status
     const payload: ConversationEvent['payload'] = {
-      agentRole: source.parentAgentRunId ? 'worker' : 'root',
+      agentRole: source.payload.role === 'team' ? 'team' : source.parentAgentRunId ? 'worker' : 'root',
       agentStatus: source.type === 'agent.started' ? 'active'
         : status === 'completed' || status === 'interrupted' || status === 'failed' ? status : undefined,
     }
@@ -547,6 +567,26 @@ export class ConversationService {
       payload.conversation = summary(next)
     }
     this.#event(conversationId, source.type, payload, source)
+  }
+
+  #projectNode(binding: TurnBinding, source: AgentEvent): void {
+    if (!source.taskNodeId) return
+    const turn = this.#turn(binding)
+    const nodes = turn.nodes ?? []
+    const index = nodes.findIndex(node => node.id === source.taskNodeId)
+    const previous = nodes[index]
+    const status = source.payload.status
+    const node: ConversationNode = {
+      id: source.taskNodeId,
+      parentNodeId: typeof source.payload.parentNodeId === 'string' ? source.payload.parentNodeId : previous?.parentNodeId,
+      role: source.payload.role === 'team' ? 'team' : previous?.role ?? 'worker',
+      status: source.type === 'task.node_started' ? 'running' : status === 'succeeded' || status === 'failed' ? status : 'interrupted',
+    }
+    if (index < 0) nodes.push(node)
+    else nodes[index] = node
+    turn.nodes = nodes
+    this.#saveTurn(binding, turn)
+    this.#event(binding.conversationId, 'task.node_updated', { node }, source)
   }
 
   #projectTool(binding: TurnBinding, source: AgentEvent): void {
@@ -574,6 +614,7 @@ export class ConversationService {
     if (source.type === 'task.resumed') turn.verification = undefined
     if (terminal) {
       for (const tool of turn.tools) if (tool.status === 'running') tool.status = 'interrupted'
+      for (const node of turn.nodes ?? []) if (node.status === 'running') node.status = 'interrupted'
     }
     this.#saveTurn(binding, turn)
     if (conversation.latestTaskId === source.taskId) {

@@ -19,13 +19,16 @@ export class FauxExecution extends PiExecution {
       })
       const respond: FauxResponseFactory = (context) => {
         provider.appendResponses([respond])
-        const tool = (name: string, args: Record<string, string>) =>
+        const tool = (name: string, args: Parameters<typeof fauxToolCall>[1]) =>
           fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' })
         const previous = context.messages.findLast((message) => message.role === 'user')
         const tail = context.messages.findLast((message) => message.role === 'user' || message.role === 'toolResult')
         if (tail?.role === 'toolResult') {
           const content = tail.content.filter((part) => part.type === 'text').map((part) => part.text).join('')
           if (!content.includes('"ok":true')) return fauxAssistantMessage('文件工具未完成请求，请检查工作区和验收路径。')
+          if (['read_text_file', 'delegate_worker', 'propose_task_plan'].includes(tail.toolName)) {
+            return fauxAssistantMessage('已核对登录页的工具证据。')
+          }
           return fauxAssistantMessage(tail.toolName === 'edit_text_file' ? '已在登录页中添加验证码输入框。' : '已创建简单登录页面，包含用户名和密码输入框。')
         }
         const text = previous?.role === 'user'
@@ -37,6 +40,17 @@ export class FauxExecution extends PiExecution {
         if (text.startsWith('Resume the task')) return fauxAssistantMessage('已从保存的会话继续。')
         if (text.includes('[slow]') || text.includes('[steer]')) {
           return fauxAssistantMessage('正在生成可中断的分段内容。'.repeat(140))
+        }
+        if (text.startsWith('[team-check]') && available.includes('propose_task_plan')) {
+          return tool('propose_task_plan', { nodes: [
+            { ref: 'team', role: 'team', teamKey: 'desktop-review', goal: '[team-read] inspect the login page' },
+          ] })
+        }
+        if (text.startsWith('[team-read]') && available.includes('delegate_worker')) {
+          return tool('delegate_worker', { goal: '[worker-read] inspect the login page' })
+        }
+        if (text.startsWith('[worker-read]') && available.includes('read_text_file')) {
+          return tool('read_text_file', { path: 'login.html' })
         }
         if (/(验证码|captcha)/iu.test(text) && available.includes('edit_text_file')) {
           return tool('edit_text_file', {

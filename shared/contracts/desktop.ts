@@ -1,6 +1,6 @@
-import type { EndReason, ModelRoute, TaskStatus, VerificationCheck, VerificationResult } from './domain.ts'
+import type { EndReason, ModelRoute, TaskStatus, VerificationCheck, VerificationResult, WorkspaceAccess } from './domain.ts'
 
-export type { ModelRoute, TaskStatus, VerificationCheck } from './domain.ts'
+export type { ModelRoute, TaskStatus, VerificationCheck, WorkspaceAccess } from './domain.ts'
 
 export interface ConversationSummary {
   id: string
@@ -9,6 +9,7 @@ export interface ConversationSummary {
   updatedAt: number
   archived: boolean
   workspace: string
+  workspaceAccess?: WorkspaceAccess
   route?: ModelRoute
   pendingRoute?: ModelRoute
   check?: VerificationCheck
@@ -38,6 +39,13 @@ export interface UsageTotals {
   cacheWrite: number
 }
 
+export interface ConversationNode {
+  id: string
+  parentNodeId?: string
+  role: 'team' | 'worker'
+  status: 'running' | 'succeeded' | 'failed' | 'interrupted'
+}
+
 export interface ConversationTurn {
   taskId: string
   taskRunId: string
@@ -50,6 +58,7 @@ export interface ConversationTurn {
   instructions: ConversationMessage[]
   tools: ConversationTool[]
   usage: UsageTotals
+  nodes?: ConversationNode[]
 }
 
 export interface ConversationHistory {
@@ -63,6 +72,7 @@ export interface CreateConversationInput {
   requestId: string
   title?: string
   workspace?: string
+  workspaceAccess?: WorkspaceAccess
   route?: ModelRoute
   check?: VerificationCheck
 }
@@ -100,8 +110,9 @@ export interface ConversationEvent {
     status?: TaskStatus
     tool?: ConversationTool
     usage?: UsageTotals
+    node?: ConversationNode
     reason?: EndReason
-    agentRole?: 'root' | 'worker'
+    agentRole?: 'root' | 'team' | 'worker'
     agentStatus?: 'active' | 'completed' | 'interrupted' | 'failed'
   }
 }

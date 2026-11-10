@@ -12,18 +12,35 @@ export type RuntimeEvent =
   | { type: 'message.delta'; delta: string }
   | { type: 'instruction.applied'; instructionId: string }
   | { type: 'model.request_started' }
-  | { type: 'model.usage'; input: number; output: number; cacheRead: number; cacheWrite: number }
+  | { type: 'model.usage'; input: number; output: number; cacheRead: number; cacheWrite: number; estimatedCostUsd?: number }
   | { type: 'model.route_changed'; route: ModelRoute }
+  | { type: 'context.compacted'; tokensBefore: number; estimatedTokensAfter?: number }
+
+export interface ModelCandidate {
+  route: ModelRoute
+  contextWindow: number
+  input: readonly string[]
+  reasoning: boolean
+  estimatedCost?: number
+}
+
+export interface ModelRequest {
+  route: ModelRoute
+  estimatedInputTokens: number
+  maxOutputTokens: number
+  kind: 'prompt' | 'compaction'
+}
 
 export interface ExecutionConfig {
   cwd: string
   correlationId?: string
-  role?: 'root' | 'worker'
+  role?: 'root' | 'team' | 'worker'
   sessionDirectory: string
   session?: SessionRef
   route?: ModelRoute
   tools: ExecutionTool[]
   systemPrompt: string
+  reserveRequest?(request: ModelRequest): void
   onEvent(event: RuntimeEvent): void
 }
 
@@ -44,6 +61,7 @@ export interface ExecutionSession {
 export interface AgentExecution {
   open(config: ExecutionConfig): Promise<ExecutionSession>
   validateRoute(route: ModelRoute): Promise<void>
+  discoverModels?(provider?: string): Promise<readonly ModelCandidate[]>
 }
 
 export class ModelUnavailableError extends Error {}

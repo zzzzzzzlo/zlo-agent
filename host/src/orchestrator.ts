@@ -1,11 +1,17 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { join } from 'node:path'
+import { handoffs, planTool, replanTool } from './agent-plan.ts'
 import { ModelUnavailableError } from './execution.ts'
 import type { AgentExecution, ExecutionConfig, ExecutionSession, ExecutionTool, RuntimeEvent } from './execution.ts'
 import type { EndReason, EventDraft, ModelRoute, SessionRef } from './contracts/domain.ts'
-import type { CapabilityGateway, CodingProfile, ContextBuilder, JudgmentKernel, ModelResourceScheduler } from './policies.ts'
+import type { LocalJudgment } from './judgment.ts'
+import type { ScopedContext } from './memory.ts'
+import { ModelBudgetError } from './model-scheduler.ts'
+import type { LocalModelScheduler } from './model-scheduler.ts'
+import type { AgentRole, CapabilityScope, CodingCapabilities, CodingProfile, ExtensionRegistry } from './policies.ts'
 import type { LocalStore } from './store.ts'
 import type { TaskEngine, TaskSnapshot, WorkerNode, WorkerResult } from './task-engine.ts'
+import { verifyWorkspace } from './verification.ts'
 import { workspaceTarget } from './workspace.ts'
 import type { CodingWorkspace, WorkspaceTool } from './workspace.ts'
 
@@ -13,7 +19,8 @@ interface AgentRecord {
   schemaVersion: 1
   id: string
   taskId: string
-  role: 'root' | 'worker'
+  role: AgentRole
+  parentAgentId?: string
   session: SessionRef
   route: ModelRoute
 }
@@ -21,42 +28,54 @@ interface AgentRun {
   schemaVersion: 1
   event: EventDraft
   status: 'active' | 'completed' | 'interrupted' | 'failed'
+  role?: AgentRole
 }
 export interface OutputEvent {
   taskId: string
   agentRunId: string
-  role: 'root' | 'worker'
+  role: AgentRole
   delta: string
 }
 
 type Outcome =
-  | { status: 'completed'; route: ModelRoute; textProduced: boolean }
+  | { status: 'completed'; route: ModelRoute; textProduced: boolean; event: EventDraft }
   | { status: 'interrupted' | 'model_error' | 'runtime_error' | 'checkpoint_error' | 'budget_exhausted' }
 
 const MAX_TURNS = 16
 const WORKER_DEADLINE_MS = 60000
-const ROOT_MODEL_REQUESTS = 32
-const WORKER_MODEL_REQUESTS = 8
+const ROOT_DEADLINE_MS = 600000
+type ProfileRuntime = ReturnType<ExtensionRegistry['resolve']>
+
+export function memoryScope(task: TaskSnapshot, route: ModelRoute): string {
+  return JSON.stringify([task.conversationId ?? task.cwd, route.provider])
+}
+
+function receiptId(id: string): string {
+  return createHash('sha256').update(id).digest('hex').slice(0, 32)
+}
 
 export class MultiAgentOrchestrator {
   readonly #db: LocalStore
   readonly #tasks: TaskEngine
   readonly #execution: AgentExecution
-  readonly #scheduler: ModelResourceScheduler
-  readonly #capabilities: CapabilityGateway
+  readonly #scheduler: LocalModelScheduler
+  readonly #capabilities: CodingCapabilities
   readonly #profile: Readonly<CodingProfile>
-  readonly #context: ContextBuilder
-  readonly #judgment: JudgmentKernel
+  readonly #context: ScopedContext
+  readonly #judgment: LocalJudgment
+  readonly #extensions: ProfileRuntime
   readonly #sessions: string
   readonly #onOutput?: (event: EventDraft, delta: string) => void
   readonly #onCheckpoint?: (taskId: string) => void
   readonly #outputSinks = new Set<(event: OutputEvent) => void | Promise<void>>()
   readonly #steering = new Map<string, (id: string, text: string) => Promise<boolean>>()
   readonly #openingConversations = new Set<string>()
+  readonly #activeTeams = new Set<string>()
 
   constructor(ports: {
-    store: LocalStore; tasks: TaskEngine; execution: AgentExecution; scheduler: ModelResourceScheduler;
-    capabilities: CapabilityGateway; profile: Readonly<CodingProfile>; context: ContextBuilder; judgment: JudgmentKernel; sessions: string;
+    store: LocalStore; tasks: TaskEngine; execution: AgentExecution; scheduler: LocalModelScheduler;
+    capabilities: CodingCapabilities; profile: Readonly<CodingProfile>; context: ScopedContext; judgment: LocalJudgment; sessions: string;
+    extensions: ProfileRuntime
     onOutput?: (event: EventDraft, delta: string) => void
     onCheckpoint?: (taskId: string) => void
   }) {
@@ -68,6 +87,7 @@ export class MultiAgentOrchestrator {
     this.#profile = ports.profile
     this.#context = ports.context
     this.#judgment = ports.judgment
+    this.#extensions = ports.extensions
     this.#sessions = ports.sessions
     this.#onOutput = ports.onOutput
     this.#onCheckpoint = ports.onCheckpoint
@@ -105,7 +125,10 @@ export class MultiAgentOrchestrator {
         if (run.status !== 'active' || !run.event.agentRunId) continue
         this.#db.put('agent-runs', run.event.agentRunId, { ...run, status: 'interrupted' })
         const taskRunId = this.#tasks.get(run.event.taskId).taskRunId
-        this.#db.append({ ...run.event, taskRunId, type: 'agent.finished', payload: { status: 'interrupted', reason: 'process_interrupted' } })
+        this.#db.append({ ...run.event, taskRunId, type: 'agent.finished', payload: {
+          role: run.role, status: 'interrupted', reason: 'process_interrupted',
+          lifecycle: run.role === 'team' ? 'idle' : 'released',
+        } })
       }
     })
   }
@@ -128,36 +151,38 @@ export class MultiAgentOrchestrator {
     this.#db.transaction(() => { this.#db.append({ ...event, type, payload }) })
   }
 
-  #register(task: TaskSnapshot, session: ExecutionSession, event: EventDraft, agentKey: string, role: AgentRecord['role']): EventDraft {
+  #register(task: TaskSnapshot, session: ExecutionSession, event: EventDraft, agentKey: string, role: AgentRole,
+    parentAgentId?: string): EventDraft {
     const recorded = { ...event, sessionId: session.ref.id }
     this.#db.transaction(() => {
-      const agent: AgentRecord = { schemaVersion: 1, id: event.agentId!, taskId: task.id, role, session: session.ref, route: session.route }
-      const run: AgentRun = { schemaVersion: 1, event: recorded, status: 'active' }
+      const agent: AgentRecord = { schemaVersion: 1, id: event.agentId!, taskId: task.id, role, session: session.ref, route: session.route, parentAgentId }
+      const run: AgentRun = { schemaVersion: 1, event: recorded, role, status: 'active' }
       this.#db.put('agents', agentKey, agent)
       if (role === 'root') this.#db.put('task-sessions', task.id, session.ref)
       this.#db.put('agent-runs', event.agentRunId!, run)
-      this.#db.append({ ...recorded, type: 'agent.started', payload: { role, route: session.route } })
+      this.#db.append({ ...recorded, type: 'agent.started', payload: { role, route: session.route, parentAgentId, lifecycle: 'active' } })
     })
     return recorded
   }
 
-  #finish(event: EventDraft, status: AgentRun['status'], result?: WorkerResult): void {
+  #finish(event: EventDraft, status: AgentRun['status'], result?: WorkerResult, role: AgentRole = 'root'): void {
     this.#db.transaction(() => {
-      const run: AgentRun = { schemaVersion: 1, event, status }
+      const run: AgentRun = { schemaVersion: 1, event, status, role }
       this.#db.put('agent-runs', event.agentRunId!, run)
       this.#db.append({
         ...event, type: 'agent.finished',
-        payload: { status, ...(result ? { evidenceCount: result.evidenceRefs.length } : {}) },
+        payload: { role, status, lifecycle: role === 'team' ? 'idle' : 'released',
+          ...(result ? { evidenceCount: result.evidenceRefs.length } : {}) },
       })
     })
   }
 
   #wrap(tool: WorkspaceTool, event: () => EventDraft, signal: AbortSignal,
-    authorize: () => boolean, evidence?: Set<string>, artifacts?: Set<string>): ExecutionTool {
+    authorize: (input: unknown) => boolean, evidence?: Set<string>, artifacts?: Set<string>): ExecutionTool {
     return {
       ...tool,
       execute: async (callId, input, toolSignal) => {
-        if (signal.aborted || toolSignal?.aborted || !authorize()) return { ok: false, error: 'Tool work is unavailable' }
+        if (signal.aborted || toolSignal?.aborted || !authorize(input)) return { ok: false, error: 'Tool work is unavailable' }
         const ref = event()
         const operationId = ref.agentRunId + ':' + callId
         this.#tasks.beginTool(ref.taskId, ref, operationId, tool.name, tool.effect,
@@ -174,7 +199,7 @@ export class MultiAgentOrchestrator {
         this.#tasks.finishTool(ref, operationId, failed ? 'failed' : 'succeeded')
         if (!failed) {
           evidence?.add(operationId)
-          const target = tool.name === 'read_text_file' ? workspaceTarget(input) : undefined
+          const target = tool.name === 'read_text_file' || tool.effect === 'write' ? workspaceTarget(input) : undefined
           if (target) artifacts?.add(target)
         }
         return result
@@ -200,9 +225,14 @@ export class MultiAgentOrchestrator {
     }
   }
 
+  #unknownWrite(taskId: string): boolean {
+    return this.#tasks.operations(taskId).some(({ effect, status }) =>
+      effect === 'write' && (status === 'unknown_effect' || status === 'started'))
+  }
+
   async #worker(task: TaskSnapshot, node: WorkerNode, parent: EventDraft, workspace: CodingWorkspace,
-    route: ModelRoute, rootSignal: AbortSignal): Promise<WorkerResult | undefined> {
-    const release = this.#scheduler.reserve(task.id, 'worker')
+    parentRoute: ModelRoute, parentScope: CapabilityScope, rootSignal: AbortSignal, suspendParent = false): Promise<WorkerResult | undefined> {
+    const role = node.role ?? 'worker'
     const deadline = new AbortController()
     const timer = setTimeout(() => deadline.abort(), WORKER_DEADLINE_MS)
     const signal = AbortSignal.any([rootSignal, deadline.signal])
@@ -214,47 +244,146 @@ export class MultiAgentOrchestrator {
     const artifacts = new Set<string>()
     let session: ExecutionSession | undefined
     let unwatch: (() => Promise<void>) | undefined
+    let lease: ReturnType<LocalModelScheduler['reserve']> | undefined
     let result: WorkerResult | undefined
+    let verification: Awaited<ReturnType<typeof verifyWorkspace>> | undefined
     let started = false
     let registered = false
-    let requests = 0
+    let teamLease: string | undefined
+    let childActive = false
+    let workspaceActive = false
     try {
-      if (rootSignal.aborted) return undefined
-      const attemptId = this.#tasks.startWorker(task.id, node.id)
+      if (rootSignal.aborted || this.#unknownWrite(task.id)) return undefined
+      const attemptId = this.#tasks.startWorker(task.id, node.id, { suspendParent })
       event = { ...event, taskAttemptId: attemptId }
       started = true
-      const tools = workspace.tools('worker').map((tool) =>
-        this.#wrap(tool, () => event, signal, () => this.#capabilities.authorize('worker', tool.effect), evidence, artifacts))
-      session = await this.#execution.open({
-        cwd: workspace.root, role: 'worker', correlationId: event.agentRunId,
-        sessionDirectory: join(this.#sessions, task.id), route,
-        tools,
-        systemPrompt: 'You are a temporary read-only coding worker. Use tools for evidence and return a short summary.',
-        onEvent: (runtime) => {
-          if (runtime.type === 'model.request_started' && ++requests > WORKER_MODEL_REQUESTS) deadline.abort()
-          this.#emit(event, runtime, 'worker')
+      lease = this.#scheduler.reserve(() => event, role)
+      const scope = this.#capabilities.child(parentScope, node.access, node.scopePath)
+      const teamKey = role === 'team'
+        ? 'team-' + createHash('sha256').update(JSON.stringify([task.conversationId ?? task.id, node.teamKey, parentRoute.provider, scope])).digest('hex')
+        : undefined
+      const saved = teamKey ? this.#db.get<AgentRecord>('agents', teamKey) : undefined
+      if (teamKey) {
+        if (this.#activeTeams.has(teamKey)) throw new Error('Team Session is active')
+        this.#activeTeams.add(teamKey)
+        teamLease = teamKey
+        if (saved) event = { ...event, agentId: saved.id }
+      }
+      const route = await this.#scheduler.allocate(event, parentRoute, node.route ?? saved?.route, Boolean(node.role))
+      const tools = this.#extensions.tools(workspace, role, scope.access)
+        .filter(tool => this.#capabilities.describe(scope, tool))
+        .map(tool => {
+          const wrapped = this.#wrap(tool, () => event, signal, input =>
+            !childActive && !this.#unknownWrite(task.id) && this.#capabilities.authorize(scope, tool, input), evidence, artifacts)
+          return {
+            ...wrapped,
+            execute: async (id: string, input: unknown, toolSignal?: AbortSignal) => {
+              if (workspaceActive) return { ok: false, error: 'Another workspace tool is active' }
+              workspaceActive = true
+              try { return await wrapped.execute(id, input, toolSignal) } finally { workspaceActive = false }
+            },
+          } as ExecutionTool
+        })
+      const runChild = async (child: WorkerNode) => {
+        if (childActive || workspaceActive || signal.aborted || !session) return undefined
+        childActive = true
+        try {
+          return await this.#worker(task, child, event, workspace, session.route, scope, signal, true)
+        } finally {
+          childActive = false
+        }
+      }
+      if (role === 'team' && this.#profile.delegation) tools.push({
+        name: 'delegate_worker',
+        description: 'Delegate a scoped read-only investigation within the current Team node, and wait for the verified result.',
+        parameters: {
+          type: 'object', additionalProperties: false, required: ['goal'],
+          properties: { goal: { type: 'string', minLength: 1, maxLength: 8000 } },
+        },
+        execute: async (id, input, toolSignal) => {
+          if (!input || typeof input !== 'object' || !('goal' in input) || typeof input.goal !== 'string' ||
+            signal.aborted || toolSignal?.aborted || childActive || workspaceActive || this.#unknownWrite(task.id)) {
+            return { ok: false, error: 'Delegation unavailable' }
+          }
+          const goal = input.goal
+          if (!await this.#judgment.decide(event, 'delegation.worth', { role, goalLength: goal.length }, goal.trim().length > 0,
+            [true, false], [node.id]) || signal.aborted || toolSignal?.aborted) return { ok: false, error: 'Delegation declined' }
+          try {
+            const current = this.#tasks.get(task.id)
+            const existing = current.nodes?.find(child => child.parentNodeId === node.id && child.goal === goal)
+            const child = existing ?? this.#tasks.proposePlan(task.id, 'team:' + event.agentRunId + ':' + receiptId(id),
+              current.planVersion, [{ ref: 'child', goal, parentNodeId: node.id, role: 'worker' }])[0]!
+            const result = child.result ?? await runChild(child)
+            return result ? { ok: result.resultStatus === 'succeeded', ...result } : { ok: false, error: 'Worker interrupted' }
+          } catch {
+            return { ok: false, error: 'Delegation rejected by task scope or budget' }
+          }
         },
       })
-      event = this.#register(task, session, event, event.agentId!, 'worker')
+      signal.throwIfAborted()
+      session = await this.#execution.open({
+        cwd: workspace.root, role, correlationId: event.agentRunId,
+        sessionDirectory: join(this.#sessions, teamKey ?? task.id), session: saved?.session, route, tools,
+        systemPrompt: this.#extensions.workflow.systemPrompt(role, scope.access, node.check),
+        reserveRequest: (request) => {
+          signal.throwIfAborted()
+          if (this.#unknownWrite(task.id)) throw new Error('Unconfirmed workspace operation')
+          lease!.request(request)
+        },
+        onEvent: (runtime) => {
+          if (runtime.type === 'model.usage') lease!.usage(runtime)
+          this.#emit(event, runtime, role)
+        },
+      })
+      if (!sameRoute(session.route, route) || (saved && (session.ref.id !== saved.session.id || session.ref.path !== saved.session.path))) {
+        throw new Error('Child Session identity or route changed')
+      }
+      event = this.#register(task, session, event, teamKey ?? event.agentId!, role, parent.agentId)
       registered = true
       unwatch = this.#watchStop(session, signal)
+      while (role === 'team' && !signal.aborted) {
+        const child = this.#tasks.runnableNodes(task.id, node.id)[0]
+        if (!child || !await runChild(child)) break
+      }
       if (!signal.aborted) {
-        const target = task.check ? workspaceTarget(task.check) : undefined
-        const outcome = await session.run(this.#context.worker({
-          taskId: task.id, nodeId: node.id, goal: node.goal,
-          constraints: ['Read-only workspace access.', 'Return only evidence relevant to this goal.'],
-          sourceMessageIds: [], artifactRefs: target ? [target] : [],
-          availableTools: tools.map((tool) => tool.name), maxModelRequests: WORKER_MODEL_REQUESTS,
-        }))
-        if (!signal.aborted && outcome.status === 'completed' && evidence.size > 0 && outcome.text.trim()) {
+        const nodes = this.#tasks.get(task.id).nodes ?? []
+        const childNodes = nodes.filter(child => child.parentNodeId === node.id)
+        const dependencies = nodes.filter(item => node.dependencies.includes(item.id))
+        const constraints = [
+          scope.access === 'read' ? 'Read-only workspace access.' : 'Workspace changes must remain inside the assigned scope.',
+          scope.path ? 'Use workspace-relative paths under ' + scope.path + '.' : 'Use workspace-relative paths.',
+          'Return a short summary of verified evidence and any remaining risks.',
+          ...(childNodes.length ? ['Child handoffs: ' + JSON.stringify(handoffs(childNodes)).slice(0, 8000)] : []),
+          ...(dependencies.length ? ['Verified prerequisites: ' + JSON.stringify(dependencies.map(item => ({
+            id: item.id, status: item.status, evidenceRefs: item.result?.evidenceRefs,
+          }))).slice(0, 4000)] : []),
+        ]
+        const target = workspaceTarget(node.check ?? (scope.path ? undefined : task.check))
+        const prompt = await this.#context.build(event, {
+          scope: scope.path ? JSON.stringify([memoryScope(task, session.route), scope.path]) : memoryScope(task, session.route),
+          goal: node.goal, constraints,
+          artifactRefs: target ? [target] : [], availableTools: tools.map(tool => tool.name), signal,
+        })
+        signal.throwIfAborted()
+        const outcome = await session.run(prompt)
+        if (!signal.aborted && outcome.status === 'completed' && outcome.text.trim()) {
+          if (node.check) verification = await verifyWorkspace(this.#tasks, this.#extensions.workflow,
+            workspace, event, node.check, signal,
+            node.check.command && !scope.path && parentScope.access === 'trusted' && node.access === 'write' ? 'trusted' : scope.access)
+          const hardEvidence = node.check ? verification?.passed === true : evidence.size > 0 ||
+            (this.#tasks.get(task.id).nodes?.some(child => child.parentNodeId === node.id && child.status === 'succeeded') ?? false)
+          const accepted = await this.#judgment.decide(event, 'handoff.sufficiency', {
+            evidenceCount: evidence.size, artifactCount: artifacts.size, checked: Boolean(node.check),
+          }, hardEvidence, hardEvidence ? [true, false] : [false], [...evidence])
           result = {
-            resultStatus: 'succeeded', summary: outcome.text.slice(0, 1600),
-            artifactRefs: [...artifacts], evidenceRefs: [...evidence], remainingRisks: [],
+            resultStatus: hardEvidence && accepted ? 'succeeded' : 'failed',
+            summary: outcome.text.slice(0, 1600), artifactRefs: [...artifacts], evidenceRefs: [...evidence],
+            remainingRisks: hardEvidence && accepted ? [] : ['verification_failed'],
           }
         }
       }
     } catch {
-      // Failure is recorded after disposal, together with bounded evidence references.
+      // The Task Engine settles the attempt after resources are released.
     } finally {
       try {
         if (session) {
@@ -269,24 +398,24 @@ export class MultiAgentOrchestrator {
         result = undefined
       } finally {
         clearTimeout(timer)
-        release()
+        if (teamLease) this.#activeTeams.delete(teamLease)
+        lease?.release()
       }
-      if (!rootSignal.aborted && !result) {
-        result = {
-          resultStatus: 'failed', summary: 'Worker did not produce verified read evidence.',
-          artifactRefs: [...artifacts], evidenceRefs: [...evidence],
-          remainingRisks: [deadline.signal.aborted ? 'worker_deadline' : 'worker_failed'],
-        }
+      if (!rootSignal.aborted && !result) result = {
+        resultStatus: 'failed', summary: 'Child Agent did not produce verified evidence.',
+        artifactRefs: [...artifacts], evidenceRefs: [...evidence],
+        remainingRisks: [deadline.signal.aborted ? 'worker_deadline' : 'worker_failed'],
       }
       if (rootSignal.aborted) result = undefined
-      if (started) this.#tasks.settleWorker(task.id, node.id, result)
-      if (registered) this.#finish(event, result?.resultStatus === 'succeeded' ? 'completed' : result ? 'failed' : 'interrupted', result)
+      if (started) result = this.#tasks.settleWorker(task.id, node.id, result, verification, event.taskAttemptId)?.result
+      if (registered) this.#finish(event, rootSignal.aborted ? 'interrupted'
+        : result?.resultStatus === 'succeeded' ? 'completed' : result ? 'failed' : 'interrupted', result, role)
     }
     return result
   }
 
+
   async run(task: TaskSnapshot, workspace: CodingWorkspace, stopSignal: AbortSignal): Promise<Outcome> {
-    const release = this.#scheduler.reserve(task.id, 'root')
     const budget = new AbortController()
     const signal = AbortSignal.any([stopSignal, budget.signal])
     const agentKey = task.conversationId ?? task.id
@@ -295,6 +424,8 @@ export class MultiAgentOrchestrator {
       taskId: task.id, taskRunId: task.taskRunId, taskAttemptId: task.attemptId, taskNodeId: task.rootNodeId,
       agentId: saved?.id ?? randomUUID(), agentRunId: randomUUID(), type: '', payload: {},
     }
+    let lease: ReturnType<LocalModelScheduler['reserve']> | undefined
+    let deadline: NodeJS.Timeout | undefined
     let session: ExecutionSession | undefined
     let unwatch: (() => Promise<void>) | undefined
     let registered = false
@@ -304,95 +435,166 @@ export class MultiAgentOrchestrator {
     let outputFailed = false
     let textProduced = false
     let streamed = false
-    let requests = 0
     const seenSteers = new Set<string>()
     const queuedSteers = new Set<string>()
     let prompted = new Set<string>()
     let outcome: Outcome = { status: 'runtime_error' }
+    const rootScope = this.#capabilities.root(task.workspaceAccess, Boolean(task.check))
+    const hasUnknownWrite = () => this.#unknownWrite(task.id)
+    const dispatchAllowed = (toolSignal?: AbortSignal) =>
+      this.#profile.delegation && !signal.aborted && !toolSignal?.aborted && !workspaceActive && !workerActive && !hasUnknownWrite()
     const runWorker = async (node: WorkerNode): Promise<WorkerResult | undefined> => {
-      if (!this.#profile.delegation) throw new Error('The Coding profile disables delegation')
-      if (!session || workerActive || workspaceActive || signal.aborted) throw new Error('Worker cannot start at this boundary')
+      if (!session || !dispatchAllowed()) throw new Error('Worker cannot start at this boundary')
       if (node.result) return node.result
       workerActive = true
       try {
-        return await this.#worker(task, node, event, workspace, session.route, signal)
+        return await this.#worker(task, node, event, workspace, session.route, rootScope, signal)
       } finally {
         workerActive = false
       }
     }
-    const hasUnknownWrite = () => this.#tasks.operations(task.id).some(({ effect, status }) =>
-      effect === 'write' && (status === 'unknown_effect' || status === 'started'))
-    const allowTool = (tool: WorkspaceTool) => this.#capabilities.authorize('root', tool.effect) &&
-      (tool.effect === 'read' || Boolean(task.check))
-    const tools = workspace.tools('root').filter(allowTool).map((tool) => {
-      const wrapped = this.#wrap(tool, () => event, signal, () =>
-        !workerActive && !hasUnknownWrite() && allowTool(tool))
-      return {
-        ...wrapped,
-        execute: async (id: string, input: unknown, toolSignal?: AbortSignal) => {
-          if (workspaceActive) return { ok: false, error: 'Another workspace tool is active' }
-          workspaceActive = true
-          try {
-            return await wrapped.execute(id, input, toolSignal)
-          } finally {
-            workspaceActive = false
+    const drain = async () => {
+      const completed = new Set<string>()
+      if (!session || !dispatchAllowed()) return []
+      const route = session.route
+      workerActive = true
+      try {
+        while (!signal.aborted && !hasUnknownWrite()) {
+          const batch = this.#tasks.runnableNodes(task.id)
+          if (!batch.length) break
+          const settled = await Promise.allSettled(batch.map(node =>
+            this.#worker(task, node, event, workspace, route, rootScope, signal)))
+          const failure = settled.find(outcome => outcome.status === 'rejected')
+          if (failure) throw failure.reason
+          const latest = this.#tasks.get(task.id)
+          let progressed = false
+          for (const previous of batch) {
+            const node = latest.worker?.id === previous.id ? latest.worker : latest.nodes?.find(item => item.id === previous.id)
+            if (!node || node.status === 'ready') continue
+            progressed = true
+            completed.add(node.id)
           }
-        },
+          if (!progressed) break
+        }
+      } finally {
+        workerActive = false
       }
-    })
-    if (this.#profile.delegation) tools.push({
-      name: 'delegate_task',
-      description: 'Run a single temporary read-only worker for a well-scoped investigation. Returns a structured result.',
-      parameters: {
-        type: 'object', additionalProperties: false, required: ['goal'],
-        properties: { goal: { type: 'string', minLength: 1, maxLength: 8000 } },
-      },
-      execute: async (id, input, toolSignal) => {
-        if (signal.aborted || toolSignal?.aborted || workerActive || workspaceActive || hasUnknownWrite()) {
-          return { ok: false, error: 'Delegation unavailable' }
+      const latest = this.#tasks.get(task.id)
+      return [latest.worker, ...(latest.nodes ?? [])].filter((node): node is WorkerNode => Boolean(node && completed.has(node.id)))
+    }
+    const tools: ExecutionTool[] = this.#extensions.tools(workspace, 'root', rootScope.access)
+      .filter(tool => this.#capabilities.describe(rootScope, tool))
+      .map(tool => {
+        const wrapped = this.#wrap(tool, () => event, signal, input =>
+          !workerActive && !hasUnknownWrite() && this.#capabilities.authorize(rootScope, tool, input))
+        return {
+          ...wrapped,
+          execute: async (id, input, toolSignal) => {
+            if (workspaceActive) return { ok: false, error: 'Another workspace tool is active' }
+            workspaceActive = true
+            try { return await wrapped.execute(id, input, toolSignal) } finally { workspaceActive = false }
+          },
         }
-        if (!input || typeof input !== 'object' || !('goal' in input) || typeof input.goal !== 'string') {
-          return { ok: false, error: 'A scoped goal is required' }
+      })
+    if (this.#profile.delegation) {
+      tools.push({
+        name: 'delegate_task',
+        description: 'Run a single temporary read-only worker for a well-scoped investigation. Returns a structured result.',
+        parameters: {
+          type: 'object', additionalProperties: false, required: ['goal'],
+          properties: { goal: { type: 'string', minLength: 1, maxLength: 8000 } },
+        },
+        execute: async (id, input, toolSignal) => {
+          if (!dispatchAllowed(toolSignal) || !input || typeof input !== 'object' ||
+            !('goal' in input) || typeof input.goal !== 'string') return { ok: false, error: 'Delegation unavailable' }
+          const goal = input.goal
+          const shouldDelegate = await this.#judgment.decide(event, 'delegation.worth',
+            { role: 'root', goalLength: goal.length }, goal.trim().length > 0, [true, false], [task.rootNodeId])
+          if (!shouldDelegate || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Delegation unavailable' }
+          const operationId = event.agentRunId + ':' + id
+          this.#tasks.beginTool(task.id, event, operationId, 'delegate_task', 'read')
+          let result: WorkerResult | undefined
+          try {
+            const node = this.#tasks.delegate(task.id, goal)
+            result = await runWorker(node)
+          } catch {
+            this.#tasks.finishTool(event, operationId, 'failed')
+            return { ok: false, error: 'Delegation rejected by task scope or budget' }
+          }
+          this.#tasks.finishTool(event, operationId, result?.resultStatus === 'succeeded' ? 'succeeded' : 'failed')
+          return result ? { ok: result.resultStatus === 'succeeded', ...result } : { ok: false, error: 'Worker interrupted' }
+        },
+      })
+      tools.push(planTool(async (id, proposals, toolSignal) => {
+        if (!dispatchAllowed(toolSignal) || !session || !proposals.length || proposals.length > 8) {
+          return { ok: false, error: 'Planning unavailable' }
         }
-        const goal = input.goal
-        const decision = await this.#judgment.evaluate({
-          id: 'delegation.worth', schemaVersion: 1, mode: 'off',
-          baseline: (value: string) => value.trim().length > 0,
-        }, goal, [task.rootNodeId])
-        this.#db.transaction(() => {
-          this.#db.append({ ...event, type: 'judgment.evaluated', payload: { ...decision } })
-        })
-        if (!decision.baseline || signal.aborted || toolSignal?.aborted || workerActive || workspaceActive) {
-          return { ok: false, error: 'Delegation unavailable' }
-        }
-        const operationId = event.agentRunId + ':' + id
-        this.#tasks.beginTool(task.id, event, operationId, 'delegate_task', 'read')
-        let result: WorkerResult | undefined
         try {
-          const node = this.#tasks.delegate(task.id, goal)
-          result = await runWorker(node)
+          const planned = []
+          for (const proposal of proposals) {
+            if (!proposal || typeof proposal !== 'object') throw new Error('Invalid node proposal')
+            this.#capabilities.child(rootScope, proposal.access, proposal.scopePath)
+            if (proposal.route && !this.#scheduler.canSwitch(session.route, proposal.route)) {
+              throw new Error('Cross-provider delegation is not authorized')
+            }
+            const teamCandidate = Boolean(proposal.teamKey)
+            const baseline = proposal.role ?? (teamCandidate ? 'team' : 'worker')
+            const role = await this.#judgment.decide(event, 'collaboration.mode',
+              { nodeCount: proposals.length, teamCandidate, hasDependencies: Boolean(proposal.dependencies?.length) },
+              baseline, !proposal.role && teamCandidate ? ['worker', 'team'] : [baseline], [task.rootNodeId])
+            planned.push({ ...proposal, role, ...(role === 'worker' ? { teamKey: undefined } : {}) })
+          }
+          if (!dispatchAllowed(toolSignal)) return { ok: false, error: 'Planning interrupted' }
+          const current = this.#tasks.get(task.id)
+          const nodes = this.#tasks.proposePlan(task.id, 'plan:' + event.agentRunId + ':' + receiptId(id), current.planVersion, planned)
+          await drain()
+          const latest = this.#tasks.get(task.id)
+          const handoff = handoffs((latest.nodes ?? []).filter(node => nodes.some(({ id }) => id === node.id)))
+          return { ok: handoff.every(node => node.status === 'succeeded'), planVersion: latest.planVersion, nodes: handoff }
         } catch {
-          this.#tasks.finishTool(event, operationId, 'failed')
-          return { ok: false, error: 'Delegation rejected by task scope or budget' }
+          return { ok: false, error: 'Plan rejected by task scope, dependency, or budget' }
         }
-        this.#tasks.finishTool(event, operationId, result?.resultStatus === 'succeeded' ? 'succeeded' : 'failed')
-        return result ? { ok: result.resultStatus === 'succeeded', ...result } : { ok: false, error: 'Worker interrupted' }
-      },
-    })
+      }))
+      tools.push(replanTool(async (id, nodeId, update, toolSignal) => {
+        if (!dispatchAllowed(toolSignal)) return { ok: false, error: 'Replanning unavailable' }
+        const current = this.#tasks.get(task.id)
+        const node = current.nodes?.find(item => item.id === nodeId)
+        const safe = node && node.parentNodeId === task.rootNodeId && !node.replans &&
+          (node.status === 'ready' || node.status === 'failed') &&
+          !this.#tasks.operations(task.id).some(operation => operation.taskNodeId === node.id && operation.effect === 'write')
+        const revise = await this.#judgment.decide(event, 'task.replan',
+          { status: node?.status ?? 'missing', requested: true }, Boolean(safe), safe ? [true, false] : [false], node ? [node.id] : [])
+        if (!revise || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Replan declined or unsafe' }
+        try {
+          this.#tasks.replanNode(task.id, 'replan:' + event.agentRunId + ':' + receiptId(id), current.planVersion, nodeId, update)
+          await drain()
+          const latest = this.#tasks.get(task.id)
+          return { ok: true, planVersion: latest.planVersion, nodes: handoffs(latest.nodes?.filter(node => node.id === nodeId) ?? []) }
+        } catch {
+          return { ok: false, error: 'Replan rejected by task scope, version, or budget' }
+        }
+      }))
+    }
     const config = (route: ModelRoute | undefined, ref?: SessionRef): ExecutionConfig => ({
       cwd: workspace.root, role: 'root', correlationId: event.agentRunId,
       sessionDirectory: join(this.#sessions, agentKey), session: ref, route, tools,
-      systemPrompt: task.check
-        ? 'You are a local coding agent. Use the listed tools for scoped text changes. A deterministic file check decides acceptance. Do not request credentials.'
-        : 'You are a local assistant. Workspace access is read-only. Respond directly to the user and do not request credentials.',
+      systemPrompt: this.#extensions.workflow.systemPrompt('root', rootScope.access, task.check),
+      reserveRequest: (request) => {
+        signal.throwIfAborted()
+        if (hasUnknownWrite()) throw new Error('Unconfirmed workspace operation')
+        try { lease!.request(request) } catch (error) {
+          if (error instanceof ModelBudgetError) budget.abort()
+          throw error
+        }
+      },
       onEvent: (runtime) => {
-        if (runtime.type === 'model.request_started' && ++requests > ROOT_MODEL_REQUESTS) budget.abort()
         if (runtime.type === 'instruction.applied') seenSteers.add(runtime.instructionId)
         if (runtime.type === 'message.delta' && runtime.delta) {
           streamed = true
           textProduced ||= Boolean(runtime.delta.trim())
         }
         try {
+          if (runtime.type === 'model.usage') lease!.usage(runtime)
           this.#emit(event, runtime, 'root')
         } catch {
           outputFailed = true
@@ -437,12 +639,14 @@ export class MultiAgentOrchestrator {
     }
     let openingSavedSession = false
     try {
+      lease = this.#scheduler.reserve(() => event, 'root')
+      deadline = setTimeout(() => budget.abort(), ROOT_DEADLINE_MS)
       lockRoute()
       const initialRoute = this.#tasks.get(task.id).route ?? saved?.route
       if (saved && initialRoute && !this.#scheduler.canSwitch(saved.route, initialRoute)) return { status: 'model_error' }
       if (initialRoute) {
         try {
-          await this.#scheduler.validateRoute(initialRoute)
+          await this.#scheduler.allocate(event, initialRoute, initialRoute)
         } catch {
           return { status: 'model_error' }
         }
@@ -509,14 +713,19 @@ export class MultiAgentOrchestrator {
             })
             unlockRoute()
           }
-          const workerResult = current.worker?.status === 'ready' ? await runWorker(current.worker) : undefined
+          const completedNodes = await drain()
           if (signal.aborted) break
-          if (workerResult) nextPrompt += '\nWorker result:\n' + JSON.stringify(workerResult)
+          if (completedNodes.length) nextPrompt += '\nAgent handoffs:\n' + JSON.stringify(handoffs(completedNodes)).slice(0, 8000)
           const latest = this.#tasks.get(task.id)
           if (conversationId && latest.route && !sameRoute(latest.route, session.route)) continue
           const instructions = latest.instructions.filter((item) => !item.delivered)
           prompted = new Set(instructions.map(({ id }) => id))
-          const prompt = [nextPrompt, ...instructions.map(({ text }) => 'Additional user instruction: ' + text)].join('\n\n')
+          const prompt = await this.#context.build(event, {
+            scope: memoryScope(task, session.route), goal: nextPrompt,
+            constraints: instructions.map(({ text }) => 'Additional user instruction: ' + text),
+            signal,
+          })
+          if (signal.aborted) break
           streamed = false
           const result = await session.run(prompt)
           if (result.status !== 'completed') {
@@ -543,10 +752,10 @@ export class MultiAgentOrchestrator {
           seenSteers.clear()
           queuedSteers.clear()
           const after = this.#tasks.get(task.id)
-          const more = after.instructions.some((item) => !item.delivered) || after.worker?.status === 'ready' ||
+          const more = after.instructions.some((item) => !item.delivered) || this.#tasks.runnableNodes(task.id).length > 0 ||
             (!conversationId && after.route && !sameRoute(after.route, session.route))
           if (!more || hasUnknownWrite()) {
-            outcome = { status: 'completed', route: session.route, textProduced }
+            outcome = { status: 'completed', route: session.route, textProduced, event }
             break
           }
           nextPrompt = 'Continue the current task using the updates in this turn.'
@@ -563,7 +772,8 @@ export class MultiAgentOrchestrator {
         checkpointFailed = true
       } finally {
         unlockRoute()
-        release()
+        clearTimeout(deadline)
+        lease?.release()
       }
       if (checkpointFailed || outputFailed) outcome = { status: 'checkpoint_error' }
       else if (stopSignal.aborted) outcome = { status: 'interrupted' }
