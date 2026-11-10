@@ -1,15 +1,21 @@
 import { randomUUID } from 'node:crypto'
 import { constants, lstatSync, realpathSync } from 'node:fs'
 import type { Stats } from 'node:fs'
-import { lstat, open, opendir, realpath, rename, unlink } from 'node:fs/promises'
+import { lstat, mkdir, open, opendir, realpath, rename, unlink } from 'node:fs/promises'
 import { dirname, join, relative, resolve } from 'node:path'
 import type { ExecutionTool } from './execution.ts'
-import type { VerificationCheck, VerificationResult } from './contracts/domain.ts'
+import { projectCommands } from './contracts/domain.ts'
+import type { ProjectCommand, VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
+import {
+  containsPath, gitInvocation, parseProjectCommand, projectInvocation, redactProcessOutput,
+  runWorkspaceProcess, UnknownProcessEffect,
+} from './workspace-process.ts'
 
-export type { VerificationCheck, VerificationResult } from './contracts/domain.ts'
+export { parseProjectCommand } from './workspace-process.ts'
+export type { VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
 export type WorkspaceTool = ExecutionTool & { effect: 'read' | 'write' }
 export interface Verifier {
-  verify(check: VerificationCheck, signal?: AbortSignal): Promise<VerificationResult>
+  verify(check: VerificationCheck, signal?: AbortSignal, access?: WorkspaceAccess): Promise<VerificationResult>
 }
 
 export function workspaceTarget(input: unknown): string | undefined {
@@ -32,6 +38,8 @@ const invalidPathCharacter = /[\u0000-\u001f\u007f<>:"|?*]/u
 const invalidTextCharacter = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u
 const pathProperty = { type: 'string', maxLength: maxPathLength }
 const textProperty = { type: 'string', maxLength: maxBytes }
+const scriptExtensions = /\.(?:[cm]?[jt]s)$/iu
+const activeWrites = new Set<string>()
 
 class WorkspaceDenied extends Error {}
 
@@ -85,8 +93,7 @@ async function writeAndSync(file: Awaited<ReturnType<typeof open>>, content: str
 
 export class CodingWorkspace implements Verifier {
   readonly root: string
-  #rootStat: Stats
-  #writing = false
+  readonly #rootStat: Stats
 
   constructor(root: string) {
     const selected = resolve(root)
@@ -102,7 +109,7 @@ export class CodingWorkspace implements Verifier {
     this.#rootStat = stat
   }
 
-  tools(role: 'root' | 'worker'): WorkspaceTool[] {
+  tools(role: 'root' | 'team' | 'worker', access: WorkspaceAccess = role === 'root' ? 'write' : 'read'): WorkspaceTool[] {
     const readTools = [
       this.#tool('list_directory', 'List allowed entries in one directory. Use "." for the workspace root.',
         'read', { path: pathProperty }, (args, signal) => this.#list(args.path, signal)),
@@ -112,18 +119,72 @@ export class CodingWorkspace implements Verifier {
           return { ok: true, text }
         }),
     ]
-    if (role !== 'root') return readTools
-    return [
+    if (access === 'read') return readTools
+    const writeTools = [
       ...readTools,
       this.#tool('create_text_file', 'Create a new workspace text file in an existing directory.',
         'write', { path: pathProperty, content: textProperty }, (args, signal) => this.#create(args, signal)),
       this.#tool('edit_text_file', 'Replace exactly one literal occurrence of oldText in a workspace text file.',
         'write', { path: pathProperty, oldText: textProperty, newText: textProperty },
         (args, signal) => this.#edit(args, signal)),
+      this.#tool('create_directory', 'Create one new workspace directory under an existing directory.',
+        'write', { path: pathProperty }, (args, signal) => this.#mkdir(args.path, signal)),
+    ]
+    if (access !== 'trusted') return writeTools
+    return [
+      ...writeTools,
+      this.#tool('run_project_command',
+        'Run an authorized local project script. For npm use a relative working directory or ".". For node_script use a relative script file and optional literal arguments.',
+        'write', {
+          command: { type: 'string', enum: [...projectCommands] },
+          path: pathProperty,
+          args: { type: 'array', maxItems: 16, items: { type: 'string', maxLength: 1024 } },
+        }, async (input, signal) => {
+          const result = await this.#project(input, signal)
+          return result.state !== 'exited' ? { ok: false, error: 'Project command did not start' } : {
+            ok: result.code === 0,
+            exitCode: result.code,
+            stdout: redactProcessOutput(result.stdout, result.truncated),
+            stderr: redactProcessOutput(result.stderr, result.truncated),
+            truncated: result.truncated,
+          }
+        }, ['args']),
+      this.#tool('git_status', 'Inspect local Git status for allowed workspace paths.', 'write', {},
+        async (_args, signal) => this.#gitStatus(signal)),
+      this.#tool('git_diff', 'Inspect the unstaged or staged Git diff for a single allowed text file.',
+        'write', { path: pathProperty, staged: { type: 'boolean' } }, async (args, signal) => {
+          if (args.staged !== undefined && typeof args.staged !== 'boolean') throw new WorkspaceDenied('Invalid staged flag')
+          const parts = segments(args.path)
+          await this.#checkedPath(parts, false)
+          return this.#gitText([
+            'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=all',
+            ...(args.staged ? ['--cached'] : []), '--', parts.join('/'),
+          ], signal)
+        }, ['staged']),
+      this.#tool('git_log', 'Inspect the last ten local commits as abbreviated IDs and dates.', 'write', {},
+        async (_args, signal) => this.#gitText(['log', '-n', '10', '--format=%h%x09%cs'], signal)),
     ]
   }
 
-  async verify(check: VerificationCheck, signal?: AbortSignal): Promise<VerificationResult> {
+  async verify(check: VerificationCheck, signal?: AbortSignal, access?: WorkspaceAccess): Promise<VerificationResult> {
+    if (check.command) {
+      if (access !== 'trusted') return { passed: false, evidence: 'workspace_command_not_authorized' }
+      if (!this.#startWrite()) return { passed: false, evidence: 'workspace_write_active' }
+      try {
+        const result = await this.#project(check.command, signal)
+        if (result.state !== 'exited') {
+          return { passed: false, evidence: result.state === 'cancelled' ? 'verification_interrupted' : 'workspace_command_unavailable' }
+        }
+        return result.code === 0
+          ? { passed: true, evidence: 'workspace_command_passed' }
+          : { passed: false, evidence: 'workspace_command_failed' }
+      } catch (error) {
+        if (error instanceof WorkspaceDenied) return { passed: false, evidence: 'workspace_command_unavailable' }
+        throw error
+      } finally {
+        activeWrites.delete(this.root)
+      }
+    }
     try {
       const { text } = await this.#read(segments(check.path), signal)
       if (check.contains !== undefined && !text.includes(textValue(check.contains))) {
@@ -138,34 +199,105 @@ export class CodingWorkspace implements Verifier {
     }
   }
 
+  #startWrite(): boolean {
+    for (const active of activeWrites) {
+      if (containsPath(active, this.root) || containsPath(this.root, active)) return false
+    }
+    activeWrites.add(this.root)
+    return true
+  }
+
   #tool(
     name: string,
     description: string,
     effect: WorkspaceTool['effect'],
     properties: Record<string, unknown>,
     execute: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>,
+    optional: string[] = [],
   ): WorkspaceTool {
     return {
       name,
       description,
       effect,
-      parameters: { type: 'object', properties, required: Object.keys(properties), additionalProperties: false },
+      parameters: {
+        type: 'object', properties,
+        required: Object.keys(properties).filter((key) => !optional.includes(key)),
+        additionalProperties: false,
+      },
       execute: async (_callId, input, signal) => {
-        if (!input || typeof input !== 'object' || Array.isArray(input)) return { ok: false, error: 'Invalid arguments' }
+        if (!input || typeof input !== 'object' || Array.isArray(input) ||
+          Object.keys(input).some((key) => !Object.hasOwn(properties, key))) return { ok: false, error: 'Invalid arguments' }
         if (signal?.aborted) return { ok: false, error: 'Tool interrupted before execution' }
-        if (effect === 'write' && this.#writing) return { ok: false, error: 'Another workspace write is active' }
-        if (effect === 'write') this.#writing = true
+        if (effect === 'write' && !this.#startWrite()) return { ok: false, error: 'Another workspace write is active' }
         try {
           return await execute(input as Record<string, unknown>, signal)
         } catch (error) {
           if (error instanceof WorkspaceDenied) return { ok: false, error: error.message }
           if (effect === 'read') return { ok: false, error: 'Workspace entry unavailable' }
+          if (error instanceof UnknownProcessEffect) throw error
           throw new Error('Workspace write could not be confirmed')
         } finally {
-          if (effect === 'write') this.#writing = false
+          if (effect === 'write') activeWrites.delete(this.root)
         }
       },
     }
+  }
+
+  async #mkdir(value: unknown, signal?: AbortSignal) {
+    const parts = segments(value)
+    const { path: parent } = await this.#checkedPath(parts.slice(0, -1), true)
+    if (signal?.aborted) return { ok: false, error: 'Tool interrupted before writing' }
+    try {
+      await mkdir(join(parent, parts.at(-1)!))
+      return { ok: true }
+    } catch (error) {
+      if (errorCode(error) === 'EEXIST') throw new WorkspaceDenied('Workspace entry already exists')
+      throw error
+    }
+  }
+
+  async #project(input: unknown, signal?: AbortSignal) {
+    let command: ProjectCommand
+    try {
+      command = parseProjectCommand(input)
+    } catch {
+      throw new WorkspaceDenied('Invalid project command')
+    }
+    const node = command.command === 'node_script'
+    const parts = segments(command.path, !node)
+    if (node && !scriptExtensions.test(parts.at(-1)!)) throw new WorkspaceDenied('Expected a JavaScript or TypeScript file')
+    const { path } = await this.#checkedPath(parts, !node)
+    if (!node) await this.#checkedPath([...parts, 'package.json'], false)
+    const invocation = projectInvocation(command, path, this.root)
+    if (!invocation) throw new WorkspaceDenied('Project command executable is unavailable')
+    return runWorkspaceProcess(invocation, node ? this.root : path, this.root, signal)
+  }
+
+  async #git(args: string[], signal?: AbortSignal) {
+    await this.#checkedPath(['.git'], true)
+    const invocation = gitInvocation(this.root, args)
+    if (!invocation) throw new WorkspaceDenied('Local Git executable is unavailable')
+    return runWorkspaceProcess(invocation, this.root, this.root, signal)
+  }
+
+  async #gitText(args: string[], signal?: AbortSignal) {
+    const result = await this.#git(args, signal)
+    if (result.state !== 'exited' || result.code !== 0) return { ok: false, error: 'Git inspection failed' }
+    return { ok: true, stdout: redactProcessOutput(result.stdout, result.truncated), truncated: result.truncated }
+  }
+
+  async #gitStatus(signal?: AbortSignal) {
+    const result = await this.#git(['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--no-renames',
+      '--ignore-submodules=all'], signal)
+    if (result.state !== 'exited' || result.code !== 0) return { ok: false, error: 'Git inspection failed' }
+    const entries = []
+    for (const record of result.stdout.split('\0').slice(0, -1)) {
+      const path = record.slice(3).replace(/\/$/u, '')
+      if (workspaceTarget({ path }) !== undefined) {
+        entries.push({ status: record.slice(0, 2), path: redactProcessOutput(path) })
+      }
+    }
+    return { ok: true, entries, truncated: result.truncated }
   }
 
   async #checkedPath(parts: string[], directory: boolean): Promise<{ path: string; stat: Stats }> {
