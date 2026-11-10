@@ -1,7 +1,7 @@
 import type {
   ConversationEvent, ConversationHistory, ConversationSummary, ConversationTool, ConversationTurn, TaskStatus,
-} from '../../../../host/src/contracts/desktop.ts'
-import type { EndReason } from '../../../../host/src/contracts/domain.ts'
+} from '../../../../shared/contracts/desktop.ts'
+import type { EndReason } from '../../../../shared/contracts/domain.ts'
 import type { Session, Turn } from '../../features/sessions/model'
 import type { RunStatus, ToolUpdate } from './AgentAdapter'
 

@@ -1,7 +1,7 @@
 import { create } from 'zustand'
 import type {
   CreateConversationInput, DesktopHostStatus, SendMessageInput, SteerInput,
-} from '../../../host/src/contracts/desktop.ts'
+} from '../../../shared/contracts/desktop.ts'
 import { HostAgentAdapter } from '../integrations/agent/HostAgentAdapter'
 import { MockDesktopHost } from '../integrations/agent/MockDesktopHost'
 import { applyHistory, applyHostEvent, applyOlderHistory, isBusy, toSession } from '../integrations/agent/conversationProjection'

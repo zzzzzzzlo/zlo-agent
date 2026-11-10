@@ -7,7 +7,7 @@ import type {
   ActionResult, ArchiveConversationInput, ConversationAction, ConversationEvent, ConversationHistory,
   ConversationSummary, CreateConversationInput, CursorInput, DesktopCommand, HistoryInput,
   RenameConversationInput, SendMessageInput, SendMessageResult, SteerInput,
-} from './contracts/desktop.ts'
+} from '../../shared/contracts/desktop.ts'
 import {
   ConversationError, ConversationService, parseConversationAction, parseCreateConversation, parseSendMessage, parseSteer,
 } from './conversation.ts'

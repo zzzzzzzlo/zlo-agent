@@ -3,7 +3,7 @@ import type {
   ArchiveConversationInput, ConversationAction, ConversationEvent, ConversationHistory, ConversationMessage,
   ConversationSummary, ConversationTool, ConversationTurn, CreateConversationInput, DesktopErrorCode,
   HistoryInput, RenameConversationInput, SendMessageInput, SendMessageResult, SteerInput, UsageTotals,
-} from './contracts/desktop.ts'
+} from '../../shared/contracts/desktop.ts'
 import type { AgentEvent, EndReason, EventDraft, ModelRoute, TaskStatus } from './contracts/domain.ts'
 import type { LocalStore } from './store.ts'
 import type { TaskSnapshot } from './task-engine.ts'

@@ -1,5 +1,5 @@
 import type { WindowApi } from '../electron/window-api'
-import type { DesktopHostApi } from '../../host/src/contracts/desktop.ts'
+import type { DesktopHostApi } from '../../shared/contracts/desktop.ts'
 
 declare global {
   interface Window {

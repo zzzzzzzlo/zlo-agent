@@ -1,5 +1,5 @@
 import type { RunStatus, ToolUpdate } from '../../integrations/agent/AgentAdapter'
-import type { ConversationMessage, ConversationSummary, ConversationTurn, TaskStatus } from '../../../../host/src/contracts/desktop.ts'
+import type { ConversationMessage, ConversationSummary, ConversationTurn, TaskStatus } from '../../../../shared/contracts/desktop.ts'
 
 export interface Turn {
   id: string

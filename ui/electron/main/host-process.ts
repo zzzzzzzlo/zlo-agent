@@ -2,7 +2,7 @@ import { spawn } from 'node:child_process'
 import type { ChildProcessWithoutNullStreams } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
-import type { ConversationEvent, DesktopCommand, DesktopErrorCode, DesktopHostStatus, HostMode } from '../../../host/src/contracts/desktop.ts'
+import type { ConversationEvent, DesktopCommand, DesktopErrorCode, DesktopHostStatus, HostMode } from '../../../shared/contracts/desktop.ts'
 
 const startupTimeoutMs = 15_000
 const requestTimeoutMs = 20_000

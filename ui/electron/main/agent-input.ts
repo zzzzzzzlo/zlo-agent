@@ -1,5 +1,5 @@
 import { isAbsolute, relative, sep } from 'node:path'
-import type { ConversationAction, ConversationRef, CreateConversationInput, DesktopCommand } from '../../../host/src/contracts/desktop.ts'
+import type { ConversationAction, ConversationRef, CreateConversationInput, DesktopCommand } from '../../../shared/contracts/desktop.ts'
 import { HostTransportError } from './host-process.ts'
 
 type ApiMethod = 'createConversation' | 'listConversations' | 'getConversation' | 'getHistory' |

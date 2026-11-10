@@ -1,6 +1,6 @@
 {
   "name": "zlo-agent",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "A local desktop workspace for Zlo Agent",
   "author": "Zlo Agent contributors",
@@ -45,6 +45,11 @@
     "files": ["out/main/**/*", "out/preload/**/*", "out/renderer/**/*", "resources/icon.png", "LICENSE", "THIRD-PARTY-NOTICES.md", "licenses/**/*"],
     "afterPack": "electron/scripts/check-host-bundle.cjs",
     "extraResources": [
+      {
+        "from": "../shared",
+        "to": "shared",
+        "filter": ["package.json", "contracts/**/*", "diagnostics.ts"]
+      },
       {
         "from": "out/agent-host",
         "to": "agent-host",

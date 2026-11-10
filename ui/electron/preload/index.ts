@@ -3,7 +3,7 @@ import type { IpcRendererEvent } from 'electron'
 import { windowChannels } from '../window-api'
 import type { WindowApi } from '../window-api'
 import { agentChannels } from '../agent-channels.ts'
-import type { ConversationEvent, DesktopHostApi, DesktopHostStatus } from '../../../host/src/contracts/desktop.ts'
+import type { ConversationEvent, DesktopHostApi, DesktopHostStatus } from '../../../shared/contracts/desktop.ts'
 
 const windowApi: WindowApi = {
   minimize: () => ipcRenderer.invoke(windowChannels.minimize),

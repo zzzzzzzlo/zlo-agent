@@ -1,7 +1,7 @@
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createInterface } from 'node:readline'
-import type { DesktopCommand, DesktopErrorCode, HostMode } from './contracts/desktop.ts'
+import type { DesktopCommand, DesktopErrorCode, HostMode } from '../../shared/contracts/desktop.ts'
 import { ConversationError, parseRoute } from './conversation.ts'
 import { FakeExecution } from './fake.ts'
 import { LocalAgentHost } from './host.ts'

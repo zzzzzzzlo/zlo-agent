@@ -13,7 +13,7 @@ import { ModelRuntime } from '@earendil-works/pi-coding-agent'
 import { ConversationService } from '../src/conversation.ts'
 import type {
   ConversationEvent, ConversationHistory, ConversationSummary, DesktopErrorCode, SendMessageResult,
-} from '../src/contracts/desktop.ts'
+} from '../../shared/contracts/desktop.ts'
 import { LocalAgentHost } from '../src/host.ts'
 import { PiExecution } from '../src/pi.ts'
 import { LocalStore } from '../src/store.ts'

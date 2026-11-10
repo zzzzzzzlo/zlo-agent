@@ -4,7 +4,7 @@ import { registerHooks } from 'node:module'
 import { setImmediate } from 'node:timers/promises'
 import type {
   ConversationEvent, ConversationHistory, ConversationSummary, ConversationTurn, DesktopHostApi, DesktopHostStatus,
-} from '../../host/src/contracts/desktop.ts'
+} from '../../shared/contracts/desktop.ts'
 import { HostAgentAdapter } from '../src/integrations/agent/HostAgentAdapter.ts'
 import { applyHistory, applyHostEvent, applyOlderHistory, isBusy } from '../src/integrations/agent/conversationProjection.ts'
 

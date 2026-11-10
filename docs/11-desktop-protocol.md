@@ -2,7 +2,7 @@
 
 Phase 0 核对：本地 main 与 origin/main 指向首轮 877b4ef，工作区干净。Node 24.15.0，Electron 43.4.1。Host 基线 31/31，UI 类型检查通过。首轮只有 Task 级事件、临时输出及按 Task 划分的 Pi 会话，桌面使用 Mock 与 localStorage。未发现可用于在线测试的 Provider 环境变量。
 
-Phase 1 冻结接口在 `host/src/contracts/domain.ts` 与 `desktop.ts`。以下约定先于并行开发。
+Phase 1 冻结接口在 `shared/contracts/domain.ts` 与 `shared/contracts/desktop.ts`。以下约定先于并行开发。
 
 - Electron → Host 使用原 JSONL stdin/stdout。新命令使用 `DesktopCommand`，结果沿用 `{schemaVersion:1, kind:"result", commandId, type, result}`。事件为 `{schemaVersion:1, kind:"conversation.event", event}`。错误为 `{schemaVersion:1,kind:"error",commandId,error:{code,message}}`，旧 CLI 保留顶层 message。启动 `ready` 包含 mode。CLI `exit` 正常停止，EOF 作为关闭保护。
 - Electron Main 管生命周期和 transport，Preload 仅暴露 `window.agentHost: DesktopHostApi`。可信窗口通过本地目录选择器授权工作区。Renderer 的写命令不能传入其他工作区路径。

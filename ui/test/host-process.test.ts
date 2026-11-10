@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { HostProcessManager, HostTransportError } from '../electron/main/host-process.ts'
-import type { ConversationEvent } from '../../host/src/contracts/desktop.ts'
+import type { ConversationEvent } from '../../shared/contracts/desktop.ts'
 
 const fixture = fileURLToPath(new URL('./fixtures/process-host.mjs', import.meta.url))
 const list = { schemaVersion: 1, type: 'listConversations' } as const

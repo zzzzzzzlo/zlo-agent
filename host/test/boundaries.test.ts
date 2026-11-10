@@ -15,18 +15,24 @@ const dependencies: Record<string, string[]> = {
   pi: ['execution'],
   fake: ['execution'],
   faux: ['pi'],
-  'contracts/desktop': ['contracts/domain'],
-  'contracts/domain': [],
+  'contracts/desktop': ['shared/domain'],
+  'contracts/domain': ['shared/domain'],
 }
 
 test('Host modules respect the dependency direction and keep Pi behind its adapter', async () => {
   for (const [file, allowed] of Object.entries(dependencies)) {
-    const content = await readFile(new URL('../src/' + file + '.ts', import.meta.url), 'utf8')
+    const source = new URL(file === 'contracts/desktop'
+      ? '../../shared/contracts/desktop.ts'
+      : '../src/' + file + '.ts', import.meta.url)
+    const content = await readFile(source, 'utf8')
     for (const match of content.matchAll(/(?:from\s+|import\s*\(\s*)['"]([^'"]+)['"]/g)) {
       const specifier = match[1]
       if (specifier.startsWith('.')) {
-        const target = new URL(specifier, new URL('../src/' + file + '.ts', import.meta.url)).pathname.split('/src/').at(-1)!
-        assert.ok(allowed.includes(target.replace(/\.ts$/, '')), file + ' -> ' + specifier)
+        const path = new URL(specifier, source).pathname
+        const target = path.includes('/shared/contracts/')
+          ? path.endsWith('/desktop.ts') ? 'contracts/desktop' : 'shared/domain'
+          : path.split('/src/').at(-1)!.replace(/\.ts$/, '')
+        assert.ok(allowed.includes(target), file + ' -> ' + specifier)
       }
       if (specifier.startsWith('@earendil-works/')) assert.ok(file === 'pi' || file === 'faux')
     }

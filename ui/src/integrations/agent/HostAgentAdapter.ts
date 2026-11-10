@@ -1,6 +1,6 @@
 import type {
   ConversationEvent, ConversationHistory, DesktopHostApi,
-} from '../../../../host/src/contracts/desktop.ts'
+} from '../../../../shared/contracts/desktop.ts'
 
 interface WatchSink {
   history(history: ConversationHistory): void

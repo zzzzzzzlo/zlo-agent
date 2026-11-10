@@ -1,7 +1,7 @@
 import type {
   ArchiveConversationInput, ConversationAction, ConversationEvent, ConversationHistory, ConversationRef, ConversationSummary, ConversationTurn,
   CreateConversationInput, CursorInput, DesktopHostApi, HistoryInput, RenameConversationInput, SendMessageInput, SteerInput,
-} from '../../../../host/src/contracts/desktop.ts'
+} from '../../../../shared/contracts/desktop.ts'
 import { MockAgentAdapter } from './MockAgentAdapter'
 import { demoSessions, newTitle } from '../../features/sessions/model'
 
