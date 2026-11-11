@@ -156,9 +156,14 @@ test('Windows Electron uses the Pi Host for coding, model switch, steering, stop
       const { input, output, cacheRead, cacheWrite } = snapshot.turns[0].usage
       assert.ok(output > 0 && input + cacheRead + cacheWrite > 0)
       assert.match(await readFile(join(workspace, 'login.html'), 'utf8'), /name="username"/)
+      await page.setViewportSize({ width: 1000, height: 720 })
       await page.getByRole('button', { name: '展开活动面板' }).click()
-      await page.getByRole('complementary', { name: '活动面板' }).getByText('create_text_file', { exact: false }).waitFor()
+      const activity = page.getByRole('complementary', { name: '活动面板' })
+      await activity.getByText('create_text_file', { exact: false }).waitFor()
+      assert.equal(await activity.evaluate(panel => getComputedStyle(panel).position), 'absolute')
       await page.getByLabel('Token 用量').waitFor()
+      await activity.getByRole('button', { name: '关闭活动面板' }).click()
+      await activity.waitFor({ state: 'hidden' })
 
       await send(page, '再给它添加一个验证码输入框')
       await page.getByText('已在登录页中添加验证码输入框', { exact: false }).waitFor()
@@ -314,6 +319,8 @@ test('Windows Electron authorizes a writable workspace without a file check and 
       await settings.getByText(/^Worker · /).first().waitFor()
       assert.equal(await settings.getByLabel('任务历史').inputValue(), teamTurn.taskId)
       await settings.getByRole('button', { name: '关闭弹窗' }).click()
+      await activity.getByRole('button', { name: '关闭活动面板' }).click()
+      await activity.waitFor({ state: 'hidden' })
 
       const exported = join(root, 'exported-login.html')
       await app.evaluate(({ dialog }, filePath) => {
