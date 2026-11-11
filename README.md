@@ -24,10 +24,15 @@ Zlo Agent 是基于 Pi 的本地优先通用 Agent，首个场景为 Windows Cod
 | `docs/16-observability-contract.md` | 中台事件与证据契约 |
 | `docs/17-core-verification.md` | 第三轮交付与验收 |
 | `docs/18-tool-system.md` | 工具清单、授权、回执与实际隔离边界 |
+| `docs/20-desktop-management-plan.md` | 0.5.0 桌面管理差距与里程碑 |
+| `docs/21-desktop-management.md` | 0.5.0 设置、协议、权限与核对说明 |
+| `docs/22-desktop-0.5.0-verification.md` | 0.5.0 验收结果与剩余限制 |
 | `diagrams/system.mmd` | 可渲染的 Mermaid 系统架构图 |
 | `diagrams/runtime-sequence.mmd` | 可渲染的运行与停止流程图 |
 
 ## 当前桌面版
+
+0.5.0 的设置中心提供模型与账号、权限与安全、Agent 与任务、工具与插件、记忆与上下文、用量与诊断。Provider 凭证通过系统安全存储保存。任务详情分别显示执行状态与验收结论，开发目标只有在确定性检查通过时才显示已验收。使用和接口见 [桌面管理](docs/21-desktop-management.md)。
 
 选定工作区后可授权文件写入，验收文件可选。用户明确选择信任项目后，Agent 可运行受控的 Node/npm 命令和本地 Git 检查，并以实际执行结果验收。Activity Panel 展示工具、模型用量和 Team/Worker 进度。
 

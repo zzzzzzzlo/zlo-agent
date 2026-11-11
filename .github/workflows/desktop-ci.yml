@@ -1,0 +1,51 @@
+name: Desktop CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: desktop-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop-windows:
+    runs-on: windows-2025
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: |
+            host/package-lock.json
+            ui/package-lock.json
+      - name: Install Host and UI dependencies
+        run: |
+          npm.cmd ci --prefix host
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          npm.cmd ci --prefix ui
+      - name: Check Host types
+        run: npm.cmd --prefix host run typecheck
+      - name: Run Host unit, integration and security tests
+        run: npm.cmd --prefix host test
+      - name: Check UI types
+        run: npm.cmd --prefix ui run typecheck
+      - name: Run UI tests and Shared Contracts boundary checks
+        run: npm.cmd --prefix ui test
+      - name: Run Electron E2E
+        run: npm.cmd --prefix ui run test:desktop
+      - name: Package Windows portable application
+        run: npm.cmd --prefix ui run pack:win
+      - uses: actions/upload-artifact@v6
+        with:
+          name: zlo-agent-windows-portable
+          path: ui/release/Zlo-Agent-*-win-x64-portable.exe
+          if-no-files-found: error
