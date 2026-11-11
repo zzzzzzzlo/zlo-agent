@@ -1,0 +1,11 @@
+{
+  "name": "zlo-agent-observatory",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node --disable-warning=ExperimentalWarning src/cli.ts",
+    "typecheck": "node ../host/node_modules/typescript/bin/tsc --noEmit",
+    "test": "node --disable-warning=ExperimentalWarning --test test/*.test.ts"
+  }
+}

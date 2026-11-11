@@ -3,3 +3,4 @@
 /host/.zlo-agent/
 /.zlo-agent/
 *.log
+observatory.sqlite*
