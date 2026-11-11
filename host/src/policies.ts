@@ -89,6 +89,8 @@ export class ExtensionRegistry {
     return {
       profile: { ...profile },
       workflow: this.#workflows.get(profile.workflow)!,
+      catalog: (workspace: CodingWorkspace, role: AgentRole, access: WorkspaceAccess) =>
+        profile.plugins.flatMap(plugin => this.#plugins.get(plugin)!.tools(workspace, role, access).map(tool => ({ plugin, tool }))),
       tools: (workspace: CodingWorkspace, role: AgentRole, access: WorkspaceAccess) => {
         const tools = profile.plugins.flatMap(id => this.#plugins.get(id)!.tools(workspace, role, access))
         if (new Set(tools.map(tool => tool.name)).size !== tools.length) throw new Error('Duplicate capability name')
@@ -104,13 +106,15 @@ export interface CapabilityScope {
   role: AgentRole
 }
 
-const accessRank: Record<WorkspaceAccess, number> = { read: 0, write: 1, trusted: 2 }
+export const accessRank: Record<WorkspaceAccess, number> = { read: 0, write: 1, trusted: 2 }
 
 export class CodingCapabilities {
   readonly #profile: Readonly<CodingProfile>
+  readonly #toolEnabled: (name: string) => boolean
 
-  constructor(profile: Readonly<CodingProfile> = defaultCodingProfile) {
+  constructor(profile: Readonly<CodingProfile> = defaultCodingProfile, toolEnabled: (name: string) => boolean = () => true) {
     this.#profile = profile
+    this.#toolEnabled = toolEnabled
   }
 
   root(access: WorkspaceAccess | undefined, legacyCheck: boolean): CapabilityScope {
@@ -125,10 +129,13 @@ export class CodingCapabilities {
   }
 
   describe(scope: CapabilityScope, tool: WorkspaceTool): boolean {
+    if (!this.enabled(tool.name)) return false
     if (tool.policy?.rootOnly && scope.role !== 'root') return false
     const minimum = tool.policy?.minimumAccess ?? (tool.effect === 'write' ? 'write' : 'read')
     return accessRank[scope.access] >= accessRank[minimum] && (tool.effect === 'read' || scope.access !== 'read')
   }
+
+  enabled(name: string): boolean { return this.#toolEnabled(name) }
 
   authorize(scope: CapabilityScope, tool: WorkspaceTool, input: unknown): boolean {
     if (!this.describe(scope, tool)) return false

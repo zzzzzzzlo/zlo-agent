@@ -63,6 +63,7 @@ export interface TaskSnapshot {
   attemptId?: string
   attemptCount: number
   reason?: EndReason
+  reconciliationBlock?: 'checkpoint_error' | 'stop_timeout'
   stopIntent?: { requestId: string; source: 'user' | 'shutdown' }
   instructions: { id: string; text: string; delivered: boolean }[]
   route?: ModelRoute
@@ -83,6 +84,19 @@ export interface Attempt {
   status: 'running' | 'succeeded' | 'failed' | 'interrupted' | 'unknown_effect'
   reason?: EndReason
 }
+export interface FilePostcondition {
+  kind: 'created_text'
+  workspaceIdentity: string
+  digest: string
+}
+
+interface OperationReconciliation {
+  status: 'verified' | 'unresolved'
+  evidence: string
+  changedEntries?: number
+  truncated?: boolean
+}
+
 export interface Operation {
   schemaVersion: 1
   id: string
@@ -98,7 +112,10 @@ export interface Operation {
   effect: 'read' | 'write'
   target?: string
   managed?: boolean
+  processId?: number
   worktreeId?: string
+  filePostcondition?: FilePostcondition
+  reconciliation?: OperationReconciliation
   status: 'started' | 'succeeded' | 'failed' | 'interrupted' | 'unknown_effect'
 }
 export interface CreateTask {
@@ -127,7 +144,7 @@ const edges: Record<TaskStatus, TaskStatus[]> = {
   stop_requested: ['stopping', 'needs_reconciliation'],
   stopping: ['stopped', 'needs_reconciliation'],
   stopped: ['ready', 'needs_reconciliation'],
-  needs_reconciliation: [],
+  needs_reconciliation: ['stopped'],
 }
 export function canTransition(from: TaskStatus, to: TaskStatus): boolean {
   return edges[from].includes(to)
@@ -300,7 +317,7 @@ export class TaskEngine {
 
   operations(taskId: string): Operation[] {
     this.get(taskId)
-    return this.#db.list<Operation>('operations').filter((operation) => operation.taskId === taskId)
+    return this.#db.matchingRecords<Operation>('operations', '$.taskId', taskId)
   }
 
   recorded<T>(requestId: string, signature: unknown): T | undefined {
@@ -730,8 +747,49 @@ export class TaskEngine {
     })
   }
 
+  setWorkspaceAccess(taskId: string, access: WorkspaceAccess, requestStop: string | undefined, onChanged: () => void): void {
+    this.#db.transaction(() => {
+      const task = this.get(taskId)
+      if (task.workspaceAccess === access) { onChanged(); return }
+      let next: TaskSnapshot = { ...task, workspaceAccess: access }
+      if (access === 'read') {
+        for (const node of allNodes(task)) {
+          if ((node.status === 'ready' || node.status === 'running') && node.access === 'write') {
+            next = changeNode(next, { ...node, access: 'read' })
+          }
+        }
+      }
+      this.#save(next)
+      onChanged()
+      this.#event(next, 'task.permissions_changed', { access })
+      if (requestStop && canTransition(next.status, 'stop_requested')) {
+        this.#transition({ ...next, stopIntent: { requestId: requestStop, source: 'user' } },
+          'stop_requested', 'task.stop_requested', requestStop)
+      }
+    })
+  }
+
+  recordReconciliation(taskId: string, id: string, observation: NonNullable<Operation['reconciliation']>): Operation {
+    return this.#db.transaction(() => {
+      const task = this.get(taskId)
+      const operation = this.#db.get<Operation>('operations', id)
+      if (!operation || operation.taskId !== taskId) throw new Error('Operation does not belong to this task')
+      if (operation.reconciliation?.status === 'verified') return operation
+      if (task.status !== 'needs_reconciliation' || operation.status !== 'unknown_effect') throw new Error('Operation is not awaiting reconciliation')
+      const next: Operation = { ...operation, reconciliation: observation,
+        status: observation.status === 'verified' ? 'interrupted' : 'unknown_effect' }
+      this.#db.put('operations', id, next)
+      this.#event(task, 'operation.reconciliation_checked', { operationId: id, ...observation })
+      if (observation.status === 'verified' && task.reason === 'unknown_effect' && !task.reconciliationBlock &&
+        !this.operations(taskId).some(item => item.status === 'unknown_effect' || item.status === 'started')) {
+        this.#transition({ ...task, reason: undefined }, 'stopped', 'task.stopped')
+      }
+      return next
+    })
+  }
+
   beginTool(taskId: string, event: EventDraft, id: string, tool: string, effect: Operation['effect'], target?: string,
-    phase?: 'verification', policy?: { deferred?: boolean; whileActive?: boolean }): void {
+    phase?: 'verification', policy?: { deferred?: boolean; whileActive?: boolean }, filePostcondition?: FilePostcondition): void {
     this.#db.transaction(() => {
       const task = this.get(taskId)
       const expected = phase === 'verification' ? 'verifying' : 'running'
@@ -763,6 +821,7 @@ export class TaskEngine {
         agentRunId: event.agentRunId, agentId: event.agentId, sessionId: event.sessionId,
         taskNodeId: nodeId, parentAgentRunId: event.parentAgentRunId,
         tool, effect, target, status: 'started', ...(policy?.deferred ? { managed: true } : {}),
+        ...(filePostcondition ? { filePostcondition } : {}),
         ...(node?.worktreeId ? { worktreeId: node.worktreeId } : {}),
       }
       this.#db.put('operations', id, operation)
@@ -780,6 +839,18 @@ export class TaskEngine {
       this.#db.put('operations', id, { ...operation, status })
       this.#db.append({ ...event, taskRunId: operation.taskRunId, taskAttemptId: operation.attemptId, taskNodeId: operation.taskNodeId,
         type: 'tool.finished', payload: { id, tool: operation.tool, status } })
+    })
+  }
+
+  attachProcess(taskId: string, id: string, pid: number): void {
+    if (!Number.isSafeInteger(pid) || pid < 1 || pid > 0x7fff_ffff) throw new Error('Invalid managed process identity')
+    this.#db.transaction(() => {
+      const operation = this.#db.get<Operation>('operations', id)
+      if (!operation || operation.taskId !== taskId || operation.tool !== 'shell_exec' ||
+        operation.status !== 'started' || !operation.managed || operation.processId !== undefined) {
+        throw new Error('Managed shell receipt is not open')
+      }
+      this.#db.put('operations', id, { ...operation, processId: pid })
     })
   }
 
@@ -864,7 +935,8 @@ export class TaskEngine {
       }
       if (unknown.length || reason === 'checkpoint_error' || reason === 'stop_timeout') {
         this.#event(task, 'operation.reconciliation_required', { operationIds: unknown.map((operation) => operation.id), reason })
-        return this.#finish(task, 'needs_reconciliation', unknown.length ? 'unknown_effect' : reason)
+        const reconciliationBlock = reason === 'checkpoint_error' || reason === 'stop_timeout' ? reason : undefined
+        return this.#finish({ ...task, reconciliationBlock }, 'needs_reconciliation', unknown.length ? 'unknown_effect' : reason)
       }
       if (task.status === 'stop_requested') task = this.#transition(task, 'stopping')
       if (task.status === 'stopping') {

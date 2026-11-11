@@ -121,6 +121,21 @@ export class LocalMemory {
     })
   }
 
+  list(scope: string): MemoryEntry[] {
+    return (this.#store.get<StoredMemoryEntry[]>(memoryNamespace, scopeId(scope)) ?? [])
+      .map(({ seenSources: _seenSources, ...entry }) => entry)
+  }
+
+  remove(scope: string, ids: ReadonlySet<string>): number {
+    const key = scopeId(scope)
+    return this.#store.transaction(() => {
+      const entries = this.#store.get<StoredMemoryEntry[]>(memoryNamespace, key) ?? []
+      const remaining = entries.filter(entry => !ids.has(entry.id))
+      if (remaining.length !== entries.length) this.#store.put(memoryNamespace, key, remaining)
+      return entries.length - remaining.length
+    })
+  }
+
   recall(scope: string, query: string, limit = maxRecallEntries): MemoryEntry[] {
     if (!Number.isSafeInteger(limit) || limit < 0 || limit > maxRecallEntries) throw new RangeError('Invalid memory recall limit')
     const key = scopeId(scope)

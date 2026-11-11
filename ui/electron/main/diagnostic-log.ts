@@ -71,6 +71,29 @@ export function createDiagnosticLog(directory: string, maxFileBytes = defaultMax
         clearTimeout(timer)
       }
     },
+    async recent(): Promise<DiagnosticEntry[]> {
+      const entries: DiagnosticEntry[] = []
+      for (const path of [current, current + '.1', current + '.2']) {
+        try {
+          const stat = await regularFile(path)
+          if (!stat || stat.size > maxFileBytes) continue
+          const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0))
+          try {
+            const opened = await file.stat()
+            if (!opened.isFile() || opened.nlink !== 1 || opened.ino !== stat.ino || opened.dev !== stat.dev) continue
+            const bytes = Buffer.alloc(maxFileBytes)
+            const { bytesRead } = await file.read(bytes)
+            for (const line of bytes.subarray(0, bytesRead).toString('utf8').split('\n').reverse()) {
+              if (line.length > maxDiagnosticLineBytes) continue
+              const entry = validateDiagnostic(JSON.parse(line || 'null'))
+              if (entry) entries.push(entry)
+              if (entries.length >= 100) return entries
+            }
+          } finally { await file.close() }
+        } catch { /* Log rotation or a malformed segment can be ignored. */ }
+      }
+      return entries
+    },
   }
 }
 

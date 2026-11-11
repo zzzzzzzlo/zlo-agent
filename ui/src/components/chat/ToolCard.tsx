@@ -14,9 +14,9 @@ const statuses = {
   reconciliation: { icon: CircleAlert, label: '待人工核对' },
 }
 
-export function RunBadge({ status }: { status: RunStatus }) {
-  const { icon: Icon, label } = statuses[status]
-  return <span className={`run-badge status-${status}`}><Icon size={13} />{label}</span>
+export function RunBadge({ status, label }: { status: RunStatus; label?: string }) {
+  const { icon: Icon, label: defaultLabel } = statuses[status]
+  return <span className={`run-badge status-${status}`}><Icon size={13} />{label ?? defaultLabel}</span>
 }
 
 export function ToolCard({ tool }: { tool: ToolUpdate }) {

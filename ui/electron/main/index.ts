@@ -8,6 +8,11 @@ import { localDirectory } from './agent-input.ts'
 import { registerAgentIpc } from './agent-ipc.ts'
 import { createDiagnosticLog } from './diagnostic-log.ts'
 import { HostProcessManager, spawnAgentHost } from './host-process.ts'
+import { registerManagementIpc } from './management-ipc.ts'
+import { SecureProviderCredentials } from './provider-credentials.ts'
+import { ChatGptAccount } from './chatgpt-account.ts'
+import { registerChatGptIpc } from './chatgpt-ipc.ts'
+import type { ManagedModel } from '../../../shared/contracts/management.ts'
 
 const developmentData = app.isPackaged ? undefined : process.env.ZLO_AGENT_DESKTOP_DATA
 if (developmentData && localDirectory(developmentData)) {
@@ -20,9 +25,23 @@ const hostRoot = app.isPackaged ? join(process.resourcesPath, 'agent-host') : re
 const userData = app.getPath('userData')
 const defaultWorkspace = join(userData, 'workspace')
 const diagnostics = createDiagnosticLog(join(userData, 'logs'))
+const credentials = new SecureProviderCredentials(userData)
+const chatGpt = hostMode === 'pi' ? new ChatGptAccount(userData, {
+  async applySession(session, quiesce): Promise<ManagedModel[]> {
+    try { return await host.request({ schemaVersion: 1, type: 'applyChatGptSession', session, quiesce }) }
+    catch (error) {
+      if (session !== null || (await host.restart()).state !== 'ready') throw error
+      return []
+    }
+  },
+}) : undefined
 const host = new HostProcessManager({
   mode: hostMode,
   diagnostic: diagnostics.write,
+  async initialize() {
+    return { schemaVersion: 1, type: 'initializeProviderKeys',
+      credentials: hostMode === 'pi' ? await credentials.load() : {}, chatGpt: await chatGpt?.loadSession() }
+  },
   spawnChild() {
     mkdirSync(defaultWorkspace, { recursive: true })
     return spawnAgentHost({
@@ -82,6 +101,9 @@ function createWindow() {
   void (devUrl ? window.loadURL(rendererUrl.href) : window.loadFile(rendererFile))
 }
 
+const ownsProfile = app.requestSingleInstanceLock()
+if (!ownsProfile) app.exit(0)
+
 app.whenReady().then(() => {
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))
   session.defaultSession.setPermissionCheckHandler(() => false)
@@ -93,13 +115,23 @@ app.whenReady().then(() => {
     if (window.isMaximized()) window.unmaximize()
     else window.maximize()
   })
+  const protectedPaths = app.isPackaged ? [userData, process.resourcesPath] : [userData]
   registerAgentIpc({
     host, windowFor, rendererUrl: rendererUrl.href,
-    protectedPaths: app.isPackaged ? [userData, process.resourcesPath] : [userData],
+    protectedPaths,
   })
+  registerManagementIpc({ host, windowFor, credentials, protectedPaths, defaultWorkspace,
+    version: app.getVersion(), recentDiagnostics: diagnostics.recent })
+  registerChatGptIpc(chatGpt, windowFor)
 
   void host.start()
   createWindow()
+  app.on('second-instance', () => {
+    const window = BrowserWindow.getAllWindows()[0]
+    if (!window) return
+    if (window.isMinimized()) window.restore()
+    window.focus()
+  })
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
@@ -114,6 +146,7 @@ app.on('before-quit', (event) => {
   event.preventDefault()
   if (quitting) return
   quitting = true
+  chatGpt?.close()
   void host.shutdown().catch(() => {
     console.error('Agent Host did not exit within the shutdown deadline.')
   }).finally(async () => {

@@ -8,8 +8,10 @@ import { createBrowserTools } from './browser-tools.ts'
 import { createFileTools } from './file-tools.ts'
 import { createGitTools, ManagedGitWorktrees } from './git-tools.ts'
 import { createProcessTools } from './process-tools.ts'
-import { createWebTools } from './web-tools.ts'
+import { BraveSearch, createWebTools, HackerNewsSearch, publicWeb } from './web-tools.ts'
 import type { ToolApprovalCommand } from '../../shared/contracts/tool-approval.ts'
+import type { ChatGptSession } from '../../shared/contracts/chatgpt.ts'
+import type { AgentPreferences, ManagedMemory, ManagedModel, ManagedOperation, ManagedProvider, ManagementCommand, ManagementSnapshot, PrivateCredentialCommand, ProviderId } from '../../shared/contracts/management.ts'
 import type { AgentEvent, EventDraft, ModelRoute, TaskStatus, VerificationCheck, WorkspaceAccess } from './contracts/domain.ts'
 import type {
   ActionResult, ArchiveConversationInput, ConversationAction, ConversationEvent, ConversationHistory,
@@ -17,16 +19,18 @@ import type {
   RenameConversationInput, SendMessageInput, SendMessageResult, SetConversationModelInput, SteerInput,
 } from '../../shared/contracts/desktop.ts'
 import {
-  ConversationError, ConversationService, parseConversationAction, parseCreateConversation, parseSendMessage, parseSetConversationModel, parseSteer,
+  ConversationError, ConversationService, parseConversationAction, parseCreateConversation, parseRoute, parseSendMessage, parseSetConversationModel, parseSteer,
 } from './conversation.ts'
 import { installTaskDiagnostics } from './diagnostics.ts'
 import { LocalJudgment } from './judgment.ts'
 import type { JudgmentOptions } from './judgment.ts'
 import { LocalMemory, ScopedContext } from './memory.ts'
+import * as management from './management.ts'
 import { LocalModelScheduler } from './model-scheduler.ts'
 import type { ModelLimits } from './model-scheduler.ts'
 import { MultiAgentOrchestrator, executionFailure, memoryScope, sameRoute } from './orchestrator.ts'
-import { CodingCapabilities, ExtensionRegistry } from './policies.ts'
+import { accessRank, CodingCapabilities, ExtensionRegistry } from './policies.ts'
+import { probeOperation } from './reconciliation.ts'
 import type { CodingProfile } from './policies.ts'
 import { LocalStore } from './store.ts'
 import { isStopping, TaskEngine } from './task-engine.ts'
@@ -35,6 +39,14 @@ import { ToolApprovalBroker } from './tool-approval.ts'
 import type { ToolApprover } from './tool-approval.ts'
 import { verifyWorkspace } from './verification.ts'
 import { CodingWorkspace } from './workspace.ts'
+
+interface ProviderRuntime {
+  listProviderAccounts(): Promise<ManagedProvider[]>
+  testProviderAccount(provider: ProviderId, model?: string): Promise<ManagedProvider>
+  validateProviderKey(provider: ProviderId, key: string): Promise<ManagedProvider>
+  setProviderKey(provider: ProviderId, key: string | null | undefined): Promise<void>
+  setChatGptSession(session: ChatGptSession | null): Promise<ManagedModel[]>
+}
 
 export type HostCommand =
   | ToolApprovalCommand
@@ -70,6 +82,7 @@ interface HostOptions {
   defaultWorkspace?: string
   defaultRoute?: ModelRoute
   approveTool?: ToolApprover
+  providerRuntime?: ProviderRuntime
 }
 
 const recoverableAfterCrash = new Set<TaskStatus>(['running', 'verifying', 'stop_requested', 'stopping'])
@@ -97,8 +110,10 @@ export class LocalAgentHost {
   readonly #capabilities: CodingCapabilities
   readonly #memory: LocalMemory
   readonly #defaultWorkspace: string
-  readonly #defaultRoute?: ModelRoute
   readonly #approval: ToolApprovalBroker
+  readonly #providerRuntime?: ProviderRuntime
+  #agentPreferences: AgentPreferences
+  #credentialMutation = false
   #active?: ActiveTask
   #closing = false
   #closed = false
@@ -108,22 +123,32 @@ export class LocalAgentHost {
     mkdirSync(options.directory, { recursive: true, mode: 0o700 })
     this.#directory = realpathSync(options.directory)
     this.#stopTimeoutMs = options.stopTimeoutMs ?? defaultStopTimeoutMs
+    this.#providerRuntime = options.providerRuntime
+    this.#agentPreferences = {
+      workspaceAccess: 'write', defaultRoute: options.defaultRoute ?? null, modelSelection: 'automatic',
+      disabledTools: [], searchProvider: process.env.ZLO_AGENT_BRAVE_SEARCH_API_KEY ? 'brave' : 'hacker_news',
+    }
     const worktrees = new ManagedGitWorktrees(join(this.#directory, 'worktrees'))
     this.#extensions = (options.extensions ?? new ExtensionRegistry([
       { id: 'artifact', tools: workspace => createArtifactTools(workspace, this.#directory) },
       { id: 'files', tools: createFileTools },
       { id: 'git', tools: workspace => createGitTools(workspace, worktrees) },
       { id: 'shell', tools: createProcessTools },
-      { id: 'web', tools: workspace => createWebTools(workspace) },
+      { id: 'web', tools: workspace => {
+        const key = process.env.ZLO_AGENT_BRAVE_SEARCH_API_KEY
+        return createWebTools(workspace, { provider: this.#agentPreferences.searchProvider === 'brave' && key
+          ? new BraveSearch(key) : new HackerNewsSearch(publicWeb) })
+      } },
       { id: 'browser', tools: workspace => createBrowserTools(workspace) },
     ])).resolve(options.profileId ?? 'coding')
     this.#profile = { ...(options.profile ?? this.#extensions.profile) }
-    this.#capabilities = new CodingCapabilities(this.#profile)
+    this.#capabilities = new CodingCapabilities(this.#profile, name => this.#toolEnabled(name))
     this.#defaultWorkspace = options.defaultWorkspace ?? this.#directory + '-workspace'
-    this.#defaultRoute = options.defaultRoute
     this.#approval = new ToolApprovalBroker(options.approveTool)
     this.#store = new LocalStore(join(this.#directory, 'tasks.sqlite'))
     try {
+      const saved = this.#store.get<AgentPreferences>('desktop-preferences', 'v1')
+      if (saved) this.#agentPreferences = management.preferences(saved)
       if (options.runtimeId) {
         this.#store.transaction(() => {
           const bound = this.#store.get<{ runtimeId: string }>('host', 'runtime')
@@ -136,7 +161,8 @@ export class LocalAgentHost {
       installTaskDiagnostics(this.#store)
       const judgment = new LocalJudgment(this.#store, options.judgment)
       this.#memory = new LocalMemory(this.#store)
-      this.#scheduler = new LocalModelScheduler(options.execution, this.#store, judgment, options.modelLimits)
+      this.#scheduler = new LocalModelScheduler(options.execution, this.#store, judgment, options.modelLimits,
+        () => this.#agentPreferences.modelSelection === 'automatic')
       this.#orchestrator = new MultiAgentOrchestrator({
         store: this.#store, tasks: this.#engine, execution: options.execution, scheduler: this.#scheduler,
         capabilities: this.#capabilities, profile: this.#profile, extensions: this.#extensions, approval: this.#approval,
@@ -180,6 +206,14 @@ export class LocalAgentHost {
   #assertOpen(): void {
     if (this.#closed || this.#closing) throw new ConversationError('HOST_UNAVAILABLE', 'Host is closing')
     if (this.#storageFailure) throw this.#storageFailure
+  }
+
+  get #defaultRoute(): ModelRoute | undefined { return this.#agentPreferences.defaultRoute ?? undefined }
+
+  #toolEnabled(name: string): boolean {
+    const search = this.#agentPreferences.searchProvider
+    return !this.#agentPreferences.disabledTools.includes(name) &&
+      (name !== 'web_search' || (search !== 'disabled' && (search !== 'brave' || Boolean(process.env.ZLO_AGENT_BRAVE_SEARCH_API_KEY))))
   }
 
   getTask(taskId: string): TaskSnapshot {
@@ -227,7 +261,8 @@ export class LocalAgentHost {
     } catch {
       throw new ConversationError('INVALID_INPUT', 'Select an available local workspace separate from Host data')
     }
-    return this.#conversations.create(command, workspace.root, this.#defaultRoute)
+    return this.#conversations.create(command, workspace.root, this.#defaultRoute,
+      this.#agentPreferences.workspaceAccess === 'trusted' ? 'read' : this.#agentPreferences.workspaceAccess)
   }
 
   listConversations(): ConversationSummary[] {
@@ -322,7 +357,14 @@ export class LocalAgentHost {
     } catch {
       throw new ConversationError('INVALID_INPUT', 'The conversation workspace is unavailable')
     }
-    const route = conversation.pendingRoute ?? conversation.route ?? this.#defaultRoute
+    const requestedRoute = conversation.pendingRoute ?? conversation.route ?? this.#defaultRoute
+    let route = requestedRoute
+    if (!route && this.#providerRuntime) {
+      const available = await this.#scheduler.discoverModels()
+      // Keep ambient and stored API models eligible. ChatGPT account routes must be selected explicitly.
+      route = available.find(model => management.providers.some(provider => provider === model.route.provider))?.route
+      if (!route) throw new ConversationError('MODEL_UNAVAILABLE', 'Configure a model provider or select an authorized model')
+    }
     if (route) {
       try {
         await this.#scheduler.validateRoute(route)
@@ -334,10 +376,15 @@ export class LocalAgentHost {
     const alreadySent = this.#conversations.sent(command)
     if (alreadySent) return alreadySent
     const current = this.#conversations.canSend(command.conversationId)
+    const currentRoute = current.pendingRoute ?? current.route ?? this.#defaultRoute
+    if ((requestedRoute === undefined) !== (currentRoute === undefined) ||
+      (requestedRoute && currentRoute && !sameRoute(requestedRoute, currentRoute))) {
+      throw new ConversationError('CONFLICT', 'The model route changed while the message was prepared; retry the request')
+    }
     this.#engine.create({
       requestId: desktopRequestId(command.requestId), conversationId: current.id, goal: command.text,
       cwd: current.workspace, check: current.check, workspaceAccess: current.workspaceAccess,
-      route: current.pendingRoute ?? current.route ?? this.#defaultRoute,
+      route,
     }, (task) => this.#conversations.attachTask(command, task))
     const sent = this.#conversations.sent(command)
     if (!sent) throw new Error('Conversation task receipt is missing')
@@ -479,6 +526,192 @@ export class LocalAgentHost {
     }
   }
 
+  async managementSnapshot(conversationId?: string): Promise<Omit<ManagementSnapshot, 'version' | 'diagnostics'>> {
+    this.#assertOpen()
+    const conversation = conversationId === undefined ? undefined : this.#conversations.get(management.id(conversationId))
+    const rootAccess = conversation ? this.#conversationAccess(conversation) : this.#agentPreferences.workspaceAccess
+    const tasks = conversation ? this.#conversations.recentTaskIds(conversation.id, 20).map(id => this.#engine.get(id)) : []
+    const memory: ManagedMemory | undefined = conversation ? { entries: [], recalls: [] } : undefined
+    if (conversation && memory) {
+      const providers = new Set<string>([...management.providers, 'chatgpt'])
+      if (conversation.route) providers.add(conversation.route.provider)
+      for (const provider of providers) {
+        for (const { id, kind, text, version, updatedAt } of this.#memory.list(management.conversationScope(conversation, provider))) {
+          memory.entries.push({ id, kind, text, version, updatedAt })
+        }
+      }
+      memory.entries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
+    }
+    const views = tasks.map(task => {
+      const events = this.#store.eventsOfTypes(task.id, management.managementEventTypes)
+      for (const event of events) {
+        if (memory && event.type === 'memory.recalled' && typeof event.payload.count === 'number') {
+          memory.recalls.push({ taskId: task.id, timestamp: Date.parse(event.occurredAt), count: event.payload.count })
+        }
+      }
+      return management.taskView(task, events, this.#engine.operations(task.id),
+        this.#capabilities.root(task.workspaceAccess, Boolean(task.check)).access,
+        { tokenLimit: this.#scheduler.tokenLimit, ...this.#scheduler.budget(task.id) })
+    })
+    if (memory) memory.recalls = memory.recalls.sort((a, b) => b.timestamp - a.timestamp).slice(0, 100)
+    // Catalog generation is static. Use the private workspace only as a descriptor if a project was removed.
+    mkdirSync(this.#defaultWorkspace, { recursive: true, mode: 0o700 })
+    let workspace: CodingWorkspace
+    try { workspace = this.#workspace(conversation?.workspace ?? this.#defaultWorkspace) }
+    catch { workspace = this.#workspace(this.#defaultWorkspace) }
+    const tools = management.toolCatalog(this.#extensions, this.#capabilities, workspace, rootAccess, name => this.#toolEnabled(name))
+    return {
+      conversation, tools, tasks: views, memory, preferences: this.#agentPreferences,
+      braveConfigured: Boolean(process.env.ZLO_AGENT_BRAVE_SEARCH_API_KEY),
+      providers: await this.#providerRuntime?.listProviderAccounts() ?? [],
+      account: { available: false, reason: '此构建未配置独立的 ChatGPT 账号授权。OpenAI API Key 使用 API 额度。' },
+    }
+  }
+
+  async saveAgentPreferences(value: unknown): Promise<AgentPreferences> {
+    const next = management.preferences(value)
+    if (next.searchProvider === 'brave' && !process.env.ZLO_AGENT_BRAVE_SEARCH_API_KEY) {
+      throw new ConversationError('INVALID_INPUT', 'Brave Search requires a local configuration key')
+    }
+    if (next.defaultRoute && (!this.#agentPreferences.defaultRoute || !sameRoute(next.defaultRoute, this.#agentPreferences.defaultRoute))) {
+      await this.#scheduler.validateRoute(next.defaultRoute).catch(() => {
+        throw new ConversationError('MODEL_UNAVAILABLE', 'The default model is unavailable')
+      })
+    }
+    if (next.searchProvider !== this.#agentPreferences.searchProvider && this.#active) {
+      throw new ConversationError('CONFLICT', 'Stop the current run before changing its search provider')
+    }
+    this.#assertOpen()
+    const newlyDisabled = next.disabledTools.some(name => !this.#agentPreferences.disabledTools.includes(name))
+    this.#store.transaction(() => this.#store.put('desktop-preferences', 'v1', next))
+    this.#agentPreferences = next
+    if (newlyDisabled && this.#active) this.#stop(this.#active.taskId, 'tool-policy:' + randomUUID())
+    return next
+  }
+
+  #conversationAccess(conversation: ConversationSummary): WorkspaceAccess {
+    return conversation.workspaceAccess ?? this.#capabilities.root(undefined, Boolean(conversation.check)).access
+  }
+
+  setConversationWorkspaceAccess(conversationId: string, requested: WorkspaceAccess, expected: WorkspaceAccess): ConversationSummary {
+    const conversation = this.#conversations.get(management.id(conversationId))
+    const access = management.access(requested)
+    const current = this.#conversationAccess(conversation)
+    if (conversation.archived || current !== management.access(expected)) throw new ConversationError('CONFLICT', 'Conversation permission changed')
+    if (current === access) return conversation
+    const task = conversation.latestTaskId ? this.#engine.get(conversation.latestTaskId) : undefined
+    const active = Boolean(task && ['ready', 'running', 'verifying', 'stop_requested', 'stopping'].includes(task.status))
+    if (accessRank[access] > accessRank[current] && active) {
+      throw new ConversationError('CONFLICT', 'Stop the current run before increasing workspace access')
+    }
+    if (accessRank[access] > accessRank[current]) {
+      try { this.#workspace(conversation.workspace) }
+      catch { throw new ConversationError('INVALID_INPUT', 'The workspace is unavailable') }
+    }
+    const update = () => this.#conversations.setWorkspaceAccess(conversation.id, access)
+    if (!task || task.status === 'succeeded' || task.status === 'failed') return this.#store.transaction(update)
+    this.#engine.setWorkspaceAccess(task.id, access, active ? 'permission:' + randomUUID() : undefined, update)
+    if (active) this.#settleStop(task.id)
+    return this.#conversations.get(conversation.id)
+  }
+
+  #removeMemory(conversationId: string, ids: unknown): number {
+    const conversation = this.#conversations.get(management.id(conversationId))
+    const selected = management.memoryIds(ids)
+    const providers = new Set<string>([...management.providers, 'chatgpt'])
+    if (conversation.route) providers.add(conversation.route.provider)
+    return [...providers].reduce((count, provider) => count +
+      this.#memory.remove(management.conversationScope(conversation, provider), selected), 0)
+  }
+
+  async #reconcile(command: Extract<ManagementCommand, { type: 'reconcileOperation' }>): Promise<ManagedOperation> {
+    const conversationId = management.id(command.conversationId)
+    const taskId = management.id(command.taskId)
+    const id = management.operationId(command.operationId)
+    this.#conversations.assertTaskOwner({ conversationId, taskId, requestId: 'reconciliation' })
+    const task = this.#engine.get(taskId)
+    const operation = this.#engine.operations(taskId).find(item => item.id === id)
+    if (!operation) throw new ConversationError('NOT_FOUND', 'Unknown operation')
+    if (operation.reconciliation?.status === 'verified') return management.managedOperation(operation)
+    if (this.#active || task.status !== 'needs_reconciliation' || operation.status !== 'unknown_effect') {
+      throw new ConversationError('CONFLICT', 'Operation is not ready to be checked')
+    }
+    let workspace: CodingWorkspace
+    try { workspace = this.#workspace(task.cwd) }
+    catch { throw new ConversationError('INVALID_INPUT', 'The workspace is unavailable') }
+    const observation = await probeOperation(workspace, operation)
+    this.#assertOpen()
+    if (this.#active) throw new ConversationError('CONFLICT', 'Retry after the active run has stopped')
+    return management.managedOperation(this.#engine.recordReconciliation(taskId, id, observation))
+  }
+
+  #requireProviderRuntime(): ProviderRuntime {
+    if (!this.#providerRuntime) throw new ConversationError('MODEL_UNAVAILABLE', 'Provider configuration requires the Pi runtime')
+    return this.#providerRuntime
+  }
+
+  async applyProviderChange<T>(matches: (provider: string) => boolean, change: () => Promise<T>): Promise<T> {
+    if (this.#credentialMutation) throw new ConversationError('CONFLICT', 'Another credential change is in progress')
+    this.#credentialMutation = true
+    try {
+      const active = this.#active
+      for (const task of this.#engine.list()) {
+        if (task.id !== active?.taskId && task.status !== 'ready') continue
+        const route = this.#orchestrator.rootRoute(task.id) ?? task.route
+        if (!route || matches(route.provider) || (task.route && matches(task.route.provider))) {
+          this.#stop(task.id, 'credential:' + randomUUID())
+        }
+      }
+      if (active?.abort.signal.aborted) {
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([active.done, new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new ConversationError('CONFLICT', 'The interrupted run is still stopping')), this.#stopTimeoutMs + 100)
+          })])
+        } finally { clearTimeout(timer) }
+      }
+      this.#assertOpen()
+      return await change()
+    } finally {
+      this.#credentialMutation = false
+      this.#dispatch()
+    }
+  }
+
+  async managementCommand(command: ManagementCommand | PrivateCredentialCommand): Promise<unknown> {
+    this.#assertOpen()
+    switch (command.type) {
+      case 'managementSnapshot': return this.managementSnapshot(command.conversationId)
+      case 'saveAgentPreferences': return this.saveAgentPreferences(command.preferences)
+      case 'setWorkspaceAccess': return this.setConversationWorkspaceAccess(command.conversationId, command.access, command.expected)
+      case 'deleteConversationMemory': return this.#removeMemory(command.conversationId, command.ids)
+      case 'reconcileOperation': return this.#reconcile(command)
+      case 'testProviderAccount': {
+        const provider = management.providerId(command.provider)
+        const model = command.model === undefined ? undefined : parseRoute({ provider, model: command.model }).model
+        const runtime = this.#requireProviderRuntime()
+        const result = await runtime.testProviderAccount(provider, model)
+        if (result.connection === 'unauthorized') await this.applyProviderChange(value => value === provider, async () => {})
+        return result
+      }
+      case 'validateProviderKey':
+        return this.#requireProviderRuntime().validateProviderKey(management.providerId(command.provider), command.key)
+      case 'applyProviderKey': {
+        const provider = management.providerId(command.provider)
+        const runtime = this.#requireProviderRuntime()
+        await this.applyProviderChange(value => value === provider, () => runtime.setProviderKey(provider, command.key))
+        return (await runtime.listProviderAccounts()).find(account => account.id === provider)
+      }
+      case 'applyChatGptSession': {
+        if (typeof command.quiesce !== 'boolean') throw new ConversationError('INVALID_INPUT', 'Invalid account update')
+        const change = () => this.#requireProviderRuntime().setChatGptSession(command.session)
+        return command.quiesce ? this.applyProviderChange(provider => provider.startsWith('chatgpt-'), change) : change()
+      }
+      case 'initializeProviderKeys':
+        throw new ConversationError('INVALID_INPUT', 'Credentials are initialized before the desktop Host starts')
+    }
+  }
+
   async command(command: HostCommand | DesktopCommand): Promise<unknown> {
     this.#assertOpen()
     if (command?.schemaVersion !== 1) throw new Error('Unsupported command version')
@@ -530,7 +763,7 @@ export class LocalAgentHost {
   }
 
   #dispatch(): void {
-    if (this.#closing || this.#active || this.#storageFailure) return
+    if (this.#closing || this.#active || this.#storageFailure || this.#credentialMutation) return
     try {
       const ready = this.#engine.list().find((task) => task.status === 'ready')
       if (!ready) return
@@ -575,6 +808,8 @@ export class LocalAgentHost {
         ? { passed: false, evidence: 'worker_verification_failed' }
         : snapshot.nodes?.some(node => node.status !== 'succeeded')
           ? { passed: false, evidence: 'dag_not_converged' }
+        : snapshot.check?.command && !this.#capabilities.enabled('run_project_command')
+          ? { passed: false, evidence: 'project_command_disabled' }
         : snapshot.check
           ? await verifyWorkspace(this.#engine, this.#extensions.workflow, workspace, result.event, snapshot.check, signal, access, 'verification')
           : {

@@ -22,8 +22,8 @@ async function eventually(predicate, label, timeout = 20000) {
   throw new Error('Timed out waiting for ' + label)
 }
 
-async function launch(data) {
-  const env = { ...process.env, ZLO_AGENT_DESKTOP_MODE: 'faux', ZLO_AGENT_DESKTOP_DATA: data }
+async function launch(data, mode = 'faux') {
+  const env = { ...process.env, ZLO_AGENT_DESKTOP_MODE: mode, ZLO_AGENT_DESKTOP_DATA: data }
   delete env.ELECTRON_RUN_AS_NODE
   delete env.ELECTRON_RENDERER_URL
   return electron.launch({
@@ -43,7 +43,9 @@ async function ready(app) {
     node: typeof process,
     require: typeof require,
     invoke: typeof window.agentHost.invoke,
-  })), { node: 'undefined', require: 'undefined', invoke: 'undefined' })
+    readKey: typeof window.agentManagement?.getProviderKey,
+    credentialInvoke: typeof window.agentManagement?.invoke,
+  })), { node: 'undefined', require: 'undefined', invoke: 'undefined', readKey: 'undefined', credentialInvoke: 'undefined' })
   return page
 }
 
@@ -204,6 +206,8 @@ test('Windows Electron uses the Pi Host for coding, model switch, steering, stop
       await waitForPartial(restored, id, '[slow]')
       const beforeCrash = (await history(restored, id)).turns[5]
       await crashTestHost(app, data)
+      await eventually(async () => (await restored.evaluate(() => window.agentManagement.recentDiagnostics()))
+        .some(entry => entry.code === 'desktop.host_crashed'), 'redacted diagnostic while Host is offline')
       await restored.getByRole('button', { name: '重启 Host' }).click()
       await eventually(async () => (await restored.evaluate(() => window.agentHost.getStatus())).state === 'ready', 'Host restart')
       await waitForRun(restored, id, 6, 'stopped')
@@ -267,14 +271,25 @@ test('Windows Electron authorizes a writable workspace without a file check and 
       await send(page, '帮我创建一个简单的登录页面')
       await waitForRun(page, writeConversation.id, 1, 'succeeded')
       assert.match(await readFile(join(writable, 'login.html'), 'utf8'), /name="username"/)
-      assert.ok((await history(page, writeConversation.id)).turns[0].tools
-        .some(({ name, status }) => name === 'create_text_file' && status === 'succeeded'))
+      const writeTurn = (await history(page, writeConversation.id)).turns[0]
+      assert.ok(writeTurn.tools.some(({ name, status }) => name === 'create_text_file' && status === 'succeeded'))
+      assert.equal(writeTurn.verification.verdict, 'unverified')
+      assert.equal(writeTurn.verification.passed, false)
+      await page.getByText('目标尚未验证', { exact: true }).first().waitFor()
       await send(page, '[team-check] 请用团队核对登录页')
       await waitForRun(page, writeConversation.id, 2, 'succeeded')
       const teamTurn = (await history(page, writeConversation.id)).turns[1]
       assert.deepEqual(teamTurn.nodes?.map(({ role, status }) => [role, status]), [['team', 'succeeded'], ['worker', 'succeeded']])
       await page.getByRole('button', { name: '展开活动面板' }).click()
-      await page.getByRole('complementary', { name: '活动面板' }).getByText('Team Agent', { exact: true }).waitFor()
+      const activity = page.getByRole('complementary', { name: '活动面板' })
+      await activity.getByText('Team Agent', { exact: true }).waitFor()
+      await activity.getByRole('button', { name: '查看任务详情' }).click()
+      const settings = page.getByRole('dialog', { name: '设置' })
+      await settings.getByRole('heading', { name: '任务 DAG' }).waitFor()
+      await settings.getByRole('heading', { name: 'Agent Tree' }).waitFor()
+      await settings.getByText(/^Worker · /).first().waitFor()
+      assert.equal(await settings.getByLabel('任务历史').inputValue(), teamTurn.taskId)
+      await settings.getByRole('button', { name: '关闭弹窗' }).click()
 
       const exported = join(root, 'exported-login.html')
       await app.evaluate(({ dialog }, filePath) => {
@@ -321,8 +336,50 @@ test('Windows Electron authorizes a writable workspace without a file check and 
       await send(page, '帮我创建一个简单的登录页面')
       await waitForRun(page, trustedConversation.id, 1, 'succeeded')
       const result = await history(page, trustedConversation.id)
-      assert.deepEqual(result.turns[0].verification, { passed: true, evidence: 'workspace_command_passed' })
+      assert.deepEqual(result.turns[0].verification, {
+        passed: true, evidence: 'workspace_command_passed', verdict: 'verified', basis: 'project_command',
+      })
       assert.equal(await readFile(join(trusted, 'tested.txt'), 'utf8'), 'verified')
+
+      await page.getByRole('button', { name: /^设置/ }).click()
+      await settings.getByRole('button', { name: '权限与安全' }).click()
+      const access = settings.getByLabel('当前会话权限')
+      await access.waitFor()
+      assert.equal(await access.inputValue(), 'trusted')
+      await access.selectOption('read')
+      await eventually(async () => await access.inputValue() === 'read', 'revoked workspace access')
+      const revised = (await page.evaluate(() => window.agentHost.listConversations()))
+        .find(({ id }) => id === trustedConversation.id)
+      assert.equal(revised.workspaceAccess, 'read')
+      await settings.getByRole('button', { name: '工具与插件' }).click()
+      await settings.getByRole('heading', { name: '已安装的工具' }).waitFor()
+      await settings.getByRole('checkbox', { name: 'create_text_file 已启用' }).waitFor()
+      await settings.getByLabel('筛选工具').fill('search_files')
+      const searchTool = settings.getByRole('checkbox', { name: 'search_files 已启用' })
+      await searchTool.waitFor()
+      assert.equal(await searchTool.isChecked(), true)
+      await searchTool.click()
+      await eventually(async () => !(await searchTool.isChecked()), 'disabled file search')
+      await settings.getByRole('button', { name: '记忆与上下文' }).click()
+      await settings.getByRole('heading', { name: '检索记录' }).waitFor()
+      const memory = settings.getByText('Project verification passed using npm_test', { exact: true })
+      await memory.waitFor()
+      await settings.getByRole('button', { name: '删除已列出的记忆' }).click()
+      await memory.waitFor({ state: 'hidden' })
+      assert.deepEqual((await page.evaluate(conversationId => window.agentManagement.snapshot({ conversationId }),
+        trustedConversation.id)).memory.entries, [])
+      await settings.getByRole('button', { name: '用量与诊断' }).click()
+      await settings.getByRole('heading', { name: '近期诊断' }).waitFor()
+      await settings.getByRole('heading', { name: '异常核对' }).waitFor()
+      const diagnostics = await page.evaluate(conversationId => window.agentManagement.snapshot({ conversationId }),
+        trustedConversation.id)
+      assert.ok(diagnostics.tasks[0].usage.output > 0)
+      assert.ok(diagnostics.tasks[0].budget.tokenLimit > diagnostics.tasks[0].budget.confirmed)
+      await settings.getByRole('button', { name: '模型与账号' }).click()
+      await settings.getByRole('heading', { name: 'ChatGPT / Codex 账号' }).waitFor()
+      await settings.getByRole('button', { name: '关于' }).click()
+      const version = await app.evaluate(({ app }) => app.getVersion())
+      await settings.getByText('v' + version, { exact: true }).waitFor()
     } catch (error) {
       const trace = await readFile(join(data, 'logs', 'diagnostics.jsonl'), 'utf8').catch(() => '')
       const codes = trace.match(/"code":"(?:desktop|host)\.[a-z_]+"/g)
@@ -331,5 +388,53 @@ test('Windows Electron authorizes a writable workspace without a file check and 
     } finally {
       await app?.close()
       await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+    }
+  })
+
+test('Windows Electron sends credential capture through Main and omits invalid clipboard contents from Renderer',
+  { skip: process.platform !== 'win32', timeout: 60000 }, async () => {
+    const data = await mkdtemp(join(tmpdir(), 'zlo-electron-credentials-'))
+    const canary = 'ZLO canary invalid provider key from Main'
+    let app
+    try {
+      app = await launch(data, 'pi')
+      const page = await ready(app)
+      const consoleOutput = []
+      page.on('console', (message) => consoleOutput.push(message.text()))
+      page.on('pageerror', (error) => consoleOutput.push(error.message))
+      // Stub native input in Main only. The Renderer, Preload, real credential
+      // handler and local credential validation are exercised as shipped.
+      await app.evaluate(({ clipboard, dialog }, text) => {
+        clipboard.readText = () => text
+        dialog.showMessageBox = async (_window, options) => {
+          if (options.defaultId !== 0 || options.cancelId !== 0 || options.detail.includes(text)) {
+            throw new Error('Unsafe credential consent prompt')
+          }
+          return { response: 1 }
+        }
+      }, canary)
+
+      await page.getByRole('button', { name: /^设置/ }).click()
+      const settings = page.getByRole('dialog', { name: '设置' })
+      await settings.getByRole('button', { name: '模型与账号' }).click()
+      const provider = settings.locator('details').filter({ hasText: 'DeepSeek' })
+      await provider.locator('summary').click()
+      await provider.getByRole('button', { name: /API Key/ }).filter({ hasText: /添加|更新/ }).click()
+      await settings.getByText(/剪贴板中没有有效格式的 API Key/).waitFor()
+
+      const exposed = await page.evaluate(async () => ({
+        dom: document.documentElement.outerHTML,
+        local: { ...localStorage },
+        session: { ...sessionStorage },
+        snapshot: await window.agentManagement.snapshot({}),
+      }))
+      assert.ok(!JSON.stringify(exposed).includes(canary))
+      assert.ok(!consoleOutput.join('\n').includes(canary))
+      const log = await readFile(join(data, 'logs', 'diagnostics.jsonl'), 'utf8').catch(() => '')
+      assert.ok(!log.includes(canary))
+      await assert.rejects(readFile(join(data, 'provider-credentials.bin')), { code: 'ENOENT' })
+    } finally {
+      await app?.close()
+      await rm(data, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
     }
   })

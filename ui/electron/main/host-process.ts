@@ -6,6 +6,7 @@ import { diagnostic } from '../../../shared/diagnostics.ts'
 import type { DiagnosticCode, DiagnosticEntry } from '../../../shared/diagnostics.ts'
 import { collectHostDiagnostics } from './diagnostic-log.ts'
 import type { ConversationEvent, DesktopCommand, DesktopErrorCode, DesktopHostStatus, HostMode } from '../../../shared/contracts/desktop.ts'
+import type { ManagementCommand, PrivateCredentialCommand } from '../../../shared/contracts/management.ts'
 import { approvalKinds } from '../../../shared/contracts/tool-approval.ts'
 import type { ApprovalKind, ToolApprovalDecision, ToolApprovalRequest } from '../../../shared/contracts/tool-approval.ts'
 
@@ -32,8 +33,10 @@ function unavailable(message = 'Agent Host 尚未就绪。') {
   return new HostTransportError('HOST_UNAVAILABLE', message)
 }
 
+type TransportCommand = DesktopCommand | ManagementCommand | PrivateCredentialCommand
+
 interface PendingRequest {
-  type: DesktopCommand['type']
+  type: TransportCommand['type']
   resolve(value: unknown): void
   reject(error: HostTransportError): void
   timer: NodeJS.Timeout
@@ -57,6 +60,7 @@ interface Connection {
 interface ManagerOptions {
   mode: HostMode
   spawnChild: () => ChildProcessWithoutNullStreams
+  initialize?: () => Promise<Extract<PrivateCredentialCommand, { type: 'initializeProviderKeys' }>>
   diagnostic?: (entry: DiagnosticEntry) => void
   startupTimeoutMs?: number
   requestTimeoutMs?: number
@@ -169,10 +173,18 @@ export class HostProcessManager {
       this.#fail(connection, 'desktop.host_startup_timeout', 'Agent Host 启动超时。')
     }, this.#options.startupTimeoutMs ?? startupTimeoutMs)
     this.#setStatus('starting')
+    if (this.#options.initialize) {
+      void this.#options.initialize().then(command => {
+        if (this.#connection !== connection || connection.state !== 'starting') return
+        connection.child.stdin.write(JSON.stringify(command) + '\n', 'utf8')
+      }).catch(() => {
+        this.#fail(connection, 'desktop.host_channel_failed', '无法从系统安全存储加载模型凭证。')
+      })
+    }
     return connection.ready
   }
 
-  async request<T>(command: DesktopCommand): Promise<T> {
+  async request<T>(command: TransportCommand): Promise<T> {
     const connection = this.#connection
     if (!connection || connection.state !== 'ready' || this.#shutdown) throw unavailable(this.#status.message)
     if (connection.pending.size >= maxPendingRequests) {
@@ -391,6 +403,6 @@ export function spawnAgentHost(options: {
   }
   return spawn(options.executable, [
     '--disable-warning=ExperimentalWarning', join(options.root, 'src', 'cli.ts'),
-    '--' + options.mode, '--data', options.data,
+    '--' + options.mode, '--data', options.data, '--desktop',
   ], { cwd: options.root, windowsHide: true, stdio: 'pipe', env })
 }

@@ -71,7 +71,7 @@ export function Sidebar({ onCreate, onSettings, onSessionAction }: {
         <div className="sidebar-footer">
           <button className="settings-entry" onClick={onSettings}>
             <span className="settings-tile"><Settings2 size={16} /></span>
-            <span><strong>设置</strong><small>外观与偏好</small></span>
+            <span><strong>设置</strong><small>账号与工作区</small></span>
           </button>
           <IconButton className="mobile-sidebar-close" label="关闭会话导航" onClick={toggle}><PanelLeft size={16} /></IconButton>
         </div>

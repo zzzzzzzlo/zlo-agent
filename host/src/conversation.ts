@@ -5,7 +5,7 @@ import type {
   HistoryInput, RenameConversationInput, SendMessageInput, SendMessageResult, SetConversationModelInput, SteerInput, UsageTotals,
 } from '../../shared/contracts/desktop.ts'
 import { normalizeVerification } from './contracts/domain.ts'
-import type { AgentEvent, EndReason, EventDraft, ModelRoute, TaskStatus, VerificationResult } from './contracts/domain.ts'
+import type { AgentEvent, EndReason, EventDraft, ModelRoute, TaskStatus, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
 import type { LocalStore } from './store.ts'
 import type { TaskSnapshot } from './task-engine.ts'
 import { parseProjectCommand, workspaceTarget } from './workspace.ts'
@@ -272,13 +272,13 @@ export class ConversationService {
     return this.#receipt(input.requestId, this.#createSignature(input))
   }
 
-  create(input: CreateConversationInput, workspace: string, defaultRoute?: ModelRoute): ConversationSummary {
+  create(input: CreateConversationInput, workspace: string, defaultRoute?: ModelRoute, defaultAccess: WorkspaceAccess = 'write'): ConversationSummary {
     return this.#command(input.requestId, this.#createSignature(input), () => {
       const now = Date.now()
       const route = input.route ?? defaultRoute
       const conversation: StoredConversation = {
         id: randomUUID(), title: input.title ?? '新会话', createdAt: now, updatedAt: now, archived: false,
-        workspace, workspaceAccess: input.workspaceAccess ?? (input.workspace ? 'write' : 'read'),
+        workspace, workspaceAccess: input.workspaceAccess ?? (input.workspace ? defaultAccess : 'read'),
         ...(route ? { route } : {}), ...(input.check ? { check: input.check } : {}), turnCount: 0,
       }
       this.#saveConversation(conversation)
@@ -294,6 +294,10 @@ export class ConversationService {
   }
 
   get(id: string): ConversationSummary { return summary(this.#record(id)) }
+
+  recentTaskIds(id: string, limit: number): string[] {
+    return this.#store.recentField(turnNamespace(this.#record(id).id), '$.taskId', limit)
+  }
 
   history({ conversationId, before }: HistoryInput): ConversationHistory {
     if (before !== undefined && (!Number.isSafeInteger(before) || before < 1)) {
@@ -345,6 +349,15 @@ export class ConversationService {
       this.#event(id, 'conversation.archived', { conversation: result })
       return result
     })
+  }
+
+  setWorkspaceAccess(id: string, access: WorkspaceAccess): ConversationSummary {
+    const record = this.#record(id)
+    if (record.workspaceAccess === access) return summary(record)
+    const next = { ...record, workspaceAccess: access, updatedAt: Date.now() }
+    this.#saveConversation(next)
+    this.#event(id, 'conversation.permissions_changed', { conversation: summary(next) })
+    return summary(next)
   }
 
   #modelSignature(input: SetConversationModelInput): string {

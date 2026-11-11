@@ -14,7 +14,7 @@ function invalid(): never {
   throw new HostTransportError('INVALID_INPUT', '请求参数无效。')
 }
 
-function object(value: unknown, fields: string[]): Input {
+export function object(value: unknown, fields: string[]): Input {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) return invalid()
   if (Object.keys(value).some((name) => !fields.includes(name))) return invalid()
   return value as Input
@@ -30,7 +30,7 @@ function requestId(value: unknown): string {
   return value
 }
 
-function entityId(value: unknown): string {
+export function entityId(value: unknown): string {
   if (typeof value !== 'string' || !/^[\da-f]{8}-(?:[\da-f]{4}-){3}[\da-f]{12}$/i.test(value)) return invalid()
   return value
 }
@@ -65,7 +65,7 @@ export function directoryOverlaps(left: string, right: string): boolean {
   return contains(left, right) || contains(right, left)
 }
 
-function modelRoute(value: unknown) {
+export function modelRoute(value: unknown) {
   const route = object(value, ['provider', 'model'])
   const provider = text(route.provider, 80)
   const model = text(route.model, 200)

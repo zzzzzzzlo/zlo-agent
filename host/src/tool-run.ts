@@ -7,6 +7,7 @@ import type { ToolApprovalBroker } from './tool-approval.ts'
 import { workspaceTarget } from './workspace.ts'
 import type { CodingWorkspace, DeferredToolOperation, WorkspaceTool } from './workspace.ts'
 import { redactProcessOutput } from './workspace-process.ts'
+import { prepareFilePostcondition } from './reconciliation.ts'
 
 const unavailable = { ok: false, error: 'Tool work is unavailable' }
 
@@ -59,8 +60,11 @@ export class ToolRun {
           destination = approval.destination
         }
         try {
+          const filePostcondition = tool.name === 'create_text_file'
+            ? await prepareFilePostcondition(tool.name, workspace, target, input) : undefined
+          if (this.#closed || combined.aborted || !authorize(input)) return unavailable
           this.#tasks.beginTool(ref.taskId, ref, operationId, tool.name, tool.effect,
-            tool.effect === 'write' ? target : undefined, undefined, tool.policy)
+            tool.effect === 'write' ? target : undefined, undefined, tool.policy, filePostcondition)
         } catch {
           return unavailable
         }
@@ -71,6 +75,7 @@ export class ToolRun {
             taskId: ref.taskId, agentRunId: ref.agentRunId!, destination,
             defer: (operation) => {
               if (!tool.policy?.deferred || deferred || this.#closed) throw new Error('Deferred operation not permitted')
+              if (operation.pid !== undefined) this.#tasks.attachProcess(ref.taskId, operationId, operation.pid)
               deferred = true
               this.#register(operationId, ref, operation)
             },

@@ -118,6 +118,18 @@ export class LocalStore {
     `).all(namespace, before, before, limit).map((row) => JSON.parse(row.value as string) as T);
   }
 
+  recentField(namespace: string, path: string, limit: number): string[] {
+    return this.#db.prepare(`
+      SELECT json_extract(value, ?) AS field FROM records WHERE namespace = ? ORDER BY id DESC LIMIT ?
+    `).all(path, namespace, limit).flatMap(row => typeof row.field === 'string' ? [row.field] : []);
+  }
+
+  matchingRecords<T>(namespace: string, path: string, value: string): T[] {
+    return this.#db.prepare(`
+      SELECT value FROM records WHERE namespace = ? AND json_extract(value, ?) = ? ORDER BY id
+    `).all(namespace, path, value).map(row => JSON.parse(row.value as string) as T);
+  }
+
   put(namespace: string, id: string, value: unknown): void {
     this.#requireTransaction();
     this.#db.prepare(`
@@ -157,6 +169,15 @@ export class LocalStore {
   events(taskId: string, after = 0): AgentEvent[] {
     validateCursor(after);
     return this.#readEvents(taskId, after, -1);
+  }
+
+  eventsOfTypes(taskId: string, types: readonly string[]): AgentEvent[] {
+    if (!types.length) return [];
+    return this.#db.prepare(`
+      SELECT event FROM events
+      WHERE task_id = ? AND json_extract(event, '$.type') IN (${types.map(() => '?').join(', ')})
+      ORDER BY seq
+    `).all(taskId, ...types).map(row => JSON.parse(row.event as string) as AgentEvent);
   }
 
   messageDeltas(streamId: string, messageId: string, after: number): { seq: number; delta: string }[] {

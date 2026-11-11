@@ -6,6 +6,7 @@ import { useWorkspace, activeSession } from '../../stores/workspace'
 import { Glass } from '../glass/Glass'
 import { IconButton } from '../ui/IconButton'
 import { RunBadge, ToolCard } from '../chat/ToolCard'
+import { verificationLabel } from '../../features/sessions/verification'
 
 const nodeStates: Record<NonNullable<Turn['nodes']>[number]['status'], RunStatus> = {
   running: 'running',
@@ -14,7 +15,10 @@ const nodeStates: Record<NonNullable<Turn['nodes']>[number]['status'], RunStatus
   interrupted: 'stopped',
 }
 
-export function ActivityPanel({ onClose }: { onClose: () => void }) {
+export function ActivityPanel({ onClose, onManage }: {
+  onClose: () => void
+  onManage(section: 'tasks' | 'diagnostics'): void
+}) {
   const turn = useWorkspace((state) => activeSession(state)?.turns.at(-1))
   const session = useWorkspace(activeSession)
   return (
@@ -25,8 +29,17 @@ export function ActivityPanel({ onClose }: { onClose: () => void }) {
           <div className="activity-caption mono">当前会话</div>
           {turn ? (
             <>
-              <div className="activity-run"><strong>最近一次运行</strong><RunBadge status={turn.status} /></div>
+              <div className="activity-run"><strong>最近一次运行</strong><RunBadge status={turn.status} label={turn.status === 'completed' ? '执行完成' : undefined} /></div>
+              {turn.verification && <p>{verificationLabel(turn.verification)}</p>}
               <div className="activity-prompt">{turn.prompt}</div>
+              {globalThis.window?.agentManagement && (
+                <div className="management-actions">
+                  {turn.status === 'reconciliation' && (
+                    <button className="button-primary" type="button" onClick={() => onManage('diagnostics')}>核对异常操作</button>
+                  )}
+                  <button className="button-neutral" type="button" onClick={() => onManage('tasks')}>查看任务详情</button>
+                </div>
+              )}
               {turn.usage && (
                 <dl className="activity-usage" aria-label="Token 用量">
                   <div><dt>输入 Token</dt><dd>{turn.usage.input}</dd></div>
@@ -45,6 +58,7 @@ export function ActivityPanel({ onClose }: { onClose: () => void }) {
                       <li className="activity-run" key={node.id} title={node.id}>
                         <span>{node.role === 'team' ? 'Team Agent' : '临时 Worker'}</span>
                         <RunBadge status={nodeStates[node.status]} />
+                        {node.verification && <small>{verificationLabel(node.verification)}</small>}
                       </li>
                     ))}
                   </ul>

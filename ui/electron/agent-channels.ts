@@ -18,3 +18,22 @@ export const agentChannels = {
   event: 'agent-host:event',
   status: 'agent-host:status-event',
 } as const
+
+export const managementChannels = {
+  snapshot: 'agent-management:snapshot',
+  recentDiagnostics: 'agent-management:recent-diagnostics',
+  savePreferences: 'agent-management:save-preferences',
+  setWorkspaceAccess: 'agent-management:set-workspace-access',
+  setProviderKey: 'agent-management:set-provider-key',
+  testProvider: 'agent-management:test-provider',
+  removeProviderKey: 'agent-management:remove-provider-key',
+  deleteMemory: 'agent-management:delete-memory',
+  reconcile: 'agent-management:reconcile',
+} as const
+
+export const chatGptChannels = {
+  status: 'agent-chatgpt:status',
+  signIn: 'agent-chatgpt:sign-in',
+  cancelSignIn: 'agent-chatgpt:cancel',
+  signOut: 'agent-chatgpt:sign-out',
+} as const

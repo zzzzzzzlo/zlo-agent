@@ -252,7 +252,7 @@ function startProcess(invocation: ShellInvocation, cwd: string, workspace: strin
   signal?.addEventListener('abort', abort, { once: true })
 
   return {
-    id, output, started: started.promise, completion: completed.promise, stop,
+    id, pid: child.pid, output, started: started.promise, completion: completed.promise, stop,
     terminal: () => terminal,
     status: () => ({ processId: id, state, exitCode, truncated: output.truncated }),
   }
@@ -339,7 +339,7 @@ export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] 
           return { ok: false, error: 'Shell command could not start' }
         }
         try {
-          context.defer({ completion: process.completion, stop: process.stop })
+          context.defer({ completion: process.completion, stop: process.stop, pid: process.pid })
         } catch {
           await process.stop()
           processes.delete(process.id)

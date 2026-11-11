@@ -55,7 +55,8 @@ test('scheduler rejects invalid requests and restricts independent selection to 
       modes: { 'model.task_fit': 'active' },
       judge: {
         async evaluate(decision) {
-          candidates.push(decision.input.candidates)
+          const routes = decision.input.candidates as Array<{ provider: string; model: string }>
+          candidates.push(routes.map(({ provider, model }) => ({ provider, model })))
           return { output: 1000 }
         },
       },

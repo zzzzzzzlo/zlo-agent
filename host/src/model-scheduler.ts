@@ -29,11 +29,14 @@ export class LocalModelScheduler {
   readonly #execution: AgentExecution
   readonly #store: LocalStore
   readonly #judgment: LocalJudgment
+  readonly #automatic: () => boolean
 
-  constructor(execution: AgentExecution, store: LocalStore, judgment: LocalJudgment, limits: Partial<ModelLimits> = {}) {
+  constructor(execution: AgentExecution, store: LocalStore, judgment: LocalJudgment, limits: Partial<ModelLimits> = {},
+    automatic: () => boolean = () => true) {
     this.#execution = execution
     this.#store = store
     this.#judgment = judgment
+    this.#automatic = automatic
     this.#limits = { ...defaults, ...limits }
     if (Object.values(this.#limits).some(value => !Number.isSafeInteger(value) || value < 1)) {
       throw new Error('Invalid model budget limits')
@@ -60,6 +63,10 @@ export class LocalModelScheduler {
   }
 
   async allocate(event: EventDraft, parent: ModelRoute, requested?: ModelRoute, independent = false): Promise<ModelRoute> {
+    if (!this.#automatic()) {
+      independent = false
+      requested = parent
+    }
     const requestedRoute = requested ?? parent
     if (!this.canSwitch(parent, requestedRoute)) throw new Error('Cross-provider context transfer is not authorized')
     await this.validateRoute(requestedRoute)
@@ -153,6 +160,7 @@ export class LocalModelScheduler {
   }
 
   budget(taskId: string): Budget { return this.#store.get<Budget>(budgets, taskId) ?? emptyBudget }
+  get tokenLimit(): number { return this.#limits.tokens }
 
   getRouteStatus() { return { quota: 'unknown' as const, activeReservations: this.#active.size } }
 }

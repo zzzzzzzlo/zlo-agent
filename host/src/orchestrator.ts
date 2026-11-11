@@ -276,7 +276,7 @@ export class MultiAgentOrchestrator {
           childActive = false
         }
       }
-      if (role === 'team' && this.#profile.delegation) tools.push({
+      if (role === 'team' && this.#profile.delegation && this.#capabilities.enabled('delegate_worker')) tools.push({
         name: 'delegate_worker',
         description: 'Delegate a scoped read-only investigation within the current Team node and wait for its evidence and verification status.',
         parameters: {
@@ -284,7 +284,7 @@ export class MultiAgentOrchestrator {
           properties: { goal: { type: 'string', minLength: 1, maxLength: 8000 } },
         },
         execute: async (id, input, toolSignal) => {
-          if (!input || typeof input !== 'object' || !('goal' in input) || typeof input.goal !== 'string' ||
+          if (!this.#capabilities.enabled('delegate_worker') || !input || typeof input !== 'object' || !('goal' in input) || typeof input.goal !== 'string' ||
             signal.aborted || toolSignal?.aborted || childActive || workspaceActive || blockingWrite()) {
             return { ok: false, error: 'Delegation unavailable' }
           }
@@ -292,7 +292,7 @@ export class MultiAgentOrchestrator {
           const nonEmptyGoal = goal.trim().length > 0
           const requestId = 'team:' + event.agentRunId + ':' + receiptId(id)
           if (!await this.#judgment.decide(event, 'delegation.worth', { role, goalLength: goal.length, nonEmptyGoal }, nonEmptyGoal,
-            [true, false], [node.id], { planRequestId: requestId }) || signal.aborted || toolSignal?.aborted) {
+            [true, false], [node.id], { planRequestId: requestId }) || !this.#capabilities.enabled('delegate_worker') || signal.aborted || toolSignal?.aborted) {
             return { ok: false, error: 'Delegation declined' }
           }
           try {
@@ -356,7 +356,9 @@ export class MultiAgentOrchestrator {
         const outcome = await session.run(prompt)
         executionCompleted = outcome.status === 'completed'
         if (!signal.aborted && outcome.status === 'completed' && outcome.text.trim()) {
-          if (node.check) verification = await verifyWorkspace(this.#tasks, this.#extensions.workflow,
+          if (node.check?.command && !this.#capabilities.enabled('run_project_command')) {
+            verification = { passed: false, evidence: 'project_command_disabled' }
+          } else if (node.check) verification = await verifyWorkspace(this.#tasks, this.#extensions.workflow,
             workspace, event, node.check, signal,
             node.check.command && !node.worktreeId && !scope.path && parentScope.access === 'trusted' && node.access === 'write' ? 'trusted' : scope.access)
           const completedChildren = this.#tasks.get(task.id).nodes?.filter(child =>
@@ -496,7 +498,7 @@ export class MultiAgentOrchestrator {
         }
       })
     if (this.#profile.delegation) {
-      tools.push({
+      if (this.#capabilities.enabled('delegate_task')) tools.push({
         name: 'delegate_task',
         description: 'Run a single temporary read-only worker for a well-scoped investigation. Returns a structured result.',
         parameters: {
@@ -504,7 +506,7 @@ export class MultiAgentOrchestrator {
           properties: { goal: { type: 'string', minLength: 1, maxLength: 8000 } },
         },
         execute: async (id, input, toolSignal) => {
-          if (!dispatchAllowed(toolSignal) || !input || typeof input !== 'object' ||
+          if (!this.#capabilities.enabled('delegate_task') || !dispatchAllowed(toolSignal) || !input || typeof input !== 'object' ||
             !('goal' in input) || typeof input.goal !== 'string') return { ok: false, error: 'Delegation unavailable' }
           const goal = input.goal
           const nonEmptyGoal = goal.trim().length > 0
@@ -512,7 +514,9 @@ export class MultiAgentOrchestrator {
           const shouldDelegate = await this.#judgment.decide(event, 'delegation.worth',
             { role: 'root', goalLength: goal.length, nonEmptyGoal }, nonEmptyGoal, [true, false], [task.rootNodeId],
             { delegationReceiptId: operationId })
-          if (!shouldDelegate || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Delegation unavailable' }
+          if (!shouldDelegate || !this.#capabilities.enabled('delegate_task') || !dispatchAllowed(toolSignal)) {
+            return { ok: false, error: 'Delegation unavailable' }
+          }
           this.#tasks.beginTool(task.id, event, operationId, 'delegate_task', 'read')
           let result: WorkerHandoff | undefined
           try {
@@ -526,8 +530,8 @@ export class MultiAgentOrchestrator {
           return result ? { ok: result.resultStatus === 'succeeded', ...result } : { ok: false, error: 'Worker interrupted' }
         },
       })
-      tools.push(planTool(async (id, proposals, toolSignal) => {
-        if (!dispatchAllowed(toolSignal) || !session || !proposals.length || proposals.length > 8) {
+      if (this.#capabilities.enabled('propose_task_plan')) tools.push(planTool(async (id, proposals, toolSignal) => {
+        if (!this.#capabilities.enabled('propose_task_plan') || !dispatchAllowed(toolSignal) || !session || !proposals.length || proposals.length > 8) {
           return { ok: false, error: 'Planning unavailable' }
         }
         try {
@@ -546,7 +550,7 @@ export class MultiAgentOrchestrator {
               baseline, !proposal.role && teamCandidate ? ['worker', 'team'] : [baseline], [task.rootNodeId], { planRequestId: requestId })
             planned.push({ ...proposal, role, ...(role === 'worker' ? { teamKey: undefined } : {}) })
           }
-          if (!dispatchAllowed(toolSignal)) return { ok: false, error: 'Planning interrupted' }
+          if (!this.#capabilities.enabled('propose_task_plan') || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Planning interrupted' }
           const current = this.#tasks.get(task.id)
           const nodes = this.#tasks.proposePlan(task.id, requestId, current.planVersion, planned)
           await drain()
@@ -557,8 +561,8 @@ export class MultiAgentOrchestrator {
           return { ok: false, error: 'Plan rejected by task scope, dependency, or budget' }
         }
       }))
-      tools.push(replanTool(async (id, nodeId, update, toolSignal) => {
-        if (!dispatchAllowed(toolSignal)) return { ok: false, error: 'Replanning unavailable' }
+      if (this.#capabilities.enabled('replan_task_node')) tools.push(replanTool(async (id, nodeId, update, toolSignal) => {
+        if (!this.#capabilities.enabled('replan_task_node') || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Replanning unavailable' }
         const current = this.#tasks.get(task.id)
         const node = current.nodes?.find(item => item.id === nodeId)
         const isRootChild = node?.parentNodeId === task.rootNodeId
@@ -570,7 +574,9 @@ export class MultiAgentOrchestrator {
         const revise = await this.#judgment.decide(event, 'task.replan',
           { status: node?.status ?? 'missing', requested: true, isRootChild, hasWrite, replanCount },
           safe, safe ? [true, false] : [false], node ? [node.id] : [], { planRequestId: requestId })
-        if (!revise || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Replan declined or unsafe' }
+        if (!revise || !this.#capabilities.enabled('replan_task_node') || !dispatchAllowed(toolSignal)) {
+          return { ok: false, error: 'Replan declined or unsafe' }
+        }
         try {
           this.#tasks.replanNode(task.id, requestId, current.planVersion, nodeId, update)
           await drain()

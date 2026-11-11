@@ -1,12 +1,14 @@
 # Sprint 4 · 桌面协议与实施顺序
 
+本页保留 Sprint 4 基线。当前权限、验收和管理命令见 [0.5.0 桌面协议](21-desktop-management.md)。
+
 Phase 0 核对：本地 main 与 origin/main 指向首轮 877b4ef，工作区干净。Node 24.15.0，Electron 43.4.1。Host 基线 31/31，UI 类型检查通过。首轮只有 Task 级事件、临时输出及按 Task 划分的 Pi 会话，桌面使用 Mock 与 localStorage。未发现可用于在线测试的 Provider 环境变量。
 
 Phase 1 冻结接口在 `shared/contracts/domain.ts` 与 `shared/contracts/desktop.ts`。以下约定先于并行开发。
 
 - Electron → Host 使用原 JSONL stdin/stdout。新命令使用 `DesktopCommand`，结果沿用 `{schemaVersion:1, kind:"result", commandId, type, result}`。事件为 `{schemaVersion:1, kind:"conversation.event", event}`。错误为 `{schemaVersion:1,kind:"error",commandId,error:{code,message}}`，旧 CLI 保留顶层 message。启动 `ready` 包含 mode。CLI `exit` 正常停止，EOF 作为关闭保护。
 - Electron Main 管生命周期和 transport，Preload 仅暴露 `window.agentHost: DesktopHostApi`。可信窗口通过本地目录选择器授权工作区。Renderer 的写命令不能传入其他工作区路径。
-- 新 Conversation 绑定工作区、可选模型和可选文件验收。无文件验收的会话使用只读工具，并对有内容的回复做确定性检查。Coding 会话必须选择工作区及相对文件验收，Root 才有受控写权限。
+- 新 Conversation 绑定工作区、可选模型和可选验收。0.5.0 的工作区授权与验收独立，文本回复与工具回执分别记录执行事实。
 - 新消息创建独立 Task，与消息原子落盘。每个 Task 首次创建时分配 TaskRun ID。显式用户停止后重试有新 Attempt，进程中断且状态可核对的连续恢复沿用该 Attempt。Worker Attempt 独立，沿用根 TaskRun。首次跨版本写入保留旧事件原样并补充旧任务的稳定 Run ID。
 - 当前 Pi Session 归 Conversation，上下文独立于 UI 和 Task。根 Agent 激活产生新的 AgentRun。Worker 有独立 Pi Session 与 Context Package，不接收完整父对话。
 - History 提供按 Task 聚合的用户消息、助理消息、工具摘要、状态、Usage 与独立 ID。每条消息有独立 ID。Conversation 事件序号独立且可从 History cursor 排他性补读。message.delta 先持久化回复片段再发出，其余事件可带当前投影。History 和 cursor 从同一同步快照读取。

@@ -3,8 +3,9 @@ import { useWorkspace, activeDraft, activeSession } from '../../stores/workspace
 import { isBusy } from '../../integrations/agent/conversationProjection'
 import { IconButton } from '../ui/IconButton'
 import { Glass } from '../glass/Glass'
+import { workspaceAccessLabels } from '../../features/sessions/model'
 
-export function Composer({ notify }: { notify: (text: string) => void }) {
+export function Composer({ notify, onReconcile }: { notify: (text: string) => void; onReconcile: () => void }) {
   const session = useWorkspace(activeSession)
   const value = useWorkspace(activeDraft)
   const status = session?.turns.at(-1)?.status ?? session?.latestStatus
@@ -25,6 +26,7 @@ export function Composer({ notify }: { notify: (text: string) => void }) {
   const label = host.state === 'starting' ? 'Host 启动中' : host.state === 'offline' ? 'Host 已断开'
     : mock ? 'Mock 演示' : host.mode === 'faux' ? 'Pi · Faux' : 'Pi Host 已连接'
   const alert = error ?? (host.state === 'offline' ? host.message : undefined)
+  const access = session?.workspaceAccess ?? 'read'
 
   return (
     <footer className="composer-dock">
@@ -59,7 +61,14 @@ export function Composer({ notify }: { notify: (text: string) => void }) {
             <IconButton label={sendLabel} type="submit" className="send-button" disabled={!canSend || !value.trim()}><ArrowUp size={19} strokeWidth={2.3} /></IconButton>
           </div>
         </Glass>
-        <div className="composer-footnote"><CircleHelp size={12} /><span>{mock ? '本地界面演示' : session?.check ? '本地 Host · 文件验收' : '本地 Host · 只读会话'}</span></div>
+        <div className="composer-footnote">
+          <CircleHelp size={12} />
+          <span>{mock ? '本地界面演示' : '本地 Host' + (session ? ' · ' + workspaceAccessLabels[access] : '') +
+            (session?.check ? (session.check.command ? ' · 命令验收' : ' · 文件验收') : '')}</span>
+          {status === 'reconciliation' && globalThis.window?.agentManagement && (
+            <button type="button" className="composer-reconcile" onClick={onReconcile}>核对异常操作</button>
+          )}
+        </div>
       </form>
     </footer>
   )

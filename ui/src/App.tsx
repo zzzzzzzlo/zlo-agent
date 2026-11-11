@@ -13,6 +13,7 @@ import { NewConversationDialog } from './components/sidebar/NewConversationDialo
 import { ChatSurface } from './components/chat/ChatSurface'
 import { Composer } from './components/chat/Composer'
 import { Settings } from './components/settings/Settings'
+import type { SettingsSection } from './components/settings/Settings'
 
 export function App() {
   const theme = useWorkspace((state) => state.theme)
@@ -21,7 +22,7 @@ export function App() {
   const initialize = useWorkspace((state) => state.initialize)
   const hostState = useWorkspace((state) => state.host.state)
   const [activity, setActivity] = useState(false)
-  const [settings, setSettings] = useState(false)
+  const [settings, setSettings] = useState<SettingsSection>()
   const [sessionAction, setSessionAction] = useState<SessionAction>()
   const [newConversation, setNewConversation] = useState(false)
   const [toast, setToast] = useState('')
@@ -48,7 +49,7 @@ export function App() {
       }
       if (event.key === ',' && !sessionAction && !newConversation) {
         event.preventDefault()
-        setSettings(true)
+        setSettings('appearance')
       }
     }
     window.addEventListener('keydown', shortcut)
@@ -61,17 +62,17 @@ export function App() {
         <div className="window-backdrop" aria-hidden="true" />
         <TitleBar activity={activity} onActivity={() => setActivity((visible) => !visible)} notify={notify} />
         <div className="workspace">
-          {sidebar && <Sidebar onCreate={() => setNewConversation(true)} onSettings={() => setSettings(true)} onSessionAction={setSessionAction} />}
+          {sidebar && <Sidebar onCreate={() => setNewConversation(true)} onSettings={() => setSettings('appearance')} onSessionAction={setSessionAction} />}
           <main className="chat-surface" aria-label="对话">
             <ChatSurface />
-            <Composer notify={notify} />
+            <Composer notify={notify} onReconcile={() => setSettings('diagnostics')} />
           </main>
-          {activity && <ActivityPanel onClose={() => setActivity(false)} />}
+          {activity && <ActivityPanel onClose={() => setActivity(false)} onManage={setSettings} />}
         </div>
         <div className="toast-anchor" role="status">
           {toast && <Glass variant="popover" className="toast" elevated contentClassName="toast-content"><Info size={16} />{toast}</Glass>}
         </div>
-        {settings && <Settings onClose={() => setSettings(false)} />}
+        {settings && <Settings initialSection={settings} onClose={() => setSettings(undefined)} />}
         {sessionAction && <SessionDialog action={sessionAction} onClose={() => setSessionAction(undefined)} />}
         {newConversation && <NewConversationDialog onClose={() => setNewConversation(false)} />}
       </div>
