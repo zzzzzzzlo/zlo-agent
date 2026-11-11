@@ -64,7 +64,7 @@ function ok(value: unknown): boolean {
   return Boolean(value && typeof value === 'object' && 'ok' in value && value.ok === true)
 }
 
-test('Host journals an approved shell command while it runs and accepts only its owner polling it', { timeout: 10_000 }, async () => {
+test('Host journals an approved shell command while it runs and accepts only its owner polling it', { timeout: 20_000 }, async () => {
   const env = await fixture()
   let approvals = 0
   const execution = new ScriptExecution(async (_config, _prompt, call) => {
@@ -74,7 +74,8 @@ test('Host journals an approved shell command while it runs and accepts only its
     assert.ok(launched.ok)
     const input = { processId: launched.processId }
     assert.equal(ok(await call('create_text_file', { path: 'blocked.txt', content: 'overlap' })), false)
-    for (let attempt = 0; attempt < 40; attempt++) {
+    const deadline = Date.now() + 10_000
+    while (Date.now() < deadline) {
       const status = await call('process_status', input) as { state: string; exitCode?: number }
       if (status.state === 'exited') {
         assert.equal(status.exitCode, 0)

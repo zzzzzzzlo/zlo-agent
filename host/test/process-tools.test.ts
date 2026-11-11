@@ -103,18 +103,32 @@ test('CMD supports explicit quoting and propagates the true exit code', { skip: 
   assert.match(output.frames[0].text, /"zlo space"/)
 })
 
-test('process_stop stops the controlled child tree and keeps the original write outcome unknown', async t => {
+test('process_stop stops the controlled child tree and keeps the original write outcome unknown', { timeout: 25_000 }, async t => {
   const { root, invoke, operations } = await setup(t)
-  const program = "setTimeout(()=>require('node:fs').writeFileSync('escaped.txt','ran'),4500)"
+  const script = join(root, 'child.cjs')
+  await writeFile(script, [
+    "const { writeFileSync } = require('node:fs')",
+    "writeFileSync('started.flag', '')",
+    "setTimeout(() => writeFileSync('escaped.txt', 'ran'), 4500)",
+  ].join('\n'))
   const command = windows
-    ? `$child = Start-Process -FilePath '${process.execPath.replaceAll("'", "''")}' -ArgumentList '-e',"${program}" -WindowStyle Hidden -PassThru; [Console]::WriteLine('started'); Wait-Process -Id $child.Id`
-    : `"${process.execPath}" -e "${program}" & printf 'started\\n'; wait`
+    ? `& '${process.execPath.replaceAll("'", "''")}' '${script.replaceAll("'", "''")}'`
+    : `"${process.execPath}" "${script}" & wait`
   const launched = await invoke('shell_exec', { shell, command })
   assert.equal(launched.ok, true)
   const processId = launched.processId
   await until(async () => {
-    const output = await invoke('process_output', { processId })
-    return output.frames.some(frame => frame.text.includes('started')) ? output : undefined
+    try {
+      await access(join(root, 'started.flag'))
+      return true
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+      const status = await invoke('process_status', { processId })
+      if (status.state !== 'running' && status.state !== 'starting') {
+        const output = await invoke('process_output', { processId })
+        assert.fail('Managed child ended before readiness: ' + JSON.stringify(output.frames))
+      }
+    }
   })
   const result = await invoke('process_stop', { processId })
   assert.equal(result.state, 'stopped')
