@@ -66,25 +66,39 @@ function ok(value: unknown): boolean {
 
 test('Host journals an approved shell command while it runs and accepts only its owner polling it', { timeout: 20_000 }, async () => {
   const env = await fixture()
+  const script = join(env.workspace, 'approved-process.cjs')
+  await writeFile(script, [
+    "const { existsSync } = require('node:fs')",
+    "console.log('approved-process')",
+    "const timer = setInterval(() => { if (existsSync('release.flag')) clearInterval(timer) }, 25)",
+  ].join('\n'))
   let approvals = 0
+  let pollingFailure: unknown
   const execution = new ScriptExecution(async (_config, _prompt, call) => {
-    const launched = await call('shell_exec', process.platform === 'win32'
-      ? { shell: 'powershell', command: "Write-Output 'approved-process'; Start-Sleep -Milliseconds 650" }
-      : { shell: 'sh', command: 'echo approved-process; sleep 1' }) as { ok: boolean; processId: string }
-    assert.ok(launched.ok)
-    const input = { processId: launched.processId }
-    assert.equal(ok(await call('create_text_file', { path: 'blocked.txt', content: 'overlap' })), false)
-    const deadline = Date.now() + 10_000
-    while (Date.now() < deadline) {
-      const status = await call('process_status', input) as { state: string; exitCode?: number }
-      if (status.state === 'exited') {
-        assert.equal(status.exitCode, 0)
-        assert.match(JSON.stringify(await call('process_output', input)), /approved-process/)
-        return 'Command completed'
+    try {
+      const launched = await call('shell_exec', process.platform === 'win32'
+        ? { shell: 'powershell', command: `& '${process.execPath.replaceAll("'", "''")}' '${script.replaceAll("'", "''")}'` }
+        : { shell: 'sh', command: `"${process.execPath}" "${script}"` }) as { ok: boolean; processId: string }
+      assert.ok(launched.ok)
+      const input = { processId: launched.processId }
+      assert.equal(ok(await call('create_text_file', { path: 'blocked.txt', content: 'overlap' })), false)
+      await writeFile(join(env.workspace, 'release.flag'), '')
+      const deadline = Date.now() + 10_000
+      while (Date.now() < deadline) {
+        const status = await call('process_status', input) as { ok: boolean; state: string; exitCode?: number }
+        assert.equal(status.ok, true, 'The owning Agent must be able to poll a managed command')
+        if (status.state === 'exited') {
+          assert.equal(status.exitCode, 0)
+          assert.match(JSON.stringify(await call('process_output', input)), /approved-process/)
+          return 'Command completed'
+        }
+        await delay(50)
       }
-      await delay(50)
+      throw new Error('Shell did not settle')
+    } catch (error) {
+      pollingFailure = error
+      throw error
     }
-    throw new Error('Shell did not settle')
   })
   const host = new LocalAgentHost({ ...env, execution, approveTool: async request => {
     assert.equal(request.kind, 'shell')
@@ -97,6 +111,7 @@ test('Host journals an approved shell command while it runs and accepts only its
       requestId: 'shell', goal: 'Execute the command', cwd: env.workspace, workspaceAccess: 'trusted',
     })
     await host.idle()
+    assert.ifError(pollingFailure)
     assert.equal(host.getTask(taskId).status, 'succeeded')
     assert.equal(approvals, 1)
     const operations = host.getHistory(taskId).operations
