@@ -70,9 +70,17 @@ export class LocalModelScheduler {
     const alternatives = [...eligible].sort((a, b) =>
       (a.estimatedCost ?? Infinity) - (b.estimatedCost ?? Infinity) ||
       b.contextWindow - a.contextWindow || a.route.model.localeCompare(b.route.model))
-    const candidates = [requestedRoute, ...alternatives.filter(({ route }) => route.model !== requestedRoute.model)
-      .slice(0, 7).map(({ route }) => route)]
-    const selected = await this.#judgment.decide(event, 'model.task_fit', { candidates, independent },
+    const requestedMetadata = eligible.find(({ route }) => route.model === requestedRoute.model)
+    const modelFeatures = (route: ModelRoute, metadata?: ModelCandidate) => ({
+      ...route, contextWindow: metadata?.contextWindow, supportsText: metadata?.input.includes('text'),
+      estimatedCost: metadata?.estimatedCost,
+    })
+    const alternativesForDecision = alternatives.filter(({ route }) => route.model !== requestedRoute.model).slice(0, 7)
+    const candidates = [requestedRoute, ...alternativesForDecision.map(({ route }) => route)]
+    const selected = await this.#judgment.decide(event, 'model.task_fit', {
+      candidates: [modelFeatures(requestedRoute, requestedMetadata), ...alternativesForDecision.map(model => modelFeatures(model.route, model))],
+      independent, requested: Boolean(requested),
+    },
       independent && candidates.length > 1 ? 1 : 0, candidates.map((_, index) => index))
     const route = candidates[selected]!
     await this.validateRoute(route)

@@ -62,5 +62,5 @@ export function replanTool(execute: (
 }
 
 export function handoffs(nodes: WorkerNode[]) {
-  return nodes.map(({ id, status, result }) => ({ nodeId: id, status, result }))
+  return nodes.map(({ id, status, result, verification }) => ({ nodeId: id, status, result, verification }))
 }

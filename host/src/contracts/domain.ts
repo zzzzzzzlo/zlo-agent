@@ -1,5 +1,5 @@
-export type { EndReason, ModelRoute, ProjectCommand, TaskStatus, VerificationCheck, VerificationResult, WorkspaceAccess } from '../../../shared/contracts/domain.ts'
-export { projectCommands } from '../../../shared/contracts/domain.ts'
+export type { EndReason, ModelRoute, ProjectCommand, TaskStatus, VerificationCheck, VerificationResult, VerificationVerdict, WorkspaceAccess } from '../../../shared/contracts/domain.ts'
+export { normalizeVerification, projectCommands, verificationVerdict } from '../../../shared/contracts/domain.ts'
 
 export interface SessionRef {
   id: string

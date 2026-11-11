@@ -1,11 +1,12 @@
 import { randomUUID } from 'node:crypto'
-import { projectCommands } from './contracts/domain.ts'
+import { normalizeVerification, projectCommands } from './contracts/domain.ts'
 import type { EndReason, EventDraft, ModelRoute, TaskStatus, VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
 import type { LocalStore } from './store.ts'
 
 export type { EndReason, TaskStatus } from './contracts/domain.ts'
 export interface WorkerResult {
   resultStatus: 'succeeded' | 'failed'
+  executionStatus?: 'completed' | 'failed'
   summary: string
   artifactRefs: string[]
   evidenceRefs: string[]
@@ -158,6 +159,23 @@ function verificationCheck(check: VerificationCheck | undefined): VerificationCh
 function allNodes(task: TaskSnapshot): WorkerNode[] {
   return [...(task.worker ? [task.worker] : []), ...(task.nodes ?? [])]
 }
+function confirmedCheck(result?: VerificationResult): boolean {
+  return result?.passed === true && (result.verdict === undefined || result.verdict === 'verified')
+}
+function normalizeNode(node: WorkerNode): WorkerNode {
+  const verification = node.verification ?? (node.status === 'succeeded'
+    ? { passed: false, verdict: 'unverified', basis: 'none', evidence: 'legacy_handoff_without_check' } as const
+    : undefined)
+  return verification ? { ...node, verification: normalizeVerification(verification) } : node
+}
+function normalizeTask(task: TaskSnapshot): TaskSnapshot {
+  return {
+    ...task,
+    ...(task.verification ? { verification: normalizeVerification(task.verification) } : {}),
+    ...(task.worker ? { worker: normalizeNode(task.worker) } : {}),
+    ...(task.nodes ? { nodes: task.nodes.map(normalizeNode) } : {}),
+  }
+}
 function separateWorktrees(left?: string, right?: string): boolean {
   return Boolean(left && right && left !== right)
 }
@@ -208,7 +226,7 @@ function interruptedWrite(operations: Operation[]) {
     evidenceRefs: writes.filter(({ status }) => status === 'succeeded' || status === 'failed').map(({ id }) => id),
     remainingRisks: [evidence],
   }
-  return { unknown, result, verification: { passed: false, evidence } }
+  return { unknown, result, verification: { passed: false, verdict: 'failed', basis: 'handoff', evidence } as const }
 }
 function assertValidGraph(rootNodeId: string, nodes: WorkerNode[]): void {
   const byId = new Map(nodes.map((node) => [node.id, node]))
@@ -270,10 +288,10 @@ export class TaskEngine {
   get(taskId: string): TaskSnapshot {
     const snapshot = this.#db.get<TaskSnapshot>('tasks', taskId)
     if (!snapshot) throw new Error('Task does not exist')
-    return snapshot
+    return normalizeTask(snapshot)
   }
 
-  list(): TaskSnapshot[] { return this.#db.list<TaskSnapshot>('tasks') }
+  list(): TaskSnapshot[] { return this.#db.list<TaskSnapshot>('tasks').map(normalizeTask) }
 
   attempts(taskId: string): Attempt[] {
     this.get(taskId)
@@ -670,23 +688,31 @@ export class TaskEngine {
       const children = nodes.filter(({ parentNodeId }) => parentNodeId === nodeId)
       if (children.some(({ status }) => status === 'running')) throw new Error('Cannot settle a node with active children')
       const legacy = task.worker?.id === nodeId
-      const receipts = legacy ? [] : this.operations(taskId).filter(({ attemptId }) => attemptId === node.attemptId)
-      const interruption = result === undefined ? interruptedWrite(receipts) : undefined
+      const receipts = this.operations(taskId).filter(({ attemptId }) => attemptId === node.attemptId)
+      const interruption = !legacy && result === undefined ? interruptedWrite(receipts) : undefined
       let accepted = result ?? interruption?.result
       if (interruption) verification = interruption.verification
-      if (!legacy && result?.resultStatus === 'succeeded') {
+      if (result?.resultStatus === 'succeeded') {
         const finished = receipts.every(({ status }) => status !== 'started' && status !== 'unknown_effect')
-        const toolsVerified = receipts.some(({ id, status }) => status === 'succeeded' && result.evidenceRefs.includes(id))
-        const childrenVerified = children.every(({ status }) => status === 'succeeded')
-        const checkVerified = node.check ? verification?.passed === true : toolsVerified || (children.length > 0 && childrenVerified)
-        const passed = finished && childrenVerified && checkVerified && Boolean(result.summary.trim())
+        const hasReceipt = receipts.some(({ id, status }) => status === 'succeeded' && result.evidenceRefs.includes(id))
+        const childrenCompleted = children.every(({ status }) => status === 'succeeded')
+        const hasHandoff = node.check ? confirmedCheck(verification) : hasReceipt || (children.length > 0 && childrenCompleted)
+        const completed = finished && childrenCompleted && hasHandoff && Boolean(result.summary.trim())
+        const verified = completed && Boolean(node.check)
         verification = {
-          passed,
-          evidence: !finished ? 'node_unsettled_operations' : !childrenVerified ? 'node_child_verification_failed'
+          passed: verified,
+          verdict: verified ? 'verified' : completed ? 'unverified' : 'failed',
+          basis: node.check ? node.check.command ? 'project_command' : 'workspace_path' : 'handoff',
+          evidence: !finished ? 'node_unsettled_operations' : !childrenCompleted ? 'node_child_verification_failed'
             : node.check ? verification?.evidence ?? 'node_check_unavailable'
-            : toolsVerified ? 'node_verified_tool_receipt' : passed ? 'node_verified_children' : 'node_missing_evidence',
+            : hasReceipt && completed ? 'node_confirmed_tool_receipt' : completed ? 'node_completed_children' : 'node_missing_evidence',
         }
-        if (!passed) accepted = { ...result, resultStatus: 'failed', remainingRisks: [...result.remainingRisks, verification.evidence] }
+        if (!completed) accepted = { ...result, resultStatus: 'failed', remainingRisks: [...result.remainingRisks, verification.evidence] }
+      } else if (result?.resultStatus === 'failed') {
+        verification = {
+          passed: false, verdict: 'failed', basis: verification?.basis ?? 'handoff',
+          evidence: verification && !verification.passed ? verification.evidence : 'node_handoff_rejected',
+        }
       }
       const settled: WorkerNode = { ...node, status: accepted?.resultStatus ?? 'ready', result: accepted, verification }
       const parent = nodes.find(({ suspendedFor }) => suspendedFor === nodeId)
@@ -697,8 +723,8 @@ export class TaskEngine {
       this.#finishAttempt(node.attemptId, attemptStatus, interruption?.unknown ? 'unknown_effect' : undefined)
       this.#nodeEvent(task, settled, legacy ? 'task.worker_settled' : 'task.node_settled', {
         status: accepted?.resultStatus ?? 'interrupted',
-        ...(!legacy ? { attemptStatus } : {}),
-        ...(!legacy && accepted ? { evidenceRefs: accepted.evidenceRefs, verification } : {}),
+        attemptStatus,
+        ...(accepted ? { executionStatus: accepted.executionStatus, evidenceRefs: accepted.evidenceRefs, verification } : {}),
       })
       return settled
     })
@@ -773,18 +799,30 @@ export class TaskEngine {
     return this.#db.transaction(() => {
       const task = this.get(taskId)
       if (task.status !== 'verifying') throw new Error('Invalid task transition from ' + task.status + ' to verified')
+      const verified = confirmedCheck(verification)
+      const result: VerificationResult = task.check
+        ? {
+          ...verification,
+          passed: verified, verdict: verified ? 'verified' : 'failed',
+          basis: task.check.command ? 'project_command' : 'workspace_path',
+        }
+        : {
+          passed: false, verdict: verified || verification.verdict === 'unverified' ? 'unverified' : 'failed',
+          evidence: verification.passed ? 'no_declared_check' : verification.evidence, basis: 'none',
+        }
+      const completed = result.verdict === 'verified' || result.verdict === 'unverified'
       const nodes = allNodes(task)
       if (nodes.some(({ status }) => status === 'running') ||
-        (verification.passed && nodes.some(({ status }) => status !== 'succeeded')) ||
-        (!verification.passed && task.worker?.status === 'ready')) {
+        (completed && nodes.some(({ status }) => status !== 'succeeded')) ||
+        (!completed && task.worker?.status === 'ready')) {
         throw new Error('Worker outcome prevents task acceptance')
       }
       if (this.operations(taskId).some((operation) => operation.status === 'started' || operation.status === 'unknown_effect')) {
         throw new Error('Tool receipts prevent task acceptance')
       }
-      this.#event(task, 'verification.finished', { ...verification })
-      return this.#finish({ ...task, verification }, verification.passed ? 'succeeded' : 'failed',
-        verification.passed ? undefined : 'verification_failed')
+      this.#event(task, 'verification.finished', { ...result, executionStatus: 'completed' })
+      return this.#finish({ ...task, verification: result }, completed ? 'succeeded' : 'failed',
+        completed ? undefined : 'verification_failed')
     })
   }
 

@@ -145,14 +145,20 @@ test('judgment enforces baseline and allowed choices across off, shadow and acti
       },
     })
     assert.equal(await judgment.decide(event, 'model.task_fit', {}, 0, [0, 1]), 0)
-    assert.equal(await judgment.decide(event, 'collaboration.mode', { privatePrompt: secret }, 'worker', ['worker', 'team'], ['node-1']), 'worker')
+    assert.equal(await judgment.decide(event, 'collaboration.mode', {
+      privatePrompt: secret, nodeCount: 2, nodeOrdinal: 1, teamCandidate: true, hasDependencies: false,
+    }, 'worker', ['worker', 'team'], ['node-1', secret]), 'worker')
     assert.equal(await judgment.decide(event, 'delegation.worth', {}, false, [false]), false)
     assert.equal(await judgment.decide(event, 'handoff.sufficiency', {}, true, [false, true]), true)
     assert.deepEqual(calls, ['collaboration.mode', 'delegation.worth', 'handoff.sufficiency'])
     const payloads = store.events('task').map(({ payload }) => payload)
     assert.deepEqual(payloads.map(({ judgeStatus }) => judgeStatus), ['baseline', 'valid', 'invalid', 'failed'])
     assert.equal(payloads[1].shadow, 'team')
-    assert.deepEqual(payloads[1].evidenceRefs, ['node-1'])
+    const references = payloads[1].evidenceRefs as string[]
+    assert.ok(references.length > 0 && references.every(ref => /^sha256:[a-f0-9]{64}$/.test(ref)))
+    assert.deepEqual(payloads[1].features, { nodeCount: 2, nodeOrdinal: 1, teamCandidate: true, hasDependencies: false })
+    assert.deepEqual(payloads[1].candidates, ['worker', 'team'])
+    assert.equal(payloads[1].featureSchemaVersion, 1)
     assert.deepEqual(payloads[1].usage, { input: 3, output: 2 })
     assert.equal(JSON.stringify(payloads).includes(secret), false)
     assert.equal(JSON.stringify(payloads).includes('privatePrompt'), false)
@@ -160,6 +166,29 @@ test('judgment enforces baseline and allowed choices across off, shadow and acti
   } finally {
     store.close()
   }
+})
+
+test('judgment event features and choices cannot persist arbitrary strings from callers', async (t) => {
+  const store = new LocalStore(':memory:')
+  t.after(() => store.close())
+  const judgment = new LocalJudgment(store)
+  await judgment.decide(event, 'model.task_fit', {
+    privatePrompt: secret, candidates: [{ provider: secret, model: secret, contextWindow: 32_000, supportsText: true, estimatedCost: 0.5 }],
+  }, 0, [0])
+  await judgment.decide(event, 'context.relevance', {
+    candidates: [{ kind: secret, rank: 0, evidenceCount: 3, estimatedBytes: 104, text: secret }],
+  }, 0, [0])
+  await judgment.decide(event, 'task.replan', { status: secret }, secret, [secret], [secret], {
+    planRequestId: secret, delegationReceiptId: secret,
+  })
+  const payloads = store.events('task').map(({ payload }) => payload)
+  assert.equal(JSON.stringify(payloads).includes(secret), false)
+  const model = (payloads[0].features as { candidates: Record<string, unknown>[] }).candidates[0]
+  assert.match(String(model.modelKey), /^sha256:[a-f0-9]{64}$/)
+  assert.equal(model.estimatedCost, 0.5)
+  const memory = (payloads[1].features as { candidates: Record<string, unknown>[] }).candidates[0]
+  assert.deepEqual(memory, { index: 0, rank: 0, evidenceCount: 3, estimatedBytes: 104 })
+  assert.equal(payloads[2].output, 'opaque:0')
 })
 
 test('a slow judge is aborted, bounded in flight, and cannot block future rule decisions', async () => {

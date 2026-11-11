@@ -195,7 +195,7 @@ export class ScopedContext {
     const choices = candidates.length ? candidates.map((_, index) => index) : [-1]
     const first = await this.#judgment.decide(event, 'context.relevance', {
       candidates: candidates.map(({ entry, line }, rank) => ({
-        kind: entry.kind, rank, evidenceCount: entry.sourceRefs.length, estimatedTokens: Buffer.byteLength(line),
+        kind: entry.kind, rank, evidenceCount: entry.sourceRefs.length, estimatedBytes: Buffer.byteLength(line),
       })),
     }, choices[0], choices, candidates.map(({ entry }) => entry.id))
     options.signal?.throwIfAborted()

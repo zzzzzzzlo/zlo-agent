@@ -242,6 +242,7 @@ test('Worker failure records its own attempt, releases resources and prevents ro
     const { task, attempts } = host.getHistory(taskId)
     assert.equal(task.worker?.status, 'failed')
     assert.equal(task.verification?.evidence, 'worker_verification_failed')
+    assert.equal(task.verification?.verdict, 'failed')
     assert.equal(task.status, 'failed')
     assert.equal(attempts.find(({ nodeId }) => nodeId === task.worker?.id)?.status, 'failed')
     assert.deepEqual(await host.command({ schemaVersion: 1, type: 'getRouteStatus' }), { quota: 'unknown', activeReservations: 0 })

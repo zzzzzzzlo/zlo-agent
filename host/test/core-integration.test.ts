@@ -239,13 +239,30 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
     await host.idle()
     const task = host.getTask(taskId)
     assert.equal(task.status, 'succeeded')
+    assert.equal(task.verification?.verdict, 'unverified')
     assert.equal(task.nodes?.length, 4)
     assert.ok(task.nodes?.every(node => node.status === 'succeeded'))
+    assert.ok(task.nodes?.every(node => node.verification?.verdict === (node.check ? 'verified' : 'unverified')))
     assert.equal(await readFile(join(env.workspace, 'src', 'report.txt'), 'utf8'), 'second')
     const events = host.events(taskId)
     const decisions = new Set(events.filter(item => item.type === 'judgment.evaluated').map(item => item.payload.id))
     assert.deepEqual([...decisions].sort(), ['collaboration.mode', 'context.relevance', 'delegation.worth',
       'handoff.sufficiency', 'model.task_fit', 'task.replan'])
+    for (const decision of events.filter(item => item.type === 'judgment.evaluated')) {
+      const { baseline, output, candidates, features, resultLink } = decision.payload
+      assert.ok(Array.isArray(candidates) && candidates.includes(baseline) && candidates.includes(output))
+      assert.ok(features && typeof features === 'object')
+      const link = resultLink as Record<string, unknown>
+      assert.equal(link.taskRunId, task.taskRunId)
+      assert.equal(link.taskAttemptId, decision.taskAttemptId)
+      assert.equal(link.taskNodeId, decision.taskNodeId)
+      if (decision.payload.id === 'collaboration.mode' || decision.payload.id === 'task.replan') {
+        assert.ok(events.some(item => item.type === 'task.plan_changed' && item.correlationId === link.planRequestId))
+      }
+      if (decision.payload.id === 'handoff.sufficiency') {
+        assert.ok(events.some(item => item.type === 'task.node_settled' && item.taskAttemptId === link.taskAttemptId))
+      }
+    }
     const teams = events.filter(item => item.type === 'agent.started' && item.payload.role === 'team')
     assert.equal(teams.length, 2)
     assert.equal(teams[0].agentId, teams[1].agentId)

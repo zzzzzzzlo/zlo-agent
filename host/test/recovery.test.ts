@@ -100,6 +100,7 @@ test('crash recovery honors Stop Intent and resumes the same Session without rep
     assert.equal(resumed.task.status, 'succeeded')
     assert.equal(resumed.task.attemptCount, 2)
     assert.equal(resumed.task.verification?.passed, true)
+    assert.equal(resumed.task.verification?.verdict, 'verified')
     assert.equal(resumed.task.stopIntent, undefined)
     assert.equal(opened.length, 1)
     assert.deepEqual(opened[0]?.session, stopped.session)

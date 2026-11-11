@@ -569,16 +569,20 @@ export class LocalAgentHost {
       this.#engine.beginVerification(task.id)
       const snapshot = this.#engine.get(task.id)
       const operations = this.#engine.operations(task.id)
-      const confirmedWrite = operations.some(item => item.effect === 'write' && item.status === 'succeeded')
+      const confirmedOperation = operations.some(item => item.status === 'succeeded')
       const access = this.#capabilities.root(snapshot.workspaceAccess, Boolean(snapshot.check)).access
       const verification = snapshot.worker?.status === 'failed'
         ? { passed: false, evidence: 'worker_verification_failed' }
         : snapshot.nodes?.some(node => node.status !== 'succeeded')
           ? { passed: false, evidence: 'dag_not_converged' }
-        : task.check
-          ? await verifyWorkspace(this.#engine, this.#extensions.workflow, workspace, result.event, task.check, signal, access, 'verification')
-          : { passed: result.textProduced || confirmedWrite, evidence: confirmedWrite
-            ? 'confirmed_workspace_operation' : result.textProduced ? 'assistant_response_present' : 'assistant_response_missing' }
+        : snapshot.check
+          ? await verifyWorkspace(this.#engine, this.#extensions.workflow, workspace, result.event, snapshot.check, signal, access, 'verification')
+          : {
+            passed: false, verdict: result.textProduced || confirmedOperation ? 'unverified' as const : 'failed' as const,
+            evidence: operations.some(item => item.effect === 'write' && item.status === 'succeeded') ? 'confirmed_workspace_operation'
+              : result.textProduced ? 'assistant_response_present' : confirmedOperation ? 'confirmed_tool_operation'
+                : operations.some(item => item.status === 'failed') ? 'tool_execution_failed' : 'assistant_response_missing',
+          }
       if (signal.aborted || this.#engine.operations(task.id).some(item => item.status === 'unknown_effect' || item.status === 'started')) {
         this.#engine.end(task.id, 'model_interrupted')
         return

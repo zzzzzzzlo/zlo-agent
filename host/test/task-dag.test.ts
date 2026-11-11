@@ -138,7 +138,9 @@ test('Team scopes inherit and only allow read children while same-workspace writ
     'child-write', 'create_text_file', 'write'), /denies writes/)
   assert.equal(settleRead(engine, taskId, child, childAttempt)?.status, 'succeeded')
   engine.finishTool(teamEvent, 'delegate', 'succeeded')
-  assert.equal(engine.settleWorker(taskId, team.id, result)?.verification?.evidence, 'node_verified_children')
+  const completed = engine.settleWorker(taskId, team.id, result)
+  assert.equal(completed?.verification?.evidence, 'node_completed_children')
+  assert.equal(completed?.verification?.verdict, 'unverified')
   assert.deepEqual(engine.runnableNodes(taskId).map(({ id }) => id), [sibling.id])
 })
 

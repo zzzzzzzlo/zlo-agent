@@ -44,6 +44,7 @@ export interface ConversationNode {
   parentNodeId?: string
   role: 'team' | 'worker'
   status: 'running' | 'succeeded' | 'failed' | 'interrupted'
+  verification?: VerificationResult
 }
 
 export interface ConversationTurn {

@@ -4,7 +4,8 @@ import type {
   ConversationSummary, ConversationTool, ConversationTurn, CreateConversationInput, DesktopErrorCode,
   HistoryInput, RenameConversationInput, SendMessageInput, SendMessageResult, SetConversationModelInput, SteerInput, UsageTotals,
 } from '../../shared/contracts/desktop.ts'
-import type { AgentEvent, EndReason, EventDraft, ModelRoute, TaskStatus } from './contracts/domain.ts'
+import { normalizeVerification } from './contracts/domain.ts'
+import type { AgentEvent, EndReason, EventDraft, ModelRoute, TaskStatus, VerificationResult } from './contracts/domain.ts'
 import type { LocalStore } from './store.ts'
 import type { TaskSnapshot } from './task-engine.ts'
 import { parseProjectCommand, workspaceTarget } from './workspace.ts'
@@ -227,7 +228,11 @@ export class ConversationService {
 
   #displayTurn(conversationId: string, turn: ConversationTurn): ConversationTurn {
     const assistant = this.#readAssistant(conversationId, turn)
-    return assistant ? { ...turn, assistant: { ...turn.assistant, text: assistant.text } } : turn
+    return {
+      ...turn,
+      ...(assistant ? { assistant: { ...turn.assistant, text: assistant.text } } : {}),
+      ...(turn.verification ? { verification: normalizeVerification(turn.verification) } : {}),
+    }
   }
 
   #compactAssistant(conversationId: string, turn: ConversationTurn): void {
@@ -529,7 +534,8 @@ export class ConversationService {
       this.#event(conversationId, type, { usage: turn.usage }, source)
     } else if (type === 'verification.finished') {
       const turn = this.#turn(binding)
-      turn.verification = { passed: source.payload.passed === true, evidence: String(source.payload.evidence) }
+      const { passed, evidence, verdict, basis } = source.payload as unknown as VerificationResult
+      turn.verification = normalizeVerification({ passed, evidence, verdict, basis })
       this.#saveTurn(binding, turn)
     } else if (type === 'operation.reconciliation_required') {
       const turn = this.#turn(binding)
@@ -576,11 +582,13 @@ export class ConversationService {
     const index = nodes.findIndex(node => node.id === source.taskNodeId)
     const previous = nodes[index]
     const status = source.payload.status
+    const verification = source.payload.verification as VerificationResult | undefined
     const node: ConversationNode = {
       id: source.taskNodeId,
       parentNodeId: typeof source.payload.parentNodeId === 'string' ? source.payload.parentNodeId : previous?.parentNodeId,
       role: source.payload.role === 'team' ? 'team' : previous?.role ?? 'worker',
       status: source.type === 'task.node_started' ? 'running' : status === 'succeeded' || status === 'failed' ? status : 'interrupted',
+      ...(verification ? { verification: normalizeVerification(verification) } : {}),
     }
     if (index < 0) nodes.push(node)
     else nodes[index] = node
