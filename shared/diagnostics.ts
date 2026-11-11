@@ -27,6 +27,7 @@ const definitions = {
   'host.model_started': ['info', 'host', 'model', 'A model request started.'],
   'host.model_completed': ['info', 'host', 'model', 'A model request completed.'],
   'host.model_failed': ['error', 'host', 'model', 'A model request failed.'],
+  'host.model_output_limit': ['warn', 'host', 'model', 'A model response reached its output token limit.'],
   'host.model_interrupted': ['warn', 'host', 'model', 'A model request was interrupted.'],
   'host.tool_started': ['info', 'host', 'tool', 'A tool invocation started.'],
   'host.tool_completed': ['info', 'host', 'tool', 'A tool invocation completed.'],

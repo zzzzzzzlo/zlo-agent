@@ -1,13 +1,64 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { test } from 'node:test'
+import { fauxAssistantMessage, fauxProvider, fauxThinking, fauxToolCall } from '@earendil-works/pi-ai/providers/faux'
+import { ModelRuntime } from '@earendil-works/pi-coding-agent'
+import { LocalAgentHost } from '../src/host.ts'
 import { fetchProviderCatalog } from '../src/model-management.ts'
 import { PiExecution } from '../src/pi.ts'
 
 const fixtureKey = 'fixture-credential-for-regression'
+
+test('DeepSeek budgets reasoning and tools, keeps thinking in Pi, and reports length as a resumable block', async () => {
+  const route = { provider: 'deepseek', model: 'deepseek-flash' }
+  const root = await mkdtemp(join(tmpdir(), 'zlo-deepseek-output-'))
+  const workspace = join(root, 'workspace')
+  await mkdir(workspace)
+  const provider = fauxProvider({ provider: route.provider, models: [{ id: route.model, reasoning: true, maxTokens: 32_768 }] })
+  const execution = new PiExecution(async () => {
+    const runtime = await ModelRuntime.create({ authPath: join(root, 'auth.json'), modelsPath: null })
+    runtime.registerNativeProvider(provider.provider)
+    return runtime
+  })
+  const budgets: (number | undefined)[] = []
+  const thinking = 'thinking fixture kept inside the Pi transcript'
+  provider.setResponses([
+    (_, options) => {
+      budgets.push(options?.maxTokens)
+      return fauxAssistantMessage([fauxThinking(thinking), fauxToolCall('list_directory', { path: '.' })], { stopReason: 'toolUse' })
+    },
+    (_, options) => {
+      budgets.push(options?.maxTokens)
+      return fauxAssistantMessage(fauxThinking('truncated reasoning fixture'), { stopReason: 'length' })
+    },
+  ])
+  const host = new LocalAgentHost({ directory: join(root, 'state'), execution })
+  try {
+    const conversation = host.createConversation({ requestId: 'create', workspace, route })
+    const { taskId } = await host.sendMessage({ conversationId: conversation.id, requestId: 'message', text: 'Inspect the workspace' })
+    await host.idle()
+    assert.deepEqual(budgets, [16_384, 16_384])
+    const task = host.getHistory(taskId)
+    assert.equal(task.task.status, 'blocked')
+    assert.equal(task.task.reason, 'model_output_limit')
+    assert.deepEqual(task.operations.map(item => [item.tool, item.status]), [['list_directory', 'succeeded']])
+    assert.match(await readFile(task.session!.path, 'utf8'), /thinking fixture kept inside the Pi transcript/u)
+    assert.ok(!JSON.stringify(host.getConversationHistory({ conversationId: conversation.id })).includes(thinking))
+    assert.ok(!JSON.stringify(host.events(taskId)).includes(thinking))
+
+    provider.setResponses([fauxAssistantMessage('Done')])
+    assert.equal(host.resumeConversation({ conversationId: conversation.id, taskId, requestId: 'resume' }).accepted, true)
+    await host.idle()
+    assert.equal(host.getTask(taskId).status, 'succeeded')
+    assert.equal(host.getHistory(taskId).operations.length, 1)
+  } finally {
+    await host.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
 
 test('the authenticated model catalog uses the fixed provider URL and does not follow redirects', async () => {
   const result = await fetchProviderCatalog('google', fixtureKey, AbortSignal.timeout(2_000), async (url, request) => {

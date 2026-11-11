@@ -943,7 +943,7 @@ export class TaskEngine {
         return this.#finish(task, 'stopped', task.stopIntent?.source === 'shutdown' ? 'host_shutdown' : 'user_stop', 'task.stopped')
       }
       if (reason === 'process_interrupted' || reason === 'model_interrupted') return this.#finish(task, 'stopped', reason, 'task.stopped')
-      if (reason === 'model_error') return this.#finish(task, 'blocked', reason)
+      if (reason === 'model_error' || reason === 'model_output_limit') return this.#finish(task, 'blocked', reason)
       return this.#finish(task, 'failed', reason)
     })
   }

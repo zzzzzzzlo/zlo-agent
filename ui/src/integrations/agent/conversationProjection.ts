@@ -34,6 +34,7 @@ const toolStates: Record<ConversationTool['status'], [RunStatus, string]> = {
 const reasons: Partial<Record<EndReason, string>> = {
   process_interrupted: 'Host 上次意外退出。已保留执行记录。',
   model_error: '模型请求失败或路由不可用。',
+  model_output_limit: '模型达到本次输出 Token 上限。你可以点击「恢复执行」继续任务。',
   model_interrupted: '模型调用已中断。',
   runtime_error: 'Agent 运行异常。',
   verification_failed: '任务未通过验收检查。',

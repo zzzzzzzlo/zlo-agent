@@ -300,7 +300,9 @@ export class PiExecution implements AgentExecution {
       }
       if (!canUseProvider(model.provider, model.id, model.maxTokens)) throw modelUnavailable('Provider authorization or model is unavailable')
       // Sign in with ChatGPT omits max_output_tokens. Reserve the documented model maximum.
-      const maxTokens = chatGpt ? model.maxTokens : Math.min(options?.maxTokens ?? model.maxTokens, 4096)
+      // DeepSeek counts reasoning and the answer or tool arguments against the same limit.
+      const outputLimit = model.provider === 'deepseek' && model.reasoning ? 16_384 : 4_096
+      const maxTokens = chatGpt ? model.maxTokens : Math.min(options?.maxTokens ?? model.maxTokens, model.maxTokens, outputLimit)
       reserve(Buffer.byteLength(JSON.stringify(context)), maxTokens, compacting ? 'compaction' : 'prompt')
       writeHostDiagnostic('host.model_started', traceId)
       const requestFailed = () => writeHostDiagnostic(options?.signal?.aborted ? 'host.model_interrupted' : 'host.model_failed', traceId)
@@ -318,7 +320,8 @@ export class PiExecution implements AgentExecution {
               ...(estimate !== undefined && Number.isFinite(estimate) && estimate > 0 ? { estimatedCostUsd: estimate } : {}) })
           }
           writeHostDiagnostic(message.stopReason === 'aborted' ? 'host.model_interrupted'
-            : message.stopReason === 'error' || message.stopReason === 'length' ? 'host.model_failed' : 'host.model_completed', traceId)
+            : message.stopReason === 'length' ? 'host.model_output_limit'
+              : message.stopReason === 'error' ? 'host.model_failed' : 'host.model_completed', traceId)
         }, requestFailed)
         return response
       } catch (error) {
@@ -467,6 +470,7 @@ function asPiTool(tool: ExecutionTool, stopping: () => boolean): ToolDefinition 
 function runResult(message: AssistantMessage | undefined, fromProvider: boolean): ExecutionResult {
   if (!message) return { status: 'runtime_error' }
   if (message.stopReason === 'aborted') return { status: 'interrupted' }
+  if (message.stopReason === 'length' && fromProvider) return { status: 'model_output_limit' }
   if (message.stopReason !== 'stop') return { status: fromProvider ? 'model_error' : 'runtime_error' }
   return { status: 'completed', text: message.content.filter(part => part.type === 'text').map(part => part.text).join('\n') }
 }

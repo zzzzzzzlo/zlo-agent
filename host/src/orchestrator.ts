@@ -41,7 +41,7 @@ export interface OutputEvent {
 
 type Outcome =
   | { status: 'completed'; route: ModelRoute; textProduced: boolean; event: EventDraft }
-  | { status: 'interrupted' | 'model_error' | 'runtime_error' | 'checkpoint_error' | 'budget_exhausted' }
+  | { status: 'interrupted' | 'model_error' | 'model_output_limit' | 'runtime_error' | 'checkpoint_error' | 'budget_exhausted' }
 
 const MAX_TURNS = 16
 const WORKER_DEADLINE_MS = 60000

@@ -46,7 +46,7 @@ export interface ExecutionConfig {
 
 export type ExecutionResult =
   | { status: 'completed'; text: string }
-  | { status: 'interrupted' | 'model_error' | 'runtime_error' }
+  | { status: 'interrupted' | 'model_error' | 'model_output_limit' | 'runtime_error' }
 
 export interface ExecutionSession {
   readonly ref: SessionRef
