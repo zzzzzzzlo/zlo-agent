@@ -112,6 +112,14 @@ function safePayload(type: string, p: Record<string, unknown>): Record<string, u
       parentAgentId: ref(p.parentAgentId), lifecycle: oneOf(p.lifecycle, states), evidenceCount: num(p.evidenceCount) }
     case 'model.request_started': return {}
     case 'model.output_recovery': return { trigger: oneOf(p.trigger, ['automatic', 'resume']) }
+    case 'visual.draft_ready': case 'visual.preview_started': case 'visual.preview_finished': case 'visual.frames_sent':
+    case 'visual.round_finished': case 'visual.loop_finished': return {
+      mode: oneOf(p.mode, ['quick', 'high_quality']), round: num(p.round), elapsedMs: num(p.elapsedMs),
+      renderMs: num(p.renderMs), rendered: bool(p.rendered), renderedPreviews: num(p.renderedPreviews), frames: num(p.frames),
+      framesSent: num(p.framesSent), samples: num(p.samples), runtimeErrors: num(p.runtimeErrors),
+      estimatedImageTokens: num(p.estimatedImageTokens), tokens: num(p.tokens), usageSamples: num(p.usageSamples),
+      requests: num(p.requests), usageComplete: bool(p.usageComplete), modified: bool(p.modified), editedAfterLastRender: bool(p.editedAfterLastRender),
+    }
     case 'model.route_changed': case 'model.switch_requested': return { route: route(p.route) }
     case 'model.reserved': case 'model.reservation_settled': return { status, route: route(p.route), kind: oneOf(p.kind, ['prompt', 'compaction']),
       estimatedTokens: num(p.estimatedTokens), actualTokens: num(p.actualTokens), estimatedCostUsd: num(p.estimatedCostUsd),

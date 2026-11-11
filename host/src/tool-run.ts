@@ -2,6 +2,7 @@ import { basename } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { EventDraft } from './contracts/domain.ts'
 import type { ExecutionTool } from './execution.ts'
+import { toolImages } from './execution.ts'
 import type { TaskEngine, ToolFailureReason } from './task-engine.ts'
 import type { ToolApprovalBroker } from './tool-approval.ts'
 import { workspaceTarget } from './workspace.ts'
@@ -16,7 +17,9 @@ function redactResult(value: unknown, depth = 0): unknown {
   if (!value || typeof value !== 'object') return value
   if (depth > 12) return undefined
   if (Array.isArray(value)) return value.map(item => redactResult(item, depth + 1))
-  return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactResult(item, depth + 1)]))
+  const result = Object.fromEntries(Object.entries(value).map(([key, item]) => [key, redactResult(item, depth + 1)]))
+  if (depth === 0 && toolImages in value && value[toolImages]) return { ...result, [toolImages]: value[toolImages] }
+  return result
 }
 
 export class ToolRun {

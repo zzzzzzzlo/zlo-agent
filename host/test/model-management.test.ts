@@ -17,7 +17,7 @@ test('DeepSeek recovers once, retains completed tool history, and resumes a pers
   const root = await mkdtemp(join(tmpdir(), 'zlo-deepseek-output-'))
   const workspace = join(root, 'workspace')
   await mkdir(workspace)
-  const provider = fauxProvider({ provider: route.provider, models: [{ id: route.model, reasoning: true, maxTokens: 32_768 }] })
+  const provider = fauxProvider({ provider: route.provider, models: [{ id: route.model, input: ['text'], reasoning: true, maxTokens: 32_768 }] })
   const execution = new PiExecution(async () => {
     const runtime = await ModelRuntime.create({ authPath: join(root, 'auth.json'), modelsPath: null })
     runtime.registerNativeProvider(provider.provider)

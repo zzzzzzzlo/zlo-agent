@@ -1,6 +1,11 @@
 import type { ModelRoute, SessionRef } from './contracts/domain.ts'
 export type { ModelRoute, SessionRef } from './contracts/domain.ts'
 
+/** Only trusted Host tools can attach images. JSON input and ordinary tool output cannot set this symbol. */
+export const toolImages = Symbol('toolImages')
+export interface ToolImage { bytes: Buffer; width: number; height: number }
+export const previewImageLimits = { count: 3, bytes: 160 * 1024, width: 1280, height: 900, estimatedTokens: 2048 } as const
+
 export interface ExecutionTool {
   name: string
   description: string
@@ -16,6 +21,7 @@ export type RuntimeEvent =
   | { type: 'model.usage'; input: number; output: number; cacheRead: number; cacheWrite: number; estimatedCostUsd?: number }
   | { type: 'model.route_changed'; route: ModelRoute }
   | { type: 'context.compacted'; tokensBefore: number; estimatedTokensAfter?: number }
+  | { type: 'visual.frames_sent'; frames: number; estimatedImageTokens: number }
 
 export interface ModelCandidate {
   route: ModelRoute
@@ -41,6 +47,7 @@ export interface ExecutionConfig {
   route?: ModelRoute
   tools: ExecutionTool[]
   systemPrompt: string
+  visualFeedback?(): { quick: boolean; final: boolean; maxOutputTokens?: number } | undefined
   resumeAfterOutputLimit?: boolean
   canRecoverModelOutput?(): boolean
   reserveRequest?(request: ModelRequest): void
@@ -54,6 +61,7 @@ export type ExecutionResult =
 export interface ExecutionSession {
   readonly ref: SessionRef
   readonly route: ModelRoute
+  readonly supportsVisualInput?: boolean
   run(prompt: string): Promise<ExecutionResult>
   steer(text: string, instructionId?: string): Promise<void>
   requestStop(): Promise<void>

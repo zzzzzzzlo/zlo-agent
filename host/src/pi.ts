@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import { writeHostDiagnostic } from '../../shared/diagnostics.ts'
 import { mkdir, open, readFile, realpath } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
-import { InMemoryCredentialStore, type AssistantMessage } from '@earendil-works/pi-ai'
+import { InMemoryCredentialStore, type AssistantMessage, type ImageContent } from '@earendil-works/pi-ai'
 import {
   createAgentSession,
   createExtensionRuntime,
@@ -13,8 +13,8 @@ import {
   type ResourceLoader,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent'
-import { ModelUnavailableError } from './execution.ts'
-import type { AgentExecution, ExecutionConfig, ExecutionResult, ExecutionSession, ExecutionTool, ModelCandidate, ModelRoute, RuntimeEvent, SessionRef } from './execution.ts'
+import { ModelUnavailableError, previewImageLimits, toolImages } from './execution.ts'
+import type { AgentExecution, ExecutionConfig, ExecutionResult, ExecutionSession, ExecutionTool, ModelCandidate, ModelRoute, RuntimeEvent, SessionRef, ToolImage } from './execution.ts'
 import { fetchProviderCatalog, isProviderId, managedProviderIds, providerName, validProviderKey } from './model-management.ts'
 import type { ProviderCatalog } from './model-management.ts'
 import type { ManagedModel, ManagedProvider, ProviderId } from '../../shared/contracts/management.ts'
@@ -257,7 +257,9 @@ export class PiExecution implements AgentExecution {
     const chatGpt = !!config.route && isChatGptProvider(config.route.provider)
     const route = { provider: chatGpt ? config.route!.provider : model.provider, model: model.id }
     let stopping = false
-    const customTools = config.tools.map(tool => asPiTool(tool, () => stopping))
+    const pendingImages = new Map<string, ToolImage[]>()
+    const vision = model.input.includes('image')
+    const customTools = config.tools.map(tool => asPiTool(tool, () => stopping, vision, pendingImages))
     const { session } = await createAgentSession({
       cwd,
       modelRuntime,
@@ -281,6 +283,8 @@ export class PiExecution implements AgentExecution {
     let compacting = false
     let recoveringOutput = false
     let outputRecoveryUsed = false
+    let lastProviderInput = 0
+    let lastRequestHadFrames = false
     const deepSeekThinking = model.provider === 'deepseek' && model.reasoning
     const previousAssistant = session.messages.findLast(message => message.role === 'assistant') as AssistantMessage | undefined
     const resumeOutputRecovery = deepSeekThinking && config.resumeAfterOutputLimit &&
@@ -309,18 +313,40 @@ export class PiExecution implements AgentExecution {
       if (!canUseProvider(model.provider, model.id, model.maxTokens)) throw modelUnavailable('Provider authorization or model is unavailable')
       // Sign in with ChatGPT omits max_output_tokens. Reserve the documented model maximum.
       // DeepSeek counts reasoning and the answer or tool arguments against the same limit.
-      const outputLimit = deepSeekThinking ? 16_384 : 4_096
+      const visual = vision ? config.visualFeedback?.() : undefined
+      const outputLimit = Math.min(deepSeekThinking ? 16_384 : 4_096, visual?.maxOutputTokens ?? Infinity)
       const maxTokens = chatGpt ? model.maxTokens : Math.min(options?.maxTokens ?? model.maxTokens, model.maxTokens, outputLimit)
       // Keep valid reasoning/tool pairs. An exhausted thinking-only turn has no result to replay.
-      const requestContext = deepSeekThinking
+      const textContext = deepSeekThinking
         ? { ...context, messages: context.messages.filter(message => message.role !== 'assistant' || !isThinkingOnlyTruncation(message)) }
         : context
-      reserve(Buffer.byteLength(JSON.stringify(requestContext)), maxTokens, compacting ? 'compaction' : 'prompt')
+      let frames = 0
+      let requestContext = textContext
+      if (!compacting && pendingImages.size) {
+        if (model.input.includes('image')) requestContext = { ...textContext, messages: textContext.messages.map(message => {
+          if (message.role !== 'toolResult') return message
+          const images = pendingImages.get(message.toolCallId)
+          if (!images) return message
+          pendingImages.delete(message.toolCallId)
+          frames += images.length
+          const content: ImageContent[] = images.map(({ bytes }) => ({ type: 'image', mimeType: 'image/jpeg', data: bytes.toString('base64') }))
+          return { ...message, content: [...message.content, ...content] }
+        }) }
+        // Pixels belong to the immediate next request. Pi's durable transcript retains only metadata.
+        pendingImages.clear()
+      }
+      const estimatedImageTokens = frames * previewImageLimits.estimatedTokens
+      const textBytes = Buffer.byteLength(JSON.stringify(textContext))
+      // Calibrate on the latest provider input and leave margin for source code and tool schemas.
+      const estimatedText = visual ? Math.max(lastProviderInput, Math.ceil(textBytes / 3) + 512) : textBytes
+      reserve(estimatedText + estimatedImageTokens, maxTokens, compacting ? 'compaction' : 'prompt')
+      lastRequestHadFrames = frames > 0
+      if (frames) emit({ type: 'visual.frames_sent', frames, estimatedImageTokens })
       writeHostDiagnostic('host.model_started', traceId)
       const requestFailed = () => writeHostDiagnostic(options?.signal?.aborted ? 'host.model_interrupted' : 'host.model_failed', traceId)
       try {
         const response = await stream(model, requestContext, { ...options, maxTokens,
-          ...(deepSeekThinking && recoveringOutput ? { reasoning: undefined }
+          ...(deepSeekThinking && (recoveringOutput || (frames > 0 && (visual?.quick || visual?.final))) ? { reasoning: undefined }
             : deepSeekThinking && model.id === 'deepseek-flash' ? { reasoning: 'low' as const } : {}),
           ...(chatGpt ? { apiKey: this.chatGptSession?.accessToken, cacheRetention: 'none' as const,
             onPayload: chatGptResponsesPayload, fetch: chatGptFetch } : {}) })
@@ -328,6 +354,7 @@ export class PiExecution implements AgentExecution {
         void response.result().then((message) => {
           providerMessages.add(message)
           const { input, output, cacheRead, cacheWrite, cost } = message.usage
+          if (input || cacheRead || cacheWrite) lastProviderInput = input + cacheRead + cacheWrite
           if (input || output || cacheRead || cacheWrite || !['aborted', 'error'].includes(message.stopReason)) {
             const estimate = chatGpt ? undefined : cost?.total
             emit({ type: 'model.usage', input, output, cacheRead, cacheWrite,
@@ -389,7 +416,7 @@ export class PiExecution implements AgentExecution {
       throw error
     }
     return {
-      ref, route,
+      ref, route, supportsVisualInput: vision,
       async run(prompt) {
         if (disposed || active) throw new Error('Pi session is unavailable for a new run')
         if (stopping) return { status: 'interrupted' }
@@ -417,7 +444,8 @@ export class PiExecution implements AgentExecution {
               emit({ type: 'model.output_recovery', trigger: 'automatic' })
               lastAssistant = undefined
               await session.prompt(
-                'Continue the current task from the recorded tool results. Avoid repeating confirmed operations. Take the next concrete step or give the concise final answer.',
+                'Continue the current task from the recorded tool results. Avoid repeating confirmed operations. Take the next concrete step or give the concise final answer.' +
+                (lastRequestHadFrames ? ' Earlier preview images are unavailable in this request. Use a fresh preview if needed and within budget, or report that visual verification is incomplete.' : ''),
                 { expandPromptTemplates: false },
               )
             }
@@ -425,6 +453,7 @@ export class PiExecution implements AgentExecution {
             return { status: stopping ? 'interrupted' : 'runtime_error' }
           } finally {
             recoveringOutput = false
+            pendingImages.clear()
           }
           if (stopping) return { status: 'interrupted' }
           return runResult(lastAssistant, lastAssistant !== undefined && providerMessages.has(lastAssistant))
@@ -478,7 +507,7 @@ function explicitResources(systemPrompt: string): ResourceLoader {
   }
 }
 
-function asPiTool(tool: ExecutionTool, stopping: () => boolean): ToolDefinition {
+function asPiTool(tool: ExecutionTool, stopping: () => boolean, vision: boolean, pending: Map<string, ToolImage[]>): ToolDefinition {
   if (!/^[a-zA-Z0-9_-]+$/.test(tool.name)) throw new Error('Invalid Pi tool name')
   return {
     name: tool.name,
@@ -490,10 +519,25 @@ function asPiTool(tool: ExecutionTool, stopping: () => boolean): ToolDefinition 
     async execute(id, args, signal) {
       if (stopping()) throw new Error('Run is stopping')
       signal?.throwIfAborted()
-      const result = await tool.execute(id, args, signal)
+      let result = await tool.execute(id, args, signal)
+      if (result && typeof result === 'object' && toolImages in result) {
+        const { [toolImages]: images, ...metadata } = result
+        const available = previewImageLimits.count - [...pending.values()].reduce((total, frames) => total + frames.length, 0)
+        const accepted = vision && Array.isArray(images) ? (images as ToolImage[]).filter(validToolImage).slice(0, available) : []
+        if (accepted.length) pending.set(id, accepted)
+        result = { ...metadata, visualInput: !vision ? 'unavailable_on_selected_model' : accepted.length ? 'attached_for_next_request' : 'no_frames_available',
+          attachedFrames: accepted.length }
+      }
       return { content: [{ type: 'text', text: JSON.stringify(result) ?? 'null' }], details: undefined }
     },
   }
+}
+
+function validToolImage(image: ToolImage): boolean {
+  return Boolean(image) && Buffer.isBuffer(image.bytes) && image.bytes.length > 4 && image.bytes.length <= previewImageLimits.bytes &&
+    image.bytes[0] === 0xff && image.bytes[1] === 0xd8 && image.bytes[2] === 0xff &&
+    image.bytes.at(-2) === 0xff && image.bytes.at(-1) === 0xd9 && Number.isSafeInteger(image.width) && Number.isSafeInteger(image.height) &&
+    image.width >= 1 && image.width <= previewImageLimits.width && image.height >= 1 && image.height <= previewImageLimits.height
 }
 
 function runResult(message: AssistantMessage | undefined, fromProvider: boolean): ExecutionResult {

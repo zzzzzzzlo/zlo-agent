@@ -5,6 +5,7 @@ import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import type { AgentExecution } from './execution.ts'
 import { createArtifactTools } from './artifact-tools.ts'
 import { createBrowserTools } from './browser-tools.ts'
+import { createPreviewTools } from './preview-tools.ts'
 import { createFileTools } from './file-tools.ts'
 import { createGitTools, ManagedGitWorktrees } from './git-tools.ts'
 import { createProcessTools } from './process-tools.ts'
@@ -141,6 +142,7 @@ export class LocalAgentHost {
           ? new BraveSearch(key) : new HackerNewsSearch(publicWeb) })
       } },
       { id: 'browser', tools: workspace => createBrowserTools(workspace) },
+      { id: 'preview', tools: workspace => createPreviewTools(workspace) },
     ])).resolve(options.profileId ?? 'coding')
     this.#profile = { ...(options.profile ?? this.#extensions.profile) }
     this.#capabilities = new CodingCapabilities(this.#profile, name => this.#toolEnabled(name))

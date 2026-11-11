@@ -1,12 +1,12 @@
 import { randomUUID } from 'node:crypto'
 import { open } from 'node:fs/promises'
-import { createServer } from 'node:net'
 import type { Server } from 'node:net'
 import { parse, serialize } from 'parse5'
 import type { Browser, Locator, Page } from 'playwright-core'
 import type { CodingWorkspace, ToolInvocationContext, WorkspaceTool } from './workspace.ts'
 import { cleanWebText, publicWeb, publicWebUrl, sensitiveWebInput, webSourceUrl } from './web-tools.ts'
 import type { WebClient } from './web-tools.ts'
+import { closeDenyProxy, launchIsolatedBrowser } from './browser-runtime.ts'
 
 const pageTimeout = 5500
 const maxRequests = 48
@@ -37,15 +37,6 @@ interface BrowserRun {
   close?: Promise<void>
 }
 
-function browserEnvironment(): Record<string, string> {
-  const env: Record<string, string> = {}
-  for (const name of ['PATH', 'SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'TMPDIR', 'LOCALAPPDATA', 'PROGRAMFILES', 'PROGRAMFILES(X86)', 'LANG']) {
-    const value = process.env[name]
-    if (value) env[name] = value
-  }
-  return env
-}
-
 function staticMarkup(html: string): string {
   const document = parse(html)
   type Container = typeof document | (typeof document.childNodes)[number]
@@ -62,19 +53,6 @@ function staticMarkup(html: string): string {
     }
   }
   return serialize(document)
-}
-
-async function denyProxy(): Promise<Server> {
-  const server = createServer(socket => socket.destroy())
-  await new Promise<void>((resolve, reject) => {
-    server.once('error', reject)
-    server.listen(0, '127.0.0.1', resolve)
-  })
-  return server
-}
-
-function closeServer(server: Server): Promise<void> {
-  return new Promise(resolve => server.close(() => resolve()))
 }
 
 function owner(context?: ToolInvocationContext): string | undefined {
@@ -101,7 +79,7 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
     active.close ??= (async () => {
       active.abort.abort()
       try { await active.browser.close() } finally {
-        await closeServer(active.proxy)
+        await closeDenyProxy(active.proxy)
         if (run === active) run = undefined
       }
     })()
@@ -109,26 +87,9 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
   }
 
   async function launch(url: URL, context: ToolInvocationContext, signal?: AbortSignal): Promise<BrowserRun> {
-    const proxy = await denyProxy()
-    let browser: Browser | undefined
+    const { browser, proxy } = await launchIsolatedBrowser(pageTimeout, signal)
     const abort = new AbortController()
     try {
-      signal?.throwIfAborted()
-      const address = proxy.address()
-      if (!address || typeof address === 'string') throw new Error('Could not start browser relay')
-      const { chromium } = await import('playwright-core')
-      browser = await chromium.launch({
-        channel: process.platform === 'win32' ? 'msedge' : undefined,
-        chromiumSandbox: true,
-        headless: true,
-        timeout: pageTimeout,
-        env: browserEnvironment(),
-        proxy: { server: 'http://127.0.0.1:' + address.port, bypass: '<-loopback>' },
-        args: ['--disable-quic', '--disable-sync', '--disable-background-networking',
-          '--host-resolver-rules=MAP * ~NOTFOUND, EXCLUDE 127.0.0.1',
-          '--force-webrtc-ip-handling-policy=disable_non_proxied_udp'],
-      })
-      signal?.throwIfAborted()
       const browserContext = await browser.newContext({
         javaScriptEnabled: false,
         serviceWorkers: 'block',
@@ -205,7 +166,7 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
       return active
     } catch (cause) {
       abort.abort()
-      try { await browser?.close() } finally { await closeServer(proxy) }
+      try { await browser.close() } finally { await closeDenyProxy(proxy) }
       throw cause
     }
   }

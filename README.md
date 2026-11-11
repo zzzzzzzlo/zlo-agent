@@ -29,6 +29,7 @@ Zlo Agent 是基于 Pi 的本地优先通用 Agent，首个场景为 Windows Cod
 | `docs/22-desktop-0.5.0-verification.md` | 0.5.0 验收结果与剩余限制 |
 | `docs/23-observatory.md` | 独立中台启动、指标定义和评估边界 |
 | `docs/24-observatory-verification.md` | 中台验收、测试和已知范围 |
+| `docs/25-visual-development.md` | 本地页面预览、视觉反馈与运行预算 |
 | `diagrams/system.mmd` | 可渲染的 Mermaid 系统架构图 |
 | `diagrams/runtime-sequence.mmd` | 可渲染的运行与停止流程图 |
 

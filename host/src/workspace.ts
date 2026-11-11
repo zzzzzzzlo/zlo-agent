@@ -155,6 +155,10 @@ export class CodingWorkspace implements Verifier {
     return this.#read(segments(value), signal)
   }
 
+  async readPreviewAsset(value: unknown, signal?: AbortSignal): Promise<Buffer> {
+    return (await this.#readBytes(segments(value), 512 * 1024, signal)).bytes
+  }
+
   async gitDiffSnapshot(value: unknown, staged: boolean, signal?: AbortSignal) {
     const parts = segments(value)
     await this.#checkedPath(parts, false)
@@ -398,8 +402,16 @@ export class CodingWorkspace implements Verifier {
   }
 
   async #read(parts: string[], signal?: AbortSignal): Promise<{ path: string; text: string; stat: Stats }> {
+    const { path, bytes, stat } = await this.#readBytes(parts, maxBytes, signal)
+    try {
+      const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes)
+      return { path, text: textValue(text), stat }
+    } catch { throw new WorkspaceDenied('Could not read a stable UTF-8 workspace file') }
+  }
+
+  async #readBytes(parts: string[], limit: number, signal?: AbortSignal): Promise<{ path: string; bytes: Buffer; stat: Stats }> {
     const { path, stat } = await this.#checkedPath(parts, false)
-    if (stat.size > maxBytes) throw new WorkspaceDenied('Workspace file exceeds 128 KiB')
+    if (stat.size > limit) throw new WorkspaceDenied('Workspace file exceeds the size limit')
     signal?.throwIfAborted()
     try {
       const file = await open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0))
@@ -417,14 +429,13 @@ export class CodingWorkspace implements Verifier {
         if (count !== opened.size || !unchangedFile(opened, await file.stat())) {
           throw new WorkspaceDenied('Workspace file changed')
         }
-        const text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(buffer.subarray(0, count))
-        return { path, text: textValue(text), stat: opened }
+        return { path, bytes: buffer.subarray(0, count), stat: opened }
       } finally {
         await file.close()
       }
     } catch (error) {
       if (error instanceof WorkspaceDenied) throw error
-      throw new WorkspaceDenied('Could not read a stable UTF-8 workspace file')
+      throw new WorkspaceDenied('Could not read a stable workspace file')
     }
   }
 

@@ -14,6 +14,7 @@ import type { NodeProposal, TaskEngine, TaskSnapshot, WorkerNode, WorkerResult }
 import type { ToolApprovalBroker } from './tool-approval.ts'
 import { ToolRun } from './tool-run.ts'
 import { verifyWorkspace } from './verification.ts'
+import { VisualWorkflow } from './visual-workflow.ts'
 import { workspaceTarget } from './workspace.ts'
 import type { CodingWorkspace } from './workspace.ts'
 
@@ -440,6 +441,8 @@ export class MultiAgentOrchestrator {
     let prompted = new Set<string>()
     let outcome: Outcome = { status: 'runtime_error' }
     const rootScope = this.#capabilities.root(task.workspaceAccess, Boolean(task.check))
+    const visual = new VisualWorkflow(task.goal, this.#db.eventsOfTypes(task.id, ['visual.preview_started', 'visual.draft_ready', 'model.reserved', 'model.reservation_settled']),
+      (type, payload) => this.#db.transaction(() => { this.#db.append({ ...event, type, payload }) }), () => budget.abort())
     const hasUnknownWrite = () => this.#tasks.blocksToolWork(task.id)
     const dispatchAllowed = (toolSignal?: AbortSignal) =>
       this.#profile.delegation && !signal.aborted && !toolSignal?.aborted && !workspaceActive && !workerActive && !hasUnknownWrite()
@@ -483,7 +486,7 @@ export class MultiAgentOrchestrator {
       return [latest.worker, ...(latest.nodes ?? [])].filter((node): node is WorkerNode => Boolean(node && completed.has(node.id)))
     }
     const tools: ExecutionTool[] = this.#extensions.tools(workspace, 'root', rootScope.access)
-      .filter(tool => this.#capabilities.describe(rootScope, tool))
+      .filter(tool => (tool.name !== 'preview_page' || visual.mode !== undefined) && this.#capabilities.describe(rootScope, tool))
       .map(tool => {
         const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input =>
           !workerActive && !this.#tasks.blocksToolWork(task.id, tool.policy?.whileActive ? event.agentRunId : undefined) &&
@@ -493,7 +496,19 @@ export class MultiAgentOrchestrator {
           execute: async (id, input, toolSignal) => {
             if (workspaceActive) return { ok: false, error: 'Another workspace tool is active' }
             workspaceActive = true
-            try { return await wrapped.execute(id, input, toolSignal) } finally { workspaceActive = false }
+            try {
+              const preview = tool.name === 'preview_page'
+              if (preview) {
+                const denied = visual.beginPreview(input)
+                if (denied) return { ok: false, error: denied }
+              } else if (!visual.acceptsEdit(tool.name, input)) {
+                return { ok: false, error: 'Visual revision budget exhausted. Report any remaining issues from the final preview.' }
+              }
+              const result = await wrapped.execute(id, input, toolSignal)
+              if (preview) visual.previewResult(input, result)
+              else visual.recordEdit(tool.name, input, result)
+              return result
+            } finally { workspaceActive = false }
           },
         }
       })
@@ -593,13 +608,18 @@ export class MultiAgentOrchestrator {
     const config = (route: ModelRoute | undefined, ref?: SessionRef): ExecutionConfig => ({
       cwd: workspace.root, role: 'root', correlationId: event.agentRunId,
       sessionDirectory: join(this.#sessions, agentKey), session: ref, route, tools,
-      systemPrompt: this.#extensions.workflow.systemPrompt('root', rootScope.access, task.check),
+      systemPrompt: this.#extensions.workflow.systemPrompt('root', rootScope.access, task.check) +
+        (tools.some(tool => tool.name === 'preview_page') ? visual.instructions() : ''),
+      visualFeedback: () => visual.feedback(),
       resumeAfterOutputLimit: saved?.taskId === task.id && previousAttempt?.reason === 'model_output_limit',
       canRecoverModelOutput: () => !signal.aborted && !hasUnknownWrite(),
       reserveRequest: (request) => {
         signal.throwIfAborted()
         if (this.#tasks.blocksToolWork(task.id, event.agentRunId)) throw new Error('Unconfirmed workspace operation')
-        try { lease!.request(request) } catch (error) {
+        try {
+          if (!visual.reserve(request)) throw new ModelBudgetError('Visual feedback token budget exhausted')
+          lease!.request(request)
+        } catch (error) {
           if (error instanceof ModelBudgetError) budget.abort()
           throw error
         }
@@ -611,6 +631,7 @@ export class MultiAgentOrchestrator {
           textProduced ||= Boolean(runtime.delta.trim())
         }
         try {
+          visual.observe(runtime)
           const reservationId = runtime.type === 'model.usage' ? lease!.usage(runtime) : undefined
           this.#emit(reservationId ? { ...event, correlationId: reservationId } : event, runtime, 'root')
         } catch {
@@ -703,6 +724,7 @@ export class MultiAgentOrchestrator {
         let nextPrompt = saved?.taskId === task.id
           ? 'Resume the task using the saved conversation. Recheck current workspace state before new edits and avoid repeating confirmed changes.\n\nOriginal task goal: ' + task.goal
           : task.goal
+        let requestedVisualFollowUp = false
         for (let turn = 0; turn < MAX_TURNS && !signal.aborted; turn++) {
           const current = this.#tasks.get(task.id)
           if (current.route && !sameRoute(current.route, session.route)) {
@@ -772,6 +794,13 @@ export class MultiAgentOrchestrator {
           const more = after.instructions.some((item) => !item.delivered) || this.#tasks.runnableNodes(task.id).length > 0 ||
             (!conversationId && after.route && !sameRoute(after.route, session.route))
           if (!more || hasUnknownWrite()) {
+            const followUp = !more && !hasUnknownWrite() && !requestedVisualFollowUp && session.supportsVisualInput &&
+              tools.some(tool => tool.name === 'preview_page') && visual.followUp()
+            if (followUp) {
+              requestedVisualFollowUp = true
+              nextPrompt = followUp
+              continue
+            }
             outcome = { status: 'completed', route: session.route, textProduced, event }
             break
           }
@@ -789,6 +818,7 @@ export class MultiAgentOrchestrator {
         checkpointFailed = true
       } finally {
         try { await toolRun.close() } catch { checkpointFailed = true }
+        try { visual.finish() } catch { /* A telemetry write cannot change the execution result. */ }
         unlockRoute()
         clearTimeout(deadline)
         lease?.release()
