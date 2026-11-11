@@ -2,7 +2,7 @@ import { basename } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { EventDraft } from './contracts/domain.ts'
 import type { ExecutionTool } from './execution.ts'
-import type { TaskEngine } from './task-engine.ts'
+import type { TaskEngine, ToolFailureReason } from './task-engine.ts'
 import type { ToolApprovalBroker } from './tool-approval.ts'
 import { workspaceTarget } from './workspace.ts'
 import type { CodingWorkspace, DeferredToolOperation, WorkspaceTool } from './workspace.ts'
@@ -39,21 +39,26 @@ export class ToolRun {
         let input: unknown
         try { input = structuredClone(raw) } catch { return unavailable }
         const combined = toolSignal ? AbortSignal.any([signal, toolSignal]) : signal
-        if (this.#closed || combined.aborted || !authorize(input)) return unavailable
+        if (this.#closed || combined.aborted) return unavailable
         const ref = event()
+        const deny = (reason: 'policy' | 'approval_safety') => {
+          try { this.#tasks.auditToolDenial(ref, tool.name, tool.effect, reason) } catch { /* A diagnostic cannot change a denial. */ }
+        }
+        if (!authorize(input)) { deny('policy'); return unavailable }
         const operationId = ref.agentRunId + ':' + callId
         const target = workspaceTarget(input)
         let destination: string | undefined
         if (tool.policy?.approval) {
           const detail = JSON.stringify(input) ?? 'null'
           if (detail.length > 8_000 || redactProcessOutput(detail) !== detail || /[\u202a-\u202e\u2066-\u2069]/u.test(detail)) {
+            deny('approval_safety')
             return { ok: false, error: 'The operation cannot be safely displayed for approval' }
           }
           const approval = await this.#approval.request({
             kind: tool.policy.approval, tool: tool.name, detail, workspace: workspace.root,
             ...(tool.policy.approval === 'export' && target ? { suggestedName: basename(target) } : {}),
           }, combined)
-          this.#tasks.auditToolApproval(ref, operationId, tool.name, approval.approved && !combined.aborted)
+          this.#tasks.auditToolApproval(ref, operationId, tool.name, approval.approved && !combined.aborted, tool.policy.approval)
           if (!approval.approved || this.#closed || combined.aborted || !authorize(input)) {
             return { ok: false, error: 'Operation was not authorized' }
           }
@@ -85,11 +90,17 @@ export class ToolRun {
             },
           })
         } catch {
-          if (!deferred) this.#finish(ref, operationId, tool.effect === 'write' ? 'unknown_effect' : 'failed')
+          if (!deferred) this.#finish(ref, operationId, tool.effect === 'write' ? 'unknown_effect' : 'failed',
+            combined.aborted ? 'tool_cancelled' : 'tool_exception')
           return { ok: false, error: tool.effect === 'write' ? 'Write result requires reconciliation' : 'Tool failed' }
         }
         const successful = Boolean(result && typeof result === 'object' && 'ok' in result && result.ok === true)
-        if (!deferred) this.#finish(ref, operationId, successful ? 'succeeded' : 'failed')
+        if (!deferred) {
+          const reason = successful ? undefined : combined.aborted ? 'tool_cancelled'
+            : result && typeof result === 'object' && 'exitCode' in result && typeof result.exitCode === 'number' && result.exitCode !== 0
+              ? 'nonzero_exit' : 'tool_result_failed'
+          this.#finish(ref, operationId, successful ? 'succeeded' : 'failed', reason)
+        }
         if (!deferred && successful) {
           evidence?.add(operationId)
           if (target && (tool.name === 'read_text_file' || tool.effect === 'write')) artifacts?.add(target)
@@ -99,9 +110,9 @@ export class ToolRun {
     }
   }
 
-  #finish(event: EventDraft, id: string, status: 'succeeded' | 'failed' | 'unknown_effect') {
+  #finish(event: EventDraft, id: string, status: 'succeeded' | 'failed' | 'unknown_effect', reason?: ToolFailureReason) {
     if (this.#tasks.operations(event.taskId).some(operation => operation.id === id && operation.status === 'started')) {
-      this.#tasks.finishTool(event, id, status)
+      this.#tasks.finishTool(event, id, status, reason)
     }
   }
 

@@ -166,9 +166,9 @@ export class LocalStore {
     this.#projectors.add(project);
   }
 
-  events(taskId: string, after = 0): AgentEvent[] {
+  events(taskId: string, after = 0, limit = -1): AgentEvent[] {
     validateCursor(after);
-    return this.#readEvents(taskId, after, -1);
+    return this.#readEvents(taskId, after, limit);
   }
 
   eventsOfTypes(taskId: string, types: readonly string[]): AgentEvent[] {

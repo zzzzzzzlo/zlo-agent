@@ -37,6 +37,7 @@ import { isStopping, TaskEngine } from './task-engine.ts'
 import type { CreateTask, NodeProposal, NodeReplan, TaskSnapshot } from './task-engine.ts'
 import { ToolApprovalBroker } from './tool-approval.ts'
 import type { ToolApprover } from './tool-approval.ts'
+import { telemetryTask } from './telemetry-projection.ts'
 import { verifyWorkspace } from './verification.ts'
 import { CodingWorkspace } from './workspace.ts'
 
@@ -229,9 +230,19 @@ export class LocalAgentHost {
     }
   }
 
-  events(taskId: string, after = 0): AgentEvent[] {
+  events(taskId: string, after = 0, limit?: number): AgentEvent[] {
     this.getTask(taskId)
-    return this.#store.events(taskId, after)
+    return this.#store.events(taskId, after, limit)
+  }
+
+  telemetryHeads(before: string | null, limit: number) {
+    this.#assertOpen()
+    return this.#engine.listPage(before, limit).map(task => ({ id: task.id, cursor: this.#store.eventCursor(task.id) }))
+  }
+
+  telemetrySnapshot(taskId: string) {
+    const task = this.getTask(taskId)
+    return telemetryTask(task, this.#store.eventCursor(taskId), this.#engine.attempts(taskId))
   }
 
   subscribe(taskId: string, after: number, sink: (event: AgentEvent) => void | Promise<void>): () => void {

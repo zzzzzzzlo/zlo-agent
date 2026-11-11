@@ -23,7 +23,7 @@ export interface JudgeRequest {
 
 export interface JudgeResponse {
   output: unknown
-  usage?: { input: number; output: number }
+  usage?: { input: number; output: number; estimatedCostUsd?: number }
 }
 
 export interface Judge {
@@ -128,7 +128,8 @@ function usageFor(response: JudgeResponse): JudgeResponse['usage'] {
   const usage = response.usage
   if (!usage || !Number.isSafeInteger(usage.input) || !Number.isSafeInteger(usage.output) ||
     usage.input < 0 || usage.output < 0) return undefined
-  return { input: usage.input, output: usage.output }
+  const estimatedCostUsd = cost(usage.estimatedCostUsd)
+  return { input: usage.input, output: usage.output, ...(estimatedCostUsd === undefined ? {} : { estimatedCostUsd }) }
 }
 
 export class LocalJudgment {

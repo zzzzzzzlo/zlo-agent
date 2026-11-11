@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import type { ApprovalKind } from '../../shared/contracts/tool-approval.ts'
 import { normalizeVerification, projectCommands } from './contracts/domain.ts'
 import type { EndReason, EventDraft, ModelRoute, TaskStatus, VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
 import type { LocalStore } from './store.ts'
@@ -118,6 +119,8 @@ export interface Operation {
   reconciliation?: OperationReconciliation
   status: 'started' | 'succeeded' | 'failed' | 'interrupted' | 'unknown_effect'
 }
+
+export type ToolFailureReason = 'tool_result_failed' | 'tool_exception' | 'nonzero_exit' | 'tool_cancelled'
 export interface CreateTask {
   requestId: string
   goal: string
@@ -310,9 +313,13 @@ export class TaskEngine {
 
   list(): TaskSnapshot[] { return this.#db.list<TaskSnapshot>('tasks').map(normalizeTask) }
 
+  listPage(before: string | null, limit: number): TaskSnapshot[] {
+    return this.#db.listBefore<TaskSnapshot>('tasks', before, limit).map(normalizeTask)
+  }
+
   attempts(taskId: string): Attempt[] {
     this.get(taskId)
-    return this.#db.list<Attempt>('attempts').filter((attempt) => attempt.taskId === taskId)
+    return this.#db.matchingRecords<Attempt>('attempts', '$.taskId', taskId)
   }
 
   operations(taskId: string): Operation[] {
@@ -761,7 +768,7 @@ export class TaskEngine {
       }
       this.#save(next)
       onChanged()
-      this.#event(next, 'task.permissions_changed', { access })
+      this.#event(next, 'task.permissions_changed', { access, previousAccess: task.workspaceAccess })
       if (requestStop && canTransition(next.status, 'stop_requested')) {
         this.#transition({ ...next, stopIntent: { requestId: requestStop, source: 'user' } },
           'stop_requested', 'task.stop_requested', requestStop)
@@ -830,7 +837,7 @@ export class TaskEngine {
     })
   }
 
-  finishTool(event: EventDraft, id: string, status: Exclude<Operation['status'], 'started'>): void {
+  finishTool(event: EventDraft, id: string, status: Exclude<Operation['status'], 'started'>, reason?: ToolFailureReason): void {
     this.#db.transaction(() => {
       const operation = this.#db.get<Operation>('operations', id)
       if (!operation || operation.taskId !== event.taskId || operation.status !== 'started' ||
@@ -838,7 +845,7 @@ export class TaskEngine {
         (event.agentRunId !== undefined && event.agentRunId !== operation.agentRunId)) throw new Error('Tool receipt is not open')
       this.#db.put('operations', id, { ...operation, status })
       this.#db.append({ ...event, taskRunId: operation.taskRunId, taskAttemptId: operation.attemptId, taskNodeId: operation.taskNodeId,
-        type: 'tool.finished', payload: { id, tool: operation.tool, status } })
+        type: 'tool.finished', payload: { id, tool: operation.tool, status, reason } })
     })
   }
 
@@ -858,8 +865,12 @@ export class TaskEngine {
     this.#db.transaction(() => { this.#transition(this.get(taskId), 'verifying') })
   }
 
-  auditToolApproval(event: EventDraft, id: string, tool: string, approved: boolean): void {
-    this.#db.transaction(() => { this.#db.append({ ...event, type: 'tool.approval_resolved', payload: { id, tool, approved } }) })
+  auditToolApproval(event: EventDraft, id: string, tool: string, approved: boolean, approvalKind?: ApprovalKind): void {
+    this.#db.transaction(() => { this.#db.append({ ...event, type: 'tool.approval_resolved', payload: { id, tool, approved, approvalKind } }) })
+  }
+
+  auditToolDenial(event: EventDraft, tool: string, effect: 'read' | 'write', reason: 'policy' | 'approval_safety'): void {
+    this.#db.transaction(() => { this.#db.append({ ...event, type: 'tool.denied', payload: { tool, effect, reason } }) })
   }
 
   continueExecution(taskId: string): void {

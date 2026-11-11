@@ -13,6 +13,7 @@ interface Reservation {
   event: EventDraft
   request: ModelRequest
   tokens: number
+  started?: number
   status: 'pending' | 'settled' | 'uncertain'
 }
 const budgets = 'model-budgets'
@@ -111,7 +112,7 @@ export class LocalModelScheduler {
           !Number.isSafeInteger(tokens) || requests >= (role === 'root' ? 32 : 8)) {
           throw new ModelBudgetError('Model request budget exhausted')
         }
-        const entry = { id: randomUUID(), event, request, tokens, status: 'pending' as const }
+        const entry = { id: randomUUID(), event, request, tokens, started: performance.now(), status: 'pending' as const }
         this.#store.transaction(() => {
           const budget = this.budget(event.taskId)
           if (budget.requests >= this.#limits.requests ||
@@ -120,7 +121,9 @@ export class LocalModelScheduler {
           }
           this.#store.put(budgets, event.taskId, { ...budget, requests: budget.requests + 1, reserved: budget.reserved + tokens })
           this.#store.put(reservations, entry.id, entry)
-          this.#store.append({ ...event, correlationId: entry.id, type: 'model.reserved', payload: { route: request.route, kind: request.kind, estimatedTokens: tokens } })
+          this.#store.append({ ...event, correlationId: entry.id, type: 'model.reserved', payload: { route: request.route, kind: request.kind,
+            estimatedTokens: tokens, estimatedInputTokens: request.estimatedInputTokens, maxOutputTokens: request.maxOutputTokens,
+            taskTokenLimit: this.#limits.tokens } })
         })
         requests++
         this.#pending.set(runId, entry)
@@ -128,6 +131,7 @@ export class LocalModelScheduler {
       usage: (usage: Usage) => {
         const entry = this.#pending.get(runId)
         if (entry) this.#settle(entry, usage)
+        return entry?.id
       },
       release: () => {
         this.#active.delete(runId)
@@ -152,6 +156,7 @@ export class LocalModelScheduler {
       this.#store.append({
         ...entry.event, correlationId: entry.id, type: 'model.reservation_settled',
         payload: { route: entry.request.route, kind: entry.request.kind, status, estimatedTokens: entry.tokens, actualTokens: actual,
+          ...(entry.started !== undefined && usage ? { durationMs: Math.round(performance.now() - entry.started) } : {}),
           ...(actual !== undefined && usage?.estimatedCostUsd !== undefined && Number.isFinite(usage.estimatedCostUsd) &&
             usage.estimatedCostUsd >= 0 ? { estimatedCostUsd: usage.estimatedCostUsd } : {}) },
       })

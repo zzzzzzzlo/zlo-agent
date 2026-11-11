@@ -80,6 +80,7 @@ export class LocalMemory {
   constructor(store: LocalStore) { this.#store = store }
 
   capture(event: EventDraft, scope: string, entries: readonly MemoryCandidate[]): void {
+    const start = performance.now()
     const scopeKey = scopeId(scope)
     const candidates = entries.slice(0, maxCaptureEntries).map(normalizedCandidate)
       .filter((candidate) => candidate !== undefined)
@@ -116,7 +117,7 @@ export class LocalMemory {
       this.#store.append({
         ...event,
         type: 'memory.captured',
-        payload: { count: changed.size, entries: [...changed.values()].map(entryRef) },
+        payload: { count: changed.size, entries: [...changed.values()].map(entryRef), elapsedMs: Math.round(performance.now() - start) },
       })
     })
   }
@@ -148,12 +149,12 @@ export class LocalMemory {
       .slice(0, limit).map(({ entry: { seenSources: _seenSources, ...entry } }) => entry)
   }
 
-  recordRecall(event: EventDraft, entries: readonly MemoryEntry[]): void {
+  recordRecall(event: EventDraft, entries: readonly MemoryEntry[], details?: { elapsedMs: number; contextBytes: number; budgetBytes: number }): void {
     this.#store.transaction(() => {
       this.#store.append({
         ...event,
         type: 'memory.recalled',
-        payload: { count: entries.length, entries: entries.map(entryRef) },
+        payload: { count: entries.length, entries: entries.map(entryRef), ...details },
       })
     })
   }
@@ -204,6 +205,7 @@ export class ScopedContext {
     for (const ref of options.artifactRefs ?? []) {
       if (append((hasArtifacts ? '' : '\n\nRelevant artifacts:') + '\n- ' + JSON.stringify(ref))) hasArtifacts = true
     }
+    const recallStart = performance.now()
     const candidates = this.#memory.recall(options.scope, options.goal)
       .map((entry) => ({ entry, line: '\n- ' + entry.kind + ': ' + JSON.stringify(entry.text) }))
       .filter(({ line }) => Buffer.byteLength(recalledHeading + line) <= remaining)
@@ -219,7 +221,7 @@ export class ScopedContext {
     for (const { entry, line } of ordered) {
       if (append((included.length ? '' : recalledHeading) + line)) included.push(entry)
     }
-    this.#memory.recordRecall(event, included)
+    this.#memory.recordRecall(event, included, { elapsedMs: Math.round(performance.now() - recallStart), contextBytes: budget - remaining, budgetBytes: budget })
     return prompt
   }
 }

@@ -155,6 +155,15 @@ export class CodingWorkspace implements Verifier {
     return this.#read(segments(value), signal)
   }
 
+  async gitDiffSnapshot(value: unknown, staged: boolean, signal?: AbortSignal) {
+    const parts = segments(value)
+    await this.#checkedPath(parts, false)
+    return this.#gitText([
+      'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=all',
+      ...(staged ? ['--cached'] : []), '--', parts.join('/'),
+    ], signal)
+  }
+
   acquireWrite(): (() => void) | undefined {
     if (!this.#startWrite()) return undefined
     let held = true
@@ -209,12 +218,7 @@ export class CodingWorkspace implements Verifier {
       this.#tool('git_diff', 'Inspect the unstaged or staged Git diff for a single allowed text file.',
         'write', { path: pathProperty, staged: { type: 'boolean' } }, async (args, signal) => {
           if (args.staged !== undefined && typeof args.staged !== 'boolean') throw new WorkspaceDenied('Invalid staged flag')
-          const parts = segments(args.path)
-          await this.#checkedPath(parts, false)
-          return this.#gitText([
-            'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=all',
-            ...(args.staged ? ['--cached'] : []), '--', parts.join('/'),
-          ], signal)
+          return this.gitDiffSnapshot(args.path, args.staged === true, signal)
         }, ['staged']),
       this.#tool('git_log', 'Inspect the last ten local commits as abbreviated IDs and dates.', 'write', {},
         async (_args, signal) => this.#gitText(['log', '-n', '10', '--format=%h%x09%cs'], signal)),

@@ -21,6 +21,7 @@ const definitions = {
   'host.startup_config_invalid': ['error', 'host', 'process', 'The Agent Host startup configuration was invalid.'],
   'host.startup_runtime_failed': ['error', 'host', 'process', 'The configured Agent execution runtime could not load.'],
   'host.startup_storage_failed': ['error', 'host', 'process', 'The Agent Host could not open or recover its local store.'],
+  'host.telemetry_unavailable': ['warn', 'host', 'process', 'The optional local telemetry listener could not start.'],
   'host.shutdown_failed': ['error', 'host', 'process', 'The Agent Host failed to shut down cleanly.'],
   'host.protocol_rejected': ['warn', 'host', 'protocol', 'The Agent Host rejected a protocol command.'],
   'host.model_unavailable': ['warn', 'host', 'model', 'A model route was unavailable.'],

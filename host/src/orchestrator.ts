@@ -318,8 +318,8 @@ export class MultiAgentOrchestrator {
           lease!.request(request)
         },
         onEvent: (runtime) => {
-          if (runtime.type === 'model.usage') lease!.usage(runtime)
-          this.#emit(event, runtime, role)
+          const reservationId = runtime.type === 'model.usage' ? lease!.usage(runtime) : undefined
+          this.#emit(reservationId ? { ...event, correlationId: reservationId } : event, runtime, role)
         },
       })
       if (!sameRoute(session.route, route) || (saved && (session.ref.id !== saved.session.id || session.ref.path !== saved.session.path))) {
@@ -611,8 +611,8 @@ export class MultiAgentOrchestrator {
           textProduced ||= Boolean(runtime.delta.trim())
         }
         try {
-          if (runtime.type === 'model.usage') lease!.usage(runtime)
-          this.#emit(event, runtime, 'root')
+          const reservationId = runtime.type === 'model.usage' ? lease!.usage(runtime) : undefined
+          this.#emit(reservationId ? { ...event, correlationId: reservationId } : event, runtime, 'root')
         } catch {
           outputFailed = true
           budget.abort()

@@ -5,6 +5,7 @@ import { writeHostDiagnostic } from '../../shared/diagnostics.ts'
 import type { HostDiagnosticCode } from '../../shared/diagnostics.ts'
 import type { DesktopCommand, DesktopErrorCode, HostMode } from '../../shared/contracts/desktop.ts'
 import type { ManagementCommand, PrivateCredentialCommand } from '../../shared/contracts/management.ts'
+import { localPort } from '../../shared/loopback-http.ts'
 import { ConversationError, parseRoute } from './conversation.ts'
 import { FakeExecution } from './fake.ts'
 import { ModelUnavailableError } from './execution.ts'
@@ -12,6 +13,7 @@ import { LocalAgentHost } from './host.ts'
 import type { HostCommand } from './host.ts'
 import { inputRecord, providerId } from './management.ts'
 import { validProviderKey } from './model-management.ts'
+import { startTelemetryHttp } from './telemetry-http.ts'
 
 const args = process.argv.slice(2)
 if (args.includes('--help')) {
@@ -73,6 +75,10 @@ async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Pro
 }
 
 async function serveHost(host: LocalAgentHost, runtimeId: HostMode, desktop: boolean): Promise<void> {
+  const token = process.env.ZLO_TELEMETRY_TOKEN
+  const telemetry = token ? Promise.resolve().then(() => startTelemetryHttp(host, {
+    port: localPort(process.env.ZLO_TELEMETRY_PORT, 4557), token,
+  })).catch(() => { writeHostDiagnostic('host.telemetry_unavailable') }) : undefined
   const subscriptions = new Map<string, () => void>()
   const conversationSubscriptions = new Map<string, () => void>()
   const send = (message: object): void => { process.stdout.write(JSON.stringify(message) + '\n') }
@@ -186,6 +192,8 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode, desktop: boo
     }
   } finally {
     try {
+      const listener = await telemetry
+      await listener?.close()
       await host.close()
     } catch {
       writeHostDiagnostic('host.shutdown_failed')
