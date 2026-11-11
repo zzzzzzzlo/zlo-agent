@@ -3,7 +3,7 @@ import { execFile } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
-import { test } from 'node:test'
+import { before, test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
@@ -12,6 +12,20 @@ import { _electron as electron } from 'playwright-core'
 const appPath = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const executablePath = join(appPath, 'node_modules', 'electron', 'dist', 'electron.exe')
 const exec = promisify(execFile)
+
+before(async () => {
+  if (process.platform !== 'win32') return
+  try {
+    const { stdout } = await exec(executablePath, ['-p', 'process.versions.electron'], {
+      cwd: appPath, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, windowsHide: true, timeout: 12_000,
+    })
+    assert.match(stdout.trim(), /^\d+\.\d+\.\d+$/u)
+  } catch (error) {
+    const code = typeof error.code === 'number' ? '0x' + (error.code >>> 0).toString(16) : error.code ?? 'unknown'
+    throw new Error(`Electron could not start in Node mode before opening a GUI or acquiring a profile lock (${code}).`,
+      { cause: error })
+  }
+})
 
 async function eventually(predicate, label, timeout = 20000) {
   const deadline = Date.now() + timeout
@@ -32,8 +46,14 @@ async function launch(data, mode = 'faux') {
   })
 }
 
-async function ready(app) {
+async function ready(app, data) {
   const page = await app.firstWindow()
+  const profile = await app.evaluate(({ app }) => ({
+    userData: app.getPath('userData'),
+    ownsLock: app.hasSingleInstanceLock(),
+  }))
+  assert.equal(profile.userData, resolve(data))
+  assert.equal(profile.ownsLock, true)
   await eventually(async () => {
     const status = await page.evaluate(() => window.agentHost?.getStatus())
     if (status?.state === 'offline') throw new Error('Host is offline: ' + status.message)
@@ -96,7 +116,7 @@ test('Windows Electron uses the Pi Host for coding, model switch, steering, stop
     let app
     try {
       app = await launch(data)
-      const page = await ready(app)
+      const page = await ready(app, data)
       assert.deepEqual(await page.evaluate(() => window.agentHost.listConversations()), [])
       const invalidPath = await page.evaluate(async (path) => {
         try {
@@ -189,7 +209,7 @@ test('Windows Electron uses the Pi Host for coding, model switch, steering, stop
       app = undefined
 
       app = await launch(data)
-      const restored = await ready(app)
+      const restored = await ready(app, data)
       await restored.getByText('已在登录页中添加验证码输入框', { exact: false }).waitFor()
       assert.deepEqual(await history(restored, id), stopped)
       await restored.getByRole('button', { name: '恢复执行' }).click()
@@ -253,7 +273,7 @@ test('Windows Electron authorizes a writable workspace without a file check and 
     let app
     try {
       app = await launch(data)
-      const page = await ready(app)
+      const page = await ready(app, data)
       await app.evaluate(({ dialog }, path) => {
         dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] })
         dialog.showMessageBox = async () => { throw new Error('Unexpected trust request for file-only access') }
@@ -398,7 +418,7 @@ test('Windows Electron sends credential capture through Main and omits invalid c
     let app
     try {
       app = await launch(data, 'pi')
-      const page = await ready(app)
+      const page = await ready(app, data)
       const consoleOutput = []
       page.on('console', (message) => consoleOutput.push(message.text()))
       page.on('pageerror', (error) => consoleOutput.push(error.message))

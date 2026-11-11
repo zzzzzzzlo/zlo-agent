@@ -51,6 +51,8 @@ jobs:
         run: npm.cmd --prefix ui test
       - name: Run Electron E2E
         timeout-minutes: 8
+        env:
+          DEBUG: pw:browser
         run: npm.cmd --prefix ui run test:desktop
       - name: Package Windows portable application
         run: npm.cmd --prefix ui run pack:win
