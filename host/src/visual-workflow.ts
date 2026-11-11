@@ -6,7 +6,7 @@ type Mode = 'quick' | 'high_quality'
 type Emit = (type: string, payload: Record<string, unknown>) => void
 const budgets = {
   quick: { calls: 2, frames: 1, tokens: 64_000, ms: 75_000 },
-  high_quality: { calls: 3, frames: 3, tokens: 150_000, ms: 150_000 },
+  high_quality: { calls: 3, frames: 3, tokens: 192_000, ms: 150_000 },
 } as const
 const htmlPath = /\.html?$/iu
 const visualFile = /\.(?:html?|css|svg|[cm]?js)$/iu
@@ -133,12 +133,14 @@ export class VisualWorkflow {
     }
   }
 
-  reserve(request: ModelRequest): boolean {
-    if (!this.#round) return true
+  reserve(request: ModelRequest, allocate?: () => void): boolean {
     const tokens = request.estimatedInputTokens + request.maxOutputTokens
-    if (this.#charged + this.#pending + tokens > this.limits.tokens) return false
-    this.#pending += tokens
-    this.#round.requests++
+    if (this.#round && this.#charged + this.#pending + tokens > this.limits.tokens) return false
+    allocate?.()
+    if (this.#round) {
+      this.#pending += tokens
+      this.#round.requests++
+    }
     return true
   }
 

@@ -617,8 +617,7 @@ export class MultiAgentOrchestrator {
         signal.throwIfAborted()
         if (this.#tasks.blocksToolWork(task.id, event.agentRunId)) throw new Error('Unconfirmed workspace operation')
         try {
-          if (!visual.reserve(request)) throw new ModelBudgetError('Visual feedback token budget exhausted')
-          lease!.request(request)
+          if (!visual.reserve(request, () => lease!.request(request))) throw new ModelBudgetError('Visual feedback token budget exhausted')
         } catch (error) {
           if (error instanceof ModelBudgetError) budget.abort()
           throw error

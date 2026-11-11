@@ -19,6 +19,7 @@
 | `verification.finished`、`context.compacted` | 根任务验收记录包含 `executionStatus`、`verdict`、`basis`、`passed` 和 `evidence`。压缩事件记录压缩前后 Token 估计。 |
 | `memory.captured`、`memory.recalled` | 数量以及 memoryId、version、kind。文本留在受作用域约束的 Memory Core。 |
 | `judgment.evaluated` | 决策点、特征版本、模式、结构化特征、候选集、规则输出、实际选择、可用的 Shadow 结果和关联结算字段。见 [Jev 接入](15-jev-integration.md)。 |
+| `visual.draft_ready`、`visual.preview_started`、`visual.preview_finished`、`visual.frames_sent`、`visual.round_finished`、`visual.loop_finished` | 初稿、渲染、帧数、反馈阶段 Token 和编辑状态。按 TaskRun 与 AgentRun 关联。截图和页面内容不进入遥测，独立 Evaluation 结果沿用原任务关联。 |
 
 ## 执行和验收指标
 

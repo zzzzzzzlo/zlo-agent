@@ -4,7 +4,7 @@
 
 ## 本地预览
 
-`preview_page` 是独立的 Root 只读工具，可在授权工作区内调用。参数示例：
+`preview_page` 是独立的 Root 只读工具，可在授权工作区内调用。下面的调用在三个时间点渲染同一个入口。
 
 ```json
 {
@@ -25,7 +25,7 @@
 | 模式 | 预览调用上限 | 单次帧数 | 反馈阶段墙钟和 Token 预算 |
 | --- | ---: | ---: | --- |
 | 快速 | 2，包含初稿 | 1 | 每次运行 75 秒，任务累计 64,000 Token |
-| 高质量 | 3，包含初稿 | 3 | 每次运行 150 秒，任务累计 150,000 Token |
+| 高质量 | 3，包含初稿 | 3 | 每次运行 150 秒，任务累计 192,000 Token |
 
 Pi 的工具适配器为有视觉能力的模型构造 `image` 内容块。JPEG 每帧最多 160 KiB，每次模型请求最多三帧，预留每帧 2048 Token。图片只进入下一次请求，历史会话仅保存工具状态与诊断。文字模型收到 `unavailable_on_selected_model` 和结构诊断。视觉任务文本预留使用已报告的输入用量和本地估算，已核销的请求按供应商实际用量计入反馈预算，未确认用量仍占用原预留。[Pi Agent SDK](https://github.com/earendil-works/pi/blob/main/packages/agent/README.md)
 
@@ -37,10 +37,10 @@ Trace 复用原有 TaskRun 和 AgentRun 事件。`visual.draft_ready` 记录首�
 
 ## 实测复现
 
-使用同一份 `deepseek-flash` 授权，安装 Node 24 和两个提交相同的锁定依赖。先将旧版 `b1ad4e3` 放在独立工作树，然后从新版仓库运行：
+使用同一份 `deepseek-flash` 授权，安装 Node 24 和两个提交相同的锁定依赖。将旧版 `b1ad4e3` 放在独立工作树后，从新版仓库运行比较脚本。
 
 ```powershell
 node --disable-warning=ExperimentalWarning host/scripts/visual-benchmark.ts <旧版工作树> .zlo-agent/visual-benchmark
 ```
 
-将 `DEEPSEEK_API_KEY` 从本机凭证安全传入该进程。脚本使用空的隔离工作区，以相同任务和外层预算比较鹈鹕、鳄鱼两个场景，输出真实 Provider 用量、耗时及供独立查看的三帧截图。测试产物位于 Git 忽略目录。
+将 `DEEPSEEK_API_KEY` 从本机凭证安全传入该进程。脚本使用隔离工作区，以相同任务和外层预算比较鹈鹕、鳄鱼两个场景，输出真实 Provider 用量、耗时及供独立查看的三帧截图。设置 `ZLO_VISUAL_BENCH_SEEDED=1` 使用内置遮挡夹具，`ZLO_VISUAL_BENCH_TOKENS` 可调整每组相同的外层预算。测试产物位于 Git 忽略目录。
