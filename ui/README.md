@@ -2,6 +2,8 @@
 
 面向 Windows x64 的本地 Coding Agent。Electron 自动启动独立 Agent Host，通过受限 IPC 提交命令和接收事件。对话、Pi Session 和任务记录保存在本机。
 
+0.4.0 加入原生工具确认和单文件保存导出。Shell、Git 修改及外部网页操作按本次参数授权，文件导出由系统保存窗口选择一个新文件。浏览器工具需要本机安装 Microsoft Edge，访问范围和工具清单见 [工具系统](../docs/18-tool-system.md)。
+
 ## 安装与启动
 
 从仓库根目录使用 Node.js 24 和 npm。

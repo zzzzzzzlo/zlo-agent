@@ -38,7 +38,7 @@ async function ready(app) {
     const status = await page.evaluate(() => window.agentHost?.getStatus())
     if (status?.state === 'offline') throw new Error('Host is offline: ' + status.message)
     return status?.state === 'ready'
-  }, 'Host Ready')
+  }, 'Host Ready', 50_000)
   assert.deepEqual(await page.evaluate(() => ({
     node: typeof process,
     require: typeof require,
@@ -275,6 +275,19 @@ test('Windows Electron authorizes a writable workspace without a file check and 
       assert.deepEqual(teamTurn.nodes?.map(({ role, status }) => [role, status]), [['team', 'succeeded'], ['worker', 'succeeded']])
       await page.getByRole('button', { name: '展开活动面板' }).click()
       await page.getByRole('complementary', { name: '活动面板' }).getByText('Team Agent', { exact: true }).waitFor()
+
+      const exported = join(root, 'exported-login.html')
+      await app.evaluate(({ dialog }, filePath) => {
+        dialog.showSaveDialog = async (_window, options) => {
+          if (options.defaultPath !== 'login.html') throw new Error('Unexpected suggested artifact')
+          return { canceled: false, filePath }
+        }
+      }, exported)
+      await send(page, '[export-check] 导出登录页面')
+      await waitForRun(page, writeConversation.id, 3, 'succeeded')
+      assert.equal(await readFile(exported, 'utf8'), await readFile(join(writable, 'login.html'), 'utf8'))
+      assert.ok((await history(page, writeConversation.id)).turns[2].tools
+        .some(({ name, status }) => name === 'export_artifact' && status === 'succeeded'))
 
       // Exercise the trusted consent handler for both responses while leaving the
       // Renderer, Preload, IPC, Host and real local project command paths intact.

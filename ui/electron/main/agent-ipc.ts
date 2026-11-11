@@ -1,5 +1,5 @@
 import { realpath, stat } from 'node:fs/promises'
-import { parse } from 'node:path'
+import { basename, dirname, join, parse } from 'node:path'
 import { BrowserWindow, dialog, ipcMain } from 'electron'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
 import { agentChannels } from '../agent-channels.ts'
@@ -37,6 +37,33 @@ export function registerAgentIpc(options: {
   const { host } = options
   const selectedDirectories = new WeakMap<WebContents, Map<string, DirectoryIdentity>>()
   const pendingTrust = new WeakSet<WebContents>()
+
+  host.setToolApprover(async (request, signal) => {
+    const window = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
+    if (signal.aborted || !window || window.isDestroyed() || window.webContents.getURL() !== options.rendererUrl ||
+      pendingTrust.has(window.webContents) || !localDirectory(request.workspace)) return { approved: false }
+    if (request.kind === 'export') {
+      const { canceled, filePath } = await dialog.showSaveDialog(window, {
+        title: '导出工作区文件', defaultPath: request.suggestedName,
+        buttonLabel: '导出', properties: ['showOverwriteConfirmation'],
+      })
+      if (signal.aborted || canceled || !filePath || !localDirectory(filePath) || window.isDestroyed() ||
+        window.webContents.getURL() !== options.rendererUrl) return { approved: false }
+      const directory = await realpath(dirname(filePath))
+      const destination = join(directory, basename(filePath))
+      const protectedPaths = await Promise.all(options.protectedPaths.map(path => realpath(path).catch(() => path)))
+      if (protectedPaths.some(path => directoryOverlaps(path, destination))) return { approved: false }
+      return { approved: true, destination }
+    }
+    const { response } = await dialog.showMessageBox(window, {
+      type: 'warning', title: '授权 Agent 工具', message: '仅允许本次操作？',
+      detail: request.tool + '\n' + request.workspace + '\n\n' + request.detail +
+        (request.kind === 'shell' ? '\n\n命令按当前系统账户权限运行。' : ''),
+      buttons: ['拒绝', '允许本次'], defaultId: 0, cancelId: 0, noLink: true, signal,
+    })
+    return { approved: !signal.aborted && response === 1 && !window.isDestroyed() &&
+      window.webContents.getURL() === options.rendererUrl ? true : false }
+  })
 
   async function checkWorkspace(window: BrowserWindow, workspace: string, expected?: DirectoryIdentity): Promise<DirectoryIdentity> {
     const current = await directoryIdentity(workspace)

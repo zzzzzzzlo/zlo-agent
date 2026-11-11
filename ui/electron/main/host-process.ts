@@ -6,8 +6,10 @@ import { diagnostic } from '../../../shared/diagnostics.ts'
 import type { DiagnosticCode, DiagnosticEntry } from '../../../shared/diagnostics.ts'
 import { collectHostDiagnostics } from './diagnostic-log.ts'
 import type { ConversationEvent, DesktopCommand, DesktopErrorCode, DesktopHostStatus, HostMode } from '../../../shared/contracts/desktop.ts'
+import { approvalKinds } from '../../../shared/contracts/tool-approval.ts'
+import type { ApprovalKind, ToolApprovalDecision, ToolApprovalRequest } from '../../../shared/contracts/tool-approval.ts'
 
-const startupTimeoutMs = 15_000
+const startupTimeoutMs = 45_000
 const requestTimeoutMs = 20_000
 const shutdownTimeoutMs = 12_000
 const maxLineLength = 32 * 1024 * 1024
@@ -46,6 +48,7 @@ interface Connection {
   closed: Promise<void>
   resolveClosed(): void
   pending: Map<string, PendingRequest>
+  approvals: Map<string, AbortController>
   startupTimer?: NodeJS.Timeout
   incompleteLine: string
   failure?: string
@@ -79,6 +82,15 @@ function isEvent(value: unknown): value is ConversationEvent {
     && typeof value.conversationId === 'string' && typeof value.type === 'string' && isObject(value.payload)
 }
 
+function approvalRequest(value: unknown): value is ToolApprovalRequest {
+  return isObject(value) && typeof value.id === 'string' && /^[a-f0-9-]{36}$/iu.test(value.id) &&
+    approvalKinds.includes(value.kind as ApprovalKind) && typeof value.tool === 'string' &&
+    /^[a-z0-9_]{1,80}$/u.test(value.tool) && typeof value.detail === 'string' && value.detail.length <= 8_000 &&
+    typeof value.workspace === 'string' && value.workspace.length <= 4096 &&
+    (value.suggestedName === undefined || (typeof value.suggestedName === 'string' &&
+      !/[\\/:\u0000-\u001f]/u.test(value.suggestedName) && value.suggestedName.length <= 260))
+}
+
 function waitForClose(connection: Connection, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(false), timeoutMs)
@@ -98,6 +110,7 @@ export class HostProcessManager {
   #stopInFlight?: Promise<void>
   #restartInFlight?: Promise<DesktopHostStatus>
   #shutdown = false
+  #approve?: (request: ToolApprovalRequest, signal: AbortSignal) => Promise<ToolApprovalDecision>
 
   constructor(options: ManagerOptions) {
     this.#options = options
@@ -114,6 +127,10 @@ export class HostProcessManager {
   onEvent(listener: Listener<ConversationEvent>): () => void {
     this.#events.add(listener)
     return () => { this.#events.delete(listener) }
+  }
+
+  setToolApprover(approve: (request: ToolApprovalRequest, signal: AbortSignal) => Promise<ToolApprovalDecision>): void {
+    this.#approve = approve
   }
 
   start(): Promise<DesktopHostStatus> {
@@ -136,7 +153,7 @@ export class HostProcessManager {
     }
     const connection: Connection = {
       child, correlationId, state: 'starting', ready: ready.promise, resolveReady: ready.resolve,
-      closed: closed.promise, resolveClosed: closed.resolve, pending: new Map(), incompleteLine: '',
+      closed: closed.promise, resolveClosed: closed.resolve, pending: new Map(), approvals: new Map(), incompleteLine: '',
     }
     this.#connection = connection
     child.once('error', () => { this.#fail(connection, 'desktop.host_spawn_failed', 'Agent Host 进程无法运行。') })
@@ -205,6 +222,7 @@ export class HostProcessManager {
       connection.state = 'stopping'
       clearTimeout(connection.startupTimer)
       this.#rejectPending(connection, unavailable('Agent Host 正在关闭。'))
+      for (const approval of connection.approvals.values()) approval.abort()
       this.#setStatus('offline')
       connection.resolveReady(this.#status)
       connection.child.stdin.end(JSON.stringify({ schemaVersion: 1, type: 'exit' }) + '\n')
@@ -259,6 +277,10 @@ export class HostProcessManager {
         return
       }
       emit(this.#events, message.event)
+    } else if (message.kind === 'tool.approval' && connection.state === 'ready' && approvalRequest(message.request)) {
+      this.#askToolApproval(connection, message.request)
+    } else if (message.kind === 'tool.approval_cancelled' && typeof message.approvalId === 'string') {
+      connection.approvals.get(message.approvalId)?.abort()
     } else if (message.kind === 'result' || message.kind === 'error') {
       if (typeof message.commandId !== 'string') return
       const pending = this.#settle(connection, message.commandId)
@@ -274,6 +296,25 @@ export class HostProcessManager {
         pending.reject(new HostTransportError('INTERNAL', 'Agent Host 返回了无效的命令响应。'))
       }
     }
+  }
+
+  #askToolApproval(connection: Connection, request: ToolApprovalRequest): void {
+    if (connection.approvals.has(request.id)) return
+    const answer = (decision: ToolApprovalDecision) => {
+      if (this.#connection !== connection || connection.state !== 'ready') return
+      connection.child.stdin.write(JSON.stringify({
+        schemaVersion: 1, type: 'resolveToolApproval', approvalId: request.id, decision,
+      }) + '\n')
+    }
+    if (!this.#approve || connection.approvals.size) {
+      answer({ approved: false })
+      return
+    }
+    const controller = new AbortController()
+    connection.approvals.set(request.id, controller)
+    void Promise.resolve().then(() => this.#approve!(request, controller.signal))
+      .then(result => { if (!controller.signal.aborted) answer(result) }, () => answer({ approved: false }))
+      .finally(() => { connection.approvals.delete(request.id) }).catch(() => {})
   }
 
   #settle(connection: Connection, id: string): PendingRequest | undefined {
@@ -302,6 +343,7 @@ export class HostProcessManager {
   }
 
   #closed(connection: Connection, code: number | null): void {
+    for (const approval of connection.approvals.values()) approval.abort()
     connection.resolveClosed()
     if (this.#connection !== connection) return
     this.#connection = undefined
