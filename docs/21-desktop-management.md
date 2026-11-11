@@ -10,7 +10,11 @@
 
 - 在设置的模型与账号选择 DeepSeek、OpenAI、Anthropic 或 Google Gemini。复制供应商 API Key 后点击添加。系统确认窗口同意后，Electron Main 读取并验证剪贴板内容。平台凭证存储使用 Electron safeStorage；Windows 使用 DPAPI。可测试连接，选择具体模型时会发起短推理。设置页只显示凭证状态、目录和连接结果。
 - 可设默认模型并为会话选择模型。自动策略可在同 Provider 内为子任务独立选型，固定策略沿用父模型。新会话未显式选模或配置默认路由时，会从已授权的 API Provider 选择可用模型。正在使用的 Pi Session 只接受同 Provider 的路由变化。
-- DeepSeek 思考模型的单次输出预算最高为 16384 Token，包含思考、正式回复和工具调用参数，仍受模型上限和任务总预算约束。思考内容由本地 Pi 会话保存，供该 Provider 的连续工具调用使用。聊天只展示正式回复，诊断日志记录触顶状态。模型触顶时，任务保留可恢复的阻塞状态，并明确提示输出上限。
+- DeepSeek 思考模型的单次输出预算最高为 16384 Token，包含思考、正式回复和工具调用参数。Flash 默认使用低思考强度。若一轮只有思考且耗尽输出预算，Root 在权限、取消与任务预算校验下至多追加一次关闭思考的续接。恢复这种已阻塞的任务时，同一模型可直接使用该方式。续接保留已完成的工具结果，从发送给模型的上下文移除仅含思考的截断回复。Pi 本地会话保存原始记录，聊天只展示正式回复。续接仍因输出上限中断时，任务进入可恢复的阻塞状态。
+
+思考强度和输出预算分开配置，参考 [DSH Provider 指南](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/providers.md) 和 [DeepSeek API](https://api-docs.deepseek.com/guides/thinking_mode/)。DSH 的[公开复现](https://github.com/deepseek-ai/deepseek-harness/discussions/12347)也记录了仅有思考内容时的空答复。Pi 负责拦截截断回复中的工具调用，Zlo 在 SDK 的正常请求路径上执行有限续接。
+
+`model.output_recovery` 记录续接触发方式 `automatic` 或 `resume`，模型用量仍由每次请求各自的 `model.usage` 记录。
 - 删除密钥会持久化停用记录，防止重启时旧启动环境重新启用该 Provider。更新或删除凭证会先让使用该 Provider 的活动和待执行任务停止。之后可选择适用模型并继续。提供方不可用或额度未知时界面如实显示。
 - ChatGPT 账号走 OpenAI 的本地开源应用授权。系统浏览器授权、回环 PKCE、签发的应用客户端 ID 和 ID token 验证在 Main 完成。该路由按本地账号配置隔离，使用官方 Responses API 和对应 ChatGPT 计划。登录可取消，可重新授权已保存的配置，登出可查看远端撤销是否确认。OpenAI API Key 仍使用独立 API 计费。
 

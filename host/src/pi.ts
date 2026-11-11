@@ -279,6 +279,14 @@ export class PiExecution implements AgentExecution {
     let stop: Promise<void> | undefined
     let lastAssistant: AssistantMessage | undefined
     let compacting = false
+    let recoveringOutput = false
+    let outputRecoveryUsed = false
+    const deepSeekThinking = model.provider === 'deepseek' && model.reasoning
+    const previousAssistant = session.messages.findLast(message => message.role === 'assistant') as AssistantMessage | undefined
+    const resumeOutputRecovery = deepSeekThinking && config.resumeAfterOutputLimit &&
+      previousAssistant?.provider === model.provider && previousAssistant.model === model.id &&
+      isThinkingOnlyTruncation(previousAssistant)
+    const canRecoverOutput = () => !stopping && !outputRecoveryUsed && config.canRecoverModelOutput?.() === true
     const providerMessages = new WeakSet<AssistantMessage>()
     const steering = new Map<string, string>()
     const emit = (event: RuntimeEvent): void => {
@@ -301,13 +309,19 @@ export class PiExecution implements AgentExecution {
       if (!canUseProvider(model.provider, model.id, model.maxTokens)) throw modelUnavailable('Provider authorization or model is unavailable')
       // Sign in with ChatGPT omits max_output_tokens. Reserve the documented model maximum.
       // DeepSeek counts reasoning and the answer or tool arguments against the same limit.
-      const outputLimit = model.provider === 'deepseek' && model.reasoning ? 16_384 : 4_096
+      const outputLimit = deepSeekThinking ? 16_384 : 4_096
       const maxTokens = chatGpt ? model.maxTokens : Math.min(options?.maxTokens ?? model.maxTokens, model.maxTokens, outputLimit)
-      reserve(Buffer.byteLength(JSON.stringify(context)), maxTokens, compacting ? 'compaction' : 'prompt')
+      // Keep valid reasoning/tool pairs. An exhausted thinking-only turn has no result to replay.
+      const requestContext = deepSeekThinking
+        ? { ...context, messages: context.messages.filter(message => message.role !== 'assistant' || !isThinkingOnlyTruncation(message)) }
+        : context
+      reserve(Buffer.byteLength(JSON.stringify(requestContext)), maxTokens, compacting ? 'compaction' : 'prompt')
       writeHostDiagnostic('host.model_started', traceId)
       const requestFailed = () => writeHostDiagnostic(options?.signal?.aborted ? 'host.model_interrupted' : 'host.model_failed', traceId)
       try {
-        const response = await stream(model, context, { ...options, maxTokens,
+        const response = await stream(model, requestContext, { ...options, maxTokens,
+          ...(deepSeekThinking && recoveringOutput ? { reasoning: undefined }
+            : deepSeekThinking && model.id === 'deepseek-flash' ? { reasoning: 'low' as const } : {}),
           ...(chatGpt ? { apiKey: this.chatGptSession?.accessToken, cacheRetention: 'none' as const,
             onPayload: chatGptResponsesPayload, fetch: chatGptFetch } : {}) })
         // Inspect only the completion category. Provider errors may contain request data.
@@ -393,9 +407,24 @@ export class PiExecution implements AgentExecution {
               }
             }
             if (stopping) return { status: 'interrupted' }
+            if (resumeOutputRecovery && canRecoverOutput()) {
+              outputRecoveryUsed = recoveringOutput = true
+              emit({ type: 'model.output_recovery', trigger: 'resume' })
+            }
             await session.prompt(prompt, { expandPromptTemplates: false })
+            if (deepSeekThinking && isThinkingOnlyTruncation(lastAssistant) && canRecoverOutput()) {
+              outputRecoveryUsed = recoveringOutput = true
+              emit({ type: 'model.output_recovery', trigger: 'automatic' })
+              lastAssistant = undefined
+              await session.prompt(
+                'Continue the current task from the recorded tool results. Avoid repeating confirmed operations. Take the next concrete step or give the concise final answer.',
+                { expandPromptTemplates: false },
+              )
+            }
           } catch {
             return { status: stopping ? 'interrupted' : 'runtime_error' }
+          } finally {
+            recoveringOutput = false
           }
           if (stopping) return { status: 'interrupted' }
           return runResult(lastAssistant, lastAssistant !== undefined && providerMessages.has(lastAssistant))
@@ -473,6 +502,11 @@ function runResult(message: AssistantMessage | undefined, fromProvider: boolean)
   if (message.stopReason === 'length' && fromProvider) return { status: 'model_output_limit' }
   if (message.stopReason !== 'stop') return { status: fromProvider ? 'model_error' : 'runtime_error' }
   return { status: 'completed', text: message.content.filter(part => part.type === 'text').map(part => part.text).join('\n') }
+}
+
+function isThinkingOnlyTruncation(message: AssistantMessage | undefined): boolean {
+  return message?.stopReason === 'length' && message.content.length > 0 &&
+    message.content.every(block => block.type === 'thinking')
 }
 
 async function checkTranscript(ref: SessionRef, cwd: string): Promise<void> {

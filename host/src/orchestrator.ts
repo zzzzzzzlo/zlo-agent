@@ -587,10 +587,15 @@ export class MultiAgentOrchestrator {
         }
       }))
     }
+    const previousAttempt = task.attemptCount > 1 ? this.#tasks.attempts(task.id)
+      .filter(attempt => attempt.nodeId === task.rootNodeId && attempt.finishedAt)
+      .sort((left, right) => right.finishedAt!.localeCompare(left.finishedAt!))[0] : undefined
     const config = (route: ModelRoute | undefined, ref?: SessionRef): ExecutionConfig => ({
       cwd: workspace.root, role: 'root', correlationId: event.agentRunId,
       sessionDirectory: join(this.#sessions, agentKey), session: ref, route, tools,
       systemPrompt: this.#extensions.workflow.systemPrompt('root', rootScope.access, task.check),
+      resumeAfterOutputLimit: saved?.taskId === task.id && previousAttempt?.reason === 'model_output_limit',
+      canRecoverModelOutput: () => !signal.aborted && !hasUnknownWrite(),
       reserveRequest: (request) => {
         signal.throwIfAborted()
         if (this.#tasks.blocksToolWork(task.id, event.agentRunId)) throw new Error('Unconfirmed workspace operation')

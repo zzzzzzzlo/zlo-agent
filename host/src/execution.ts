@@ -12,6 +12,7 @@ export type RuntimeEvent =
   | { type: 'message.delta'; delta: string }
   | { type: 'instruction.applied'; instructionId: string }
   | { type: 'model.request_started' }
+  | { type: 'model.output_recovery'; trigger: 'automatic' | 'resume' }
   | { type: 'model.usage'; input: number; output: number; cacheRead: number; cacheWrite: number; estimatedCostUsd?: number }
   | { type: 'model.route_changed'; route: ModelRoute }
   | { type: 'context.compacted'; tokensBefore: number; estimatedTokensAfter?: number }
@@ -40,6 +41,8 @@ export interface ExecutionConfig {
   route?: ModelRoute
   tools: ExecutionTool[]
   systemPrompt: string
+  resumeAfterOutputLimit?: boolean
+  canRecoverModelOutput?(): boolean
   reserveRequest?(request: ModelRequest): void
   onEvent(event: RuntimeEvent): void
 }

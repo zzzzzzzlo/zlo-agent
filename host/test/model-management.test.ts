@@ -12,7 +12,7 @@ import { PiExecution } from '../src/pi.ts'
 
 const fixtureKey = 'fixture-credential-for-regression'
 
-test('DeepSeek budgets reasoning and tools, keeps thinking in Pi, and reports length as a resumable block', async () => {
+test('DeepSeek recovers once, retains completed tool history, and resumes a persisted output-limit block', async () => {
   const route = { provider: 'deepseek', model: 'deepseek-flash' }
   const root = await mkdtemp(join(tmpdir(), 'zlo-deepseek-output-'))
   const workspace = join(root, 'workspace')
@@ -24,23 +24,36 @@ test('DeepSeek budgets reasoning and tools, keeps thinking in Pi, and reports le
     return runtime
   })
   const budgets: (number | undefined)[] = []
+  const efforts: (string | undefined)[] = []
   const thinking = 'thinking fixture kept inside the Pi transcript'
+  const truncated = 'truncated reasoning fixture'
   provider.setResponses([
     (_, options) => {
       budgets.push(options?.maxTokens)
+      efforts.push(options?.reasoning)
       return fauxAssistantMessage([fauxThinking(thinking), fauxToolCall('list_directory', { path: '.' })], { stopReason: 'toolUse' })
     },
     (_, options) => {
       budgets.push(options?.maxTokens)
-      return fauxAssistantMessage(fauxThinking('truncated reasoning fixture'), { stopReason: 'length' })
+      efforts.push(options?.reasoning)
+      return fauxAssistantMessage(fauxThinking(truncated), { stopReason: 'length' })
+    },
+    (context, options) => {
+      budgets.push(options?.maxTokens)
+      efforts.push(options?.reasoning)
+      assert.ok(context.messages.some(message => message.role === 'toolResult' && message.toolName === 'list_directory'))
+      assert.ok(JSON.stringify(context).includes(thinking))
+      assert.ok(!JSON.stringify(context).includes(truncated))
+      return fauxAssistantMessage(fauxThinking('second output-limit fixture'), { stopReason: 'length' })
     },
   ])
   const host = new LocalAgentHost({ directory: join(root, 'state'), execution })
   try {
-    const conversation = host.createConversation({ requestId: 'create', workspace, route })
-    const { taskId } = await host.sendMessage({ conversationId: conversation.id, requestId: 'message', text: 'Inspect the workspace' })
+    const conversation = host.createConversation({ requestId: 'create', workspace, workspaceAccess: 'write', route })
+    const { taskId } = await host.sendMessage({ conversationId: conversation.id, requestId: 'message', text: 'Inspect the workspace and create demo.html' })
     await host.idle()
-    assert.deepEqual(budgets, [16_384, 16_384])
+    assert.deepEqual(budgets, [16_384, 16_384, 16_384])
+    assert.deepEqual(efforts, ['low', 'low', undefined])
     const task = host.getHistory(taskId)
     assert.equal(task.task.status, 'blocked')
     assert.equal(task.task.reason, 'model_output_limit')
@@ -48,15 +61,78 @@ test('DeepSeek budgets reasoning and tools, keeps thinking in Pi, and reports le
     assert.match(await readFile(task.session!.path, 'utf8'), /thinking fixture kept inside the Pi transcript/u)
     assert.ok(!JSON.stringify(host.getConversationHistory({ conversationId: conversation.id })).includes(thinking))
     assert.ok(!JSON.stringify(host.events(taskId)).includes(thinking))
+    assert.deepEqual(host.events(taskId).filter(event => event.type === 'model.output_recovery')
+      .map(event => event.payload.trigger), ['automatic'])
 
-    provider.setResponses([fauxAssistantMessage('Done')])
+    provider.setResponses([
+      (context, options) => {
+        efforts.push(options?.reasoning)
+        assert.ok(context.messages.some(message => message.role === 'toolResult' && message.toolName === 'list_directory'))
+        return fauxAssistantMessage(fauxToolCall('create_text_file', { path: 'demo.html', content: '<p>Done</p>' }), { stopReason: 'toolUse' })
+      },
+      (_, options) => {
+        efforts.push(options?.reasoning)
+        return fauxAssistantMessage('Done')
+      },
+    ])
     assert.equal(host.resumeConversation({ conversationId: conversation.id, taskId, requestId: 'resume' }).accepted, true)
     await host.idle()
     assert.equal(host.getTask(taskId).status, 'succeeded')
-    assert.equal(host.getHistory(taskId).operations.length, 1)
+    const resumed = host.getHistory(taskId)
+    assert.equal(resumed.session?.id, task.session?.id)
+    assert.deepEqual(resumed.operations.map(item => [item.tool, item.status]).sort(), [
+      ['create_text_file', 'succeeded'], ['list_directory', 'succeeded'],
+    ])
+    assert.equal(await readFile(join(workspace, 'demo.html'), 'utf8'), '<p>Done</p>')
+    assert.deepEqual(efforts, ['low', 'low', undefined, undefined, undefined])
+    assert.deepEqual(host.events(taskId).filter(event => event.type === 'model.output_recovery')
+      .map(event => event.payload.trigger), ['automatic', 'resume'])
   } finally {
     await host.close()
     await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('the DeepSeek wire payload enables low thinking and disables it only for an allowed recovery', async (t) => {
+  const route = { provider: 'deepseek', model: 'deepseek-flash' }
+  const cwd = await mkdtemp(join(tmpdir(), 'zlo-deepseek-wire-'))
+  t.after(() => rm(cwd, { recursive: true, force: true }))
+  const requests: Record<string, unknown>[] = []
+  t.mock.method(globalThis, 'fetch', async (input: string | URL, init?: RequestInit) => {
+    assert.equal(String(input), 'https://api.deepseek.com/chat/completions')
+    requests.push(JSON.parse(String(init?.body)))
+    const finish = requests.length === 2 ? 'stop' : 'length'
+    const common = { id: 'chatcmpl-fixture', object: 'chat.completion.chunk', created: 1, model: route.model }
+    const delta = finish === 'stop' ? { content: 'Done' } : { reasoning_content: 'reasoning-only wire fixture' }
+    const chunks = [
+      { ...common, choices: [{ index: 0, delta, finish_reason: null }] },
+      { ...common, choices: [{ index: 0, delta: {}, finish_reason: finish }] },
+      { ...common, choices: [], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 } },
+    ]
+    return new Response(chunks.map(chunk => `data: ${JSON.stringify(chunk)}\n\n`).join('') + 'data: [DONE]\n\n',
+      { headers: { 'content-type': 'text/event-stream' } })
+  })
+  const execution = new PiExecution()
+  await execution.setProviderKey('deepseek', fixtureKey)
+  const config = { cwd, sessionDirectory: join(cwd, 'sessions'), route, tools: [], systemPrompt: 'Use concise output.',
+    onEvent: () => {} }
+  const session = await execution.open({ ...config, canRecoverModelOutput: () => true })
+  try {
+    assert.deepEqual(await session.run('Return a short answer.'), { status: 'completed', text: 'Done' })
+    assert.deepEqual(requests.map(request => [request.max_tokens, request.thinking, request.reasoning_effort]), [
+      [16_384, { type: 'enabled' }, 'low'],
+      [16_384, { type: 'disabled' }, undefined],
+    ])
+    assert.ok(!JSON.stringify(requests[1]).includes('reasoning-only wire fixture'))
+  } finally {
+    await session.dispose()
+  }
+  const guarded = await execution.open({ ...config, canRecoverModelOutput: () => false })
+  try {
+    assert.deepEqual(await guarded.run('Return a short answer.'), { status: 'model_output_limit' })
+    assert.equal(requests.length, 3)
+  } finally {
+    await guarded.dispose()
   }
 })
 
