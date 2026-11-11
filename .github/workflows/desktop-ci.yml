@@ -27,6 +27,14 @@ jobs:
           cache-dependency-path: |
             host/package-lock.json
             ui/package-lock.json
+      - name: Use a canonical local directory for Windows test fixtures
+        run: |
+          $zloTestTemp = Join-Path $env:RUNNER_TEMP 'zlo-agent-tests'
+          $null = New-Item -ItemType Directory -Path $zloTestTemp -Force
+          $zloCanonicalTemp = node -p "require('node:fs').realpathSync.native(process.argv[1])" $zloTestTemp
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "TEMP=$zloCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "TMP=$zloCanonicalTemp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
       - name: Install Host and UI dependencies
         run: |
           npm.cmd ci --prefix host
@@ -35,12 +43,14 @@ jobs:
       - name: Check Host types
         run: npm.cmd --prefix host run typecheck
       - name: Run Host unit, integration and security tests
+        timeout-minutes: 6
         run: npm.cmd --prefix host test
       - name: Check UI types
         run: npm.cmd --prefix ui run typecheck
       - name: Run UI tests and Shared Contracts boundary checks
         run: npm.cmd --prefix ui test
       - name: Run Electron E2E
+        timeout-minutes: 8
         run: npm.cmd --prefix ui run test:desktop
       - name: Package Windows portable application
         run: npm.cmd --prefix ui run pack:win

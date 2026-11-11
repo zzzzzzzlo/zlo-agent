@@ -51,7 +51,7 @@ test('workspace revocation quiesces the current run and persists across Host res
   } finally { await restarted.close() }
 })
 
-test('the tool gateway revokes an already exposed capability before its next invocation', async (t) => {
+test('the tool gateway revokes an already exposed capability before its next invocation', { timeout: 15000 }, async (t) => {
   const { directory, workspace } = await fixture(t)
   const fake = new FakeExecution()
   const opened = Promise.withResolvers<ExecutionConfig>()
@@ -73,7 +73,10 @@ test('the tool gateway revokes an already exposed capability before its next inv
   try {
     const { id } = host.createConversation({ requestId: 'conversation', workspace })
     await host.sendMessage({ requestId: 'message', conversationId: id, text: 'Search the workspace' })
-    const config = await opened.promise
+    const config = await Promise.race([
+      opened.promise,
+      host.idle().then(() => { throw new Error('Task finished before opening its execution session') }),
+    ])
     assert.ok(config.tools.some(tool => tool.name === 'search_files'))
     const snapshot = await host.managementSnapshot(id)
     await host.saveAgentPreferences({ ...snapshot.preferences, disabledTools: ['search_files'] })
