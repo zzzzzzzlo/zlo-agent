@@ -23,6 +23,7 @@ Zlo Agent 是基于 Pi 的本地优先通用 Agent，首个场景为 Windows Cod
 | `docs/15-jev-integration.md` | Jev 与六个判断点接入 |
 | `docs/16-observability-contract.md` | 中台事件与证据契约 |
 | `docs/17-core-verification.md` | 第三轮交付与验收 |
+| `docs/18-tool-system.md` | 工具清单、授权、回执与实际隔离边界 |
 | `diagrams/system.mmd` | 可渲染的 Mermaid 系统架构图 |
 | `diagrams/runtime-sequence.mmd` | 可渲染的运行与停止流程图 |
 
@@ -31,5 +32,7 @@ Zlo Agent 是基于 Pi 的本地优先通用 Agent，首个场景为 Windows Cod
 选定工作区后可授权文件写入，验收文件可选。用户明确选择信任项目后，Agent 可运行受控的 Node/npm 命令和本地 Git 检查，并以实际执行结果验收。Activity Panel 展示工具、模型用量和 Team/Worker 进度。
 
 Host 提供版本化 Task DAG、Root/Team/Worker 分层执行、模型预留和用量核销、上下文压缩、证据记忆和规则判断。Pi 保留 Session 与单 Agent Loop。Task 与 Conversation 可重放事件支持中断后核对和恢复。
+
+工具扩展加入受控 Shell/Process、文件搜索与精确 Patch、本地 Git 修改与 Worktree、公共网页抓取与搜索、隔离浏览器及原生文件导出。高风险工具通过桌面原生确认，每次授权限定在本次参数和执行。详见 [工具系统](docs/18-tool-system.md)。
 
 信任项目的命令按当前系统账户运行。隔离、恢复和模型路由的边界见 [第三轮验收](docs/17-core-verification.md)。旧版桌面协议和实施记录见 [Sprint 4](docs/11-desktop-protocol.md) 与 [Sprint 0–3](docs/10-sprint-execution.md)。

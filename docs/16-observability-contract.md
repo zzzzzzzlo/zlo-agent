@@ -13,6 +13,7 @@
 | `agent.started`、`agent.finished` | 角色、开始路由、父 Agent、Run/Session、完成状态、生命周期和证据计数。Team 进入 idle 时保留 Agent 与 Session。Worker 释放运行资源。 |
 | `model.request_started`、`model.usage`、`model.route_changed`、`model.reserved`、`model.reservation_settled` | 模型、调用和预算。预留/核销共享 reservation correlationId，含 prompt/compaction 类型、预估 Token、实际 Token 或 uncertain 状态。用量给出 input/output/cacheRead/cacheWrite，目录有价格时给出 estimatedCostUsd。目录价格估算与账单分开，额度仍为 unknown。 |
 | `tool.started`、`tool.finished`、`operation.reconciliation_required` | 工具名、效果类别、回执 ID、状态。开始/结束可计算时长；未确认动作明确列出回执 ID 并阻塞恢复。 |
+| `tool.approval_resolved` | 工具名、回执关联 ID 和本次是否同意。完整参数与系统保存路径保留在临时授权通道。长进程的 `tool.started` 带 managed 标记，直到实际退出才结算原操作。 |
 | `verification.finished`、`context.compacted` | 确定性验收通过与证据代码，或压缩前后 Token 估计。 |
 | `memory.captured`、`memory.recalled` | 数量以及 memoryId、version、kind。文本留在受作用域约束的 Memory Core。 |
 | `judgment.evaluated` | 决策 ID、版本、mode、规则/选用结果、可用的 Shadow 候选、状态、证据引用、时长和可用的 Judge 用量。见 [Jev 接入](15-jev-integration.md)。 |
