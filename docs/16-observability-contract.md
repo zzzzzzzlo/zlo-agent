@@ -2,6 +2,8 @@
 
 使用 Host JSONL 的 `listTasks` 发现任务，并用 `events(taskId, after)` 回放或 `subscribe(taskId, after)` 续订。同一 Task 的 `seq` 单调增长，从客户端最后持久化的 Cursor 续读，按 `id` 去重。Task 间无全局序号。桌面使用独立的 Conversation 事件流和 Cursor。消息增量与完整对话只供有权限的桌面会话使用。
 
+独立中台使用 Host 可选的回环只读端口。`GET /v1/tasks` 分页发现任务，`GET /v1/tasks/:id` 返回脱敏 DAG 和尝试快照，`GET /v1/tasks/:id/events?after=` 返回最多 128 条投影事件，`POST /v1/watch` 等待已知 Task 游标发生变化。完整取证由 `POST /v1/tasks/:id/evidence` 独立授权访问。启动、指标和证据边界见 [Zlo Observatory](23-observatory.md)。
+
 ## 公共信封
 
 `schemaVersion` 当前为 1。每条事件包含 `id`、`seq`、`occurredAt`、`taskId`、`type`、`payload`。按事件来源附带 `taskRunId`、`taskNodeId`、`taskAttemptId`、`agentId`、`agentRunId`、`parentAgentRunId`、`sessionId`、`correlationId` 和 `causationId`。字段缺省时由消费者保留未知值。业务事件入库后再通知订阅方，订阅方故障隔离。
@@ -26,3 +28,5 @@
 - 历史事件仍可按原 Cursor 回放。旧验收无 `verdict` 时，用共享的 `verificationVerdict` 解读。旧版助手文本、成功回执、完成子节点及无法识别的验收证据按未验收计数。根任务和桌面快照自动提供归一后的结论。
 
 消费端应忽略未识别的可选字段和事件类型。所有绝对路径、原始工具输出、Prompt、凭证及 Pi Session 文件留在所属业务或本机存储。中台按任务、节点、Agent Run 和操作 ID 聚合。采集前按自身授权限定访问范围与留存期，观测投影保持只读。
+
+当前预留事件可附带 `estimatedInputTokens`、`maxOutputTokens`、`taskTokenLimit`，核销记录可附带 `durationMs`，用量可与预留共享 `correlationId`。`memory.recalled` 可附带 `elapsedMs`、`contextBytes`、`budgetBytes`，`memory.captured` 可附带 `elapsedMs`。`tool.denied` 记录工具名、效果类别及有限拒绝原因，`tool.approval_resolved` 可附带批准类型，`task.permissions_changed` 可附带此前访问级别。旧历史缺少这些字段时由消费者保留缺测状态。

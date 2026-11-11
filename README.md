@@ -27,6 +27,8 @@ Zlo Agent 是基于 Pi 的本地优先通用 Agent，首个场景为 Windows Cod
 | `docs/20-desktop-management-plan.md` | 0.5.0 桌面管理差距与里程碑 |
 | `docs/21-desktop-management.md` | 0.5.0 设置、协议、权限与核对说明 |
 | `docs/22-desktop-0.5.0-verification.md` | 0.5.0 验收结果与剩余限制 |
+| `docs/23-observatory.md` | 独立中台启动、指标定义和评估边界 |
+| `docs/24-observatory-verification.md` | 中台验收、测试和已知范围 |
 | `diagrams/system.mmd` | 可渲染的 Mermaid 系统架构图 |
 | `diagrams/runtime-sequence.mmd` | 可渲染的运行与停止流程图 |
 
@@ -41,3 +43,7 @@ Host 提供版本化 Task DAG、Root/Team/Worker 分层执行、模型预留和�
 工具扩展加入受控 Shell/Process、文件搜索与精确 Patch、本地 Git 修改与 Worktree、公共网页抓取与搜索、隔离浏览器及原生文件导出。高风险工具通过桌面原生确认，每次授权限定在本次参数和执行。详见 [工具系统](docs/18-tool-system.md)。
 
 信任项目的命令按当前系统账户运行。隔离、恢复和模型路由的边界见 [第三轮验收](docs/17-core-verification.md)。旧版桌面协议和实施记录见 [Sprint 4](docs/11-desktop-protocol.md) 与 [Sprint 0–3](docs/10-sprint-execution.md)。
+
+## 独立运行中台
+
+Zlo Observatory 提供运行指标、Task DAG 和 Agent Trace，以及单独归档的只读质量评估。启动方式和指标定义见 [中台使用文档](docs/23-observatory.md)。

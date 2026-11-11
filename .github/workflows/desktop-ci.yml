@@ -49,6 +49,11 @@ jobs:
         run: npm.cmd --prefix ui run typecheck
       - name: Run UI tests and Shared Contracts boundary checks
         run: npm.cmd --prefix ui test
+      - name: Check Observatory types
+        run: npm.cmd --prefix observatory run typecheck
+      - name: Run Observatory integration and browser tests
+        timeout-minutes: 5
+        run: npm.cmd --prefix observatory test
       - name: Run Electron E2E
         timeout-minutes: 8
         run: npm.cmd --prefix ui run test:desktop
