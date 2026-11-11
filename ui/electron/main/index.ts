@@ -102,10 +102,7 @@ function createWindow() {
 }
 
 const ownsProfile = app.requestSingleInstanceLock()
-if (!ownsProfile) {
-  console.warn('Zlo Agent could not acquire the desktop profile lock.')
-  app.exit(0)
-}
+if (!ownsProfile) app.exit(0)
 
 app.whenReady().then(() => {
   session.defaultSession.setPermissionRequestHandler((_contents, _permission, callback) => callback(false))

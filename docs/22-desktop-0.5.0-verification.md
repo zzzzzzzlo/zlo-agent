@@ -23,6 +23,8 @@
 
 首次运行暴露出 runner 临时目录与工作区路径策略不兼容。工作流为测试夹具选择独立、规范化的本地临时目录，保留产品对重定向工作区的拒绝规则。随后补足 Windows PowerShell 冷启动的测试等待预算，并以子进程创建的标志文件确认它已实际运行。
 
+全新 runner 的 Electron 启动探针曾返回 `ENOENT`。Electron 43 的 npm 入口会在首次解析可执行文件时下载二进制。E2E 改用该入口取得路径，并在启动 GUI 前检查二进制能否执行。每个测试实例同时验证独立的用户数据目录和单实例锁。
+
 ## 待现场验收与限制
 
 ChatGPT 接入采用 OpenAI 的 [开源应用授权](https://developers.openai.com/siwc/token-sharing-open-source/sign-in) 和官方 Responses 路径。自动化覆盖授权参数、回环、身份令牌校验、独立账号路由、请求适配与预算。真实账号的网页授权与第一次推理需要账号持有人确认，未将该场景计为通过。

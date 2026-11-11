@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { before, test } from 'node:test'
@@ -10,11 +11,14 @@ import { promisify } from 'node:util'
 import { _electron as electron } from 'playwright-core'
 
 const appPath = resolve(fileURLToPath(new URL('..', import.meta.url)))
-const executablePath = join(appPath, 'node_modules', 'electron', 'dist', 'electron.exe')
+const require = createRequire(import.meta.url)
 const exec = promisify(execFile)
+let executablePath
 
 before(async () => {
   if (process.platform !== 'win32') return
+  // Electron's npm entry point downloads the binary on a clean install.
+  executablePath = require('electron')
   try {
     const { stdout } = await exec(executablePath, ['-p', 'process.versions.electron'], {
       cwd: appPath, env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' }, windowsHide: true, timeout: 12_000,
