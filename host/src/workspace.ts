@@ -4,6 +4,7 @@ import type { Stats } from 'node:fs'
 import { lstat, mkdir, open, opendir, realpath, rename, unlink } from 'node:fs/promises'
 import { dirname, join, relative, resolve } from 'node:path'
 import type { ExecutionTool } from './execution.ts'
+import type { ApprovalKind } from '../../shared/contracts/tool-approval.ts'
 import { projectCommands } from './contracts/domain.ts'
 import type { ProjectCommand, VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
 import {
@@ -13,7 +14,33 @@ import {
 
 export { parseProjectCommand } from './workspace-process.ts'
 export type { VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
-export type WorkspaceTool = ExecutionTool & { effect: 'read' | 'write' }
+export interface ToolPolicy {
+  minimumAccess?: WorkspaceAccess
+  rootOnly?: boolean
+  approval?: ApprovalKind
+  targets?(input: unknown): string[]
+  deferred?: boolean
+  whileActive?: boolean
+}
+
+export interface DeferredToolOperation {
+  completion: Promise<'succeeded' | 'failed' | 'unknown_effect'>
+  stop(): Promise<void>
+}
+
+export interface ToolInvocationContext {
+  taskId: string
+  agentRunId: string
+  destination?: string
+  defer(operation: DeferredToolOperation): void
+  onCleanup(cleanup: () => Promise<void>): void
+}
+
+export interface WorkspaceTool extends ExecutionTool {
+  effect: 'read' | 'write'
+  policy?: ToolPolicy
+  execute(callId: string, input: unknown, signal?: AbortSignal, context?: ToolInvocationContext): Promise<unknown>
+}
 export interface Verifier {
   verify(check: VerificationCheck, signal?: AbortSignal, access?: WorkspaceAccess): Promise<VerificationResult>
 }
@@ -107,6 +134,33 @@ export class CodingWorkspace implements Verifier {
     }
     this.root = canonical
     this.#rootStat = stat
+  }
+
+  async checkedTarget(value: unknown, kind: 'file' | 'directory' | 'new'): Promise<string> {
+    const parts = segments(value, kind === 'directory')
+    if (kind !== 'new') return (await this.#checkedPath(parts, kind === 'directory')).path
+    const { path: parent } = await this.#checkedPath(parts.slice(0, -1), true)
+    const target = join(parent, parts.at(-1)!)
+    try {
+      await lstat(target)
+    } catch (error) {
+      if (errorCode(error) === 'ENOENT') return target
+      throw error
+    }
+    throw new WorkspaceDenied('Workspace entry already exists')
+  }
+
+  readTextSnapshot(value: unknown, signal?: AbortSignal) {
+    return this.#read(segments(value), signal)
+  }
+
+  acquireWrite(): (() => void) | undefined {
+    if (!this.#startWrite()) return undefined
+    let held = true
+    return () => {
+      if (held) activeWrites.delete(this.root)
+      held = false
+    }
   }
 
   tools(role: 'root' | 'team' | 'worker', access: WorkspaceAccess = role === 'root' ? 'write' : 'read'): WorkspaceTool[] {

@@ -113,7 +113,7 @@ export function gitInvocation(workspace: string, args: string[]): Invocation | u
   }
 }
 
-function processEnvironment(workspace: string, invocation?: Invocation): NodeJS.ProcessEnv {
+export function processEnvironment(workspace: string, invocation?: Invocation): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {
     PATH: trustedPath(workspace).join(delimiter),
     CI: '1',

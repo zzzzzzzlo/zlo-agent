@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -62,6 +63,137 @@ async function fixture() {
 function ok(value: unknown): boolean {
   return Boolean(value && typeof value === 'object' && 'ok' in value && value.ok === true)
 }
+
+test('Host journals an approved shell command while it runs and accepts only its owner polling it', { timeout: 10_000 }, async () => {
+  const env = await fixture()
+  let approvals = 0
+  const execution = new ScriptExecution(async (_config, _prompt, call) => {
+    const launched = await call('shell_exec', process.platform === 'win32'
+      ? { shell: 'powershell', command: "Write-Output 'approved-process'; Start-Sleep -Milliseconds 650" }
+      : { shell: 'sh', command: 'echo approved-process; sleep 1' }) as { ok: boolean; processId: string }
+    assert.ok(launched.ok)
+    const input = { processId: launched.processId }
+    assert.equal(ok(await call('create_text_file', { path: 'blocked.txt', content: 'overlap' })), false)
+    for (let attempt = 0; attempt < 40; attempt++) {
+      const status = await call('process_status', input) as { state: string; exitCode?: number }
+      if (status.state === 'exited') {
+        assert.equal(status.exitCode, 0)
+        assert.match(JSON.stringify(await call('process_output', input)), /approved-process/)
+        return 'Command completed'
+      }
+      await delay(50)
+    }
+    throw new Error('Shell did not settle')
+  })
+  const host = new LocalAgentHost({ ...env, execution, approveTool: async request => {
+    assert.equal(request.kind, 'shell')
+    assert.match(request.detail, /approved-process/)
+    approvals++
+    return { approved: true }
+  } })
+  try {
+    const { taskId } = await host.createTask({
+      requestId: 'shell', goal: 'Execute the command', cwd: env.workspace, workspaceAccess: 'trusted',
+    })
+    await host.idle()
+    assert.equal(host.getTask(taskId).status, 'succeeded')
+    assert.equal(approvals, 1)
+    const operations = host.getHistory(taskId).operations
+    assert.ok(operations.some(({ tool, status, managed }) => tool === 'shell_exec' && status === 'succeeded' && managed))
+    assert.ok(operations.some(({ tool, status }) => tool === 'process_output' && status === 'succeeded'))
+    assert.ok(!operations.some(({ tool }) => tool === 'create_text_file'))
+  } finally {
+    await host.close()
+    await rm(env.path, { recursive: true, force: true })
+  }
+})
+
+test('stopping a task with an active shell records unknown effects and refuses to replay it', { timeout: 15_000 }, async () => {
+  const env = await fixture()
+  const started = Promise.withResolvers<void>()
+  const execution = new ScriptExecution(async (_config, _prompt, call, signal) => {
+    const result = await call('shell_exec', process.platform === 'win32'
+      ? { shell: 'powershell', command: 'Start-Sleep -Seconds 30' }
+      : { shell: 'sh', command: 'sleep 30' })
+    assert.ok(ok(result))
+    started.resolve()
+    await delay(30_000, undefined, { signal })
+    return 'Unexpected completion'
+  })
+  const host = new LocalAgentHost({ ...env, execution, approveTool: async () => ({ approved: true }) })
+  try {
+    const { taskId } = await host.createTask({
+      requestId: 'shell-stop', goal: 'Start the process', cwd: env.workspace, workspaceAccess: 'trusted',
+    })
+    await Promise.race([started.promise, delay(5_000, undefined, { ref: false }).then(() => { throw new Error('Shell did not start') })])
+    assert.ok(host.getHistory(taskId).operations.some(({ tool, status }) => tool === 'shell_exec' && status === 'started'))
+    assert.equal(host.stop(taskId, 'shell-stop-user').accepted, true)
+    await host.idle()
+    assert.equal(host.getTask(taskId).status, 'needs_reconciliation')
+    assert.ok(host.getHistory(taskId).operations.some(({ tool, status }) => tool === 'shell_exec' && status === 'unknown_effect'))
+    assert.equal(host.resume(taskId, 'shell-no-replay').accepted, false)
+  } finally {
+    await host.close()
+    await rm(env.path, { recursive: true, force: true })
+  }
+})
+
+test('approved Git worktrees isolate two real concurrent write nodes and merge only confirmed local commits', { timeout: 25_000 }, async () => {
+  const env = await fixture()
+  await writeFile(join(env.workspace, 'src', 'base.txt'), 'baseline')
+  const git = (...args: string[]) => execFileSync('git', ['-C', env.workspace, ...args], { windowsHide: true, stdio: 'pipe' })
+  git('init', '-q')
+  git('config', '--local', 'user.name', 'Zlo Test')
+  git('config', '--local', 'user.email', 'zlo@example.test')
+  git('add', '--', 'src/base.txt')
+  git('commit', '-qm', 'baseline')
+  const concurrent = Promise.withResolvers<void>()
+  const roots = new Set<string>()
+  const execution = new ScriptExecution(async (config, prompt, call) => {
+    if (config.role === 'root') {
+      const assignments = []
+      for (const branch of ['node-one', 'node-two']) {
+        const created = await call('git_worktree', { branch }) as { ok: boolean; worktreeId: string }
+        assert.ok(created.ok)
+        assignments.push({ ref: branch, goal: branch, access: 'write', scopePath: 'src', worktreeId: created.worktreeId,
+          check: { path: 'src/' + branch + '.txt', contains: branch } })
+      }
+      assert.ok(ok(await call('propose_task_plan', { nodes: assignments })))
+      for (const assignment of assignments) {
+        await assert.rejects(readFile(join(env.workspace, 'src', assignment.ref + '.txt')))
+        assert.ok(ok(await call('git_commit', {
+          worktreeId: assignment.worktreeId, message: 'Add ' + assignment.ref, paths: ['src/' + assignment.ref + '.txt'],
+        })))
+        assert.ok(ok(await call('git_merge', { branch: assignment.ref })))
+      }
+      return 'Both worktrees merged'
+    }
+    roots.add(config.cwd)
+    if (roots.size === 2) concurrent.resolve()
+    const ready = await Promise.race([concurrent.promise.then(() => true), delay(2_000, false, { ref: false })])
+    assert.ok(ready)
+    const branch = prompt.startsWith('node-one') ? 'node-one' : 'node-two'
+    assert.ok(ok(await call('create_text_file', { path: 'src/' + branch + '.txt', content: branch })))
+    return 'Verified branch'
+  })
+  const host = new LocalAgentHost({ ...env, execution, approveTool: async () => ({ approved: true }) })
+  try {
+    const { taskId } = await host.createTask({
+      requestId: 'worktree', goal: 'Implement both branches', cwd: env.workspace, workspaceAccess: 'trusted',
+    })
+    await host.idle()
+    assert.equal(host.getTask(taskId).status, 'succeeded')
+    assert.equal(roots.size, 2)
+    assert.ok(!roots.has(env.workspace))
+    assert.equal(await readFile(join(env.workspace, 'src', 'node-one.txt'), 'utf8'), 'node-one')
+    assert.equal(await readFile(join(env.workspace, 'src', 'node-two.txt'), 'utf8'), 'node-two')
+    assert.equal(new Set(host.getHistory(taskId).operations.filter(({ tool }) => tool === 'create_text_file')
+      .map(({ worktreeId }) => worktreeId)).size, 2)
+  } finally {
+    await host.close()
+    await rm(env.path, { recursive: true, force: true })
+  }
+})
 
 test('Host runs a verified DAG with Team reuse, nested scope, replan and six live decisions', async () => {
   const env = await fixture()

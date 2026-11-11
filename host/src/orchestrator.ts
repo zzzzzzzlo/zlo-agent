@@ -11,9 +11,11 @@ import type { LocalModelScheduler } from './model-scheduler.ts'
 import type { AgentRole, CapabilityScope, CodingCapabilities, CodingProfile, ExtensionRegistry } from './policies.ts'
 import type { LocalStore } from './store.ts'
 import type { TaskEngine, TaskSnapshot, WorkerNode, WorkerResult } from './task-engine.ts'
+import type { ToolApprovalBroker } from './tool-approval.ts'
+import { ToolRun } from './tool-run.ts'
 import { verifyWorkspace } from './verification.ts'
 import { workspaceTarget } from './workspace.ts'
-import type { CodingWorkspace, WorkspaceTool } from './workspace.ts'
+import type { CodingWorkspace } from './workspace.ts'
 
 interface AgentRecord {
   schemaVersion: 1
@@ -64,6 +66,8 @@ export class MultiAgentOrchestrator {
   readonly #context: ScopedContext
   readonly #judgment: LocalJudgment
   readonly #extensions: ProfileRuntime
+  readonly #approval: ToolApprovalBroker
+  readonly #resolveWorkspace?: (workspace: CodingWorkspace, taskId: string, id: string, signal: AbortSignal) => Promise<CodingWorkspace | undefined>
   readonly #sessions: string
   readonly #onOutput?: (event: EventDraft, delta: string) => void
   readonly #onCheckpoint?: (taskId: string) => void
@@ -76,6 +80,8 @@ export class MultiAgentOrchestrator {
     store: LocalStore; tasks: TaskEngine; execution: AgentExecution; scheduler: LocalModelScheduler;
     capabilities: CodingCapabilities; profile: Readonly<CodingProfile>; context: ScopedContext; judgment: LocalJudgment; sessions: string;
     extensions: ProfileRuntime
+    approval: ToolApprovalBroker
+    resolveWorkspace?: (workspace: CodingWorkspace, taskId: string, id: string, signal: AbortSignal) => Promise<CodingWorkspace | undefined>
     onOutput?: (event: EventDraft, delta: string) => void
     onCheckpoint?: (taskId: string) => void
   }) {
@@ -88,6 +94,8 @@ export class MultiAgentOrchestrator {
     this.#context = ports.context
     this.#judgment = ports.judgment
     this.#extensions = ports.extensions
+    this.#approval = ports.approval
+    this.#resolveWorkspace = ports.resolveWorkspace
     this.#sessions = ports.sessions
     this.#onOutput = ports.onOutput
     this.#onCheckpoint = ports.onCheckpoint
@@ -177,36 +185,6 @@ export class MultiAgentOrchestrator {
     })
   }
 
-  #wrap(tool: WorkspaceTool, event: () => EventDraft, signal: AbortSignal,
-    authorize: (input: unknown) => boolean, evidence?: Set<string>, artifacts?: Set<string>): ExecutionTool {
-    return {
-      ...tool,
-      execute: async (callId, input, toolSignal) => {
-        if (signal.aborted || toolSignal?.aborted || !authorize(input)) return { ok: false, error: 'Tool work is unavailable' }
-        const ref = event()
-        const operationId = ref.agentRunId + ':' + callId
-        this.#tasks.beginTool(ref.taskId, ref, operationId, tool.name, tool.effect,
-          tool.effect === 'write' ? workspaceTarget(input) : undefined)
-        let result: unknown
-        try {
-          const combined = toolSignal ? AbortSignal.any([signal, toolSignal]) : signal
-          result = await tool.execute(callId, input, combined)
-        } catch {
-          this.#tasks.finishTool(ref, operationId, tool.effect === 'write' ? 'unknown_effect' : 'failed')
-          return { ok: false, error: tool.effect === 'write' ? 'Write result requires reconciliation' : 'Tool failed' }
-        }
-        const failed = !result || typeof result !== 'object' || !('ok' in result) || result.ok !== true
-        this.#tasks.finishTool(ref, operationId, failed ? 'failed' : 'succeeded')
-        if (!failed) {
-          evidence?.add(operationId)
-          const target = tool.name === 'read_text_file' || tool.effect === 'write' ? workspaceTarget(input) : undefined
-          if (target) artifacts?.add(target)
-        }
-        return result
-      },
-    }
-  }
-
   #watchStop(session: ExecutionSession, signal: AbortSignal): () => Promise<void> {
     let stopping: Promise<void> | undefined
     const abort = () => {
@@ -225,11 +203,6 @@ export class MultiAgentOrchestrator {
     }
   }
 
-  #unknownWrite(taskId: string): boolean {
-    return this.#tasks.operations(taskId).some(({ effect, status }) =>
-      effect === 'write' && (status === 'unknown_effect' || status === 'started'))
-  }
-
   async #worker(task: TaskSnapshot, node: WorkerNode, parent: EventDraft, workspace: CodingWorkspace,
     parentRoute: ModelRoute, parentScope: CapabilityScope, rootSignal: AbortSignal, suspendParent = false): Promise<WorkerResult | undefined> {
     const role = node.role ?? 'worker'
@@ -242,6 +215,7 @@ export class MultiAgentOrchestrator {
     }
     const evidence = new Set<string>()
     const artifacts = new Set<string>()
+    const toolRun = new ToolRun(this.#tasks, this.#approval)
     let session: ExecutionSession | undefined
     let unwatch: (() => Promise<void>) | undefined
     let lease: ReturnType<LocalModelScheduler['reserve']> | undefined
@@ -252,15 +226,22 @@ export class MultiAgentOrchestrator {
     let teamLease: string | undefined
     let childActive = false
     let workspaceActive = false
+    const blockingWrite = () => this.#tasks.blocksToolWork(task.id, undefined, node.worktreeId)
     try {
-      if (rootSignal.aborted || this.#unknownWrite(task.id)) return undefined
+      if (rootSignal.aborted || blockingWrite()) return undefined
       const attemptId = this.#tasks.startWorker(task.id, node.id, { suspendParent })
       event = { ...event, taskAttemptId: attemptId }
       started = true
+      if (node.worktreeId && parent.taskNodeId === task.rootNodeId) {
+        const isolated = await this.#resolveWorkspace?.(workspace, task.id, node.worktreeId, signal)
+        if (!isolated) throw new Error('Worktree ownership or registration could not be verified')
+        workspace = isolated
+      }
       lease = this.#scheduler.reserve(() => event, role)
-      const scope = this.#capabilities.child(parentScope, node.access, node.scopePath)
+      const scope = this.#capabilities.child(parentScope, node.access, node.scopePath, role)
       const teamKey = role === 'team'
-        ? 'team-' + createHash('sha256').update(JSON.stringify([task.conversationId ?? task.id, node.teamKey, parentRoute.provider, scope])).digest('hex')
+        ? 'team-' + createHash('sha256').update(JSON.stringify([task.conversationId ?? task.id, node.teamKey, parentRoute.provider,
+          { access: scope.access, path: scope.path, worktreeId: node.worktreeId }])).digest('hex')
         : undefined
       const saved = teamKey ? this.#db.get<AgentRecord>('agents', teamKey) : undefined
       if (teamKey) {
@@ -273,8 +254,8 @@ export class MultiAgentOrchestrator {
       const tools = this.#extensions.tools(workspace, role, scope.access)
         .filter(tool => this.#capabilities.describe(scope, tool))
         .map(tool => {
-          const wrapped = this.#wrap(tool, () => event, signal, input =>
-            !childActive && !this.#unknownWrite(task.id) && this.#capabilities.authorize(scope, tool, input), evidence, artifacts)
+          const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input =>
+            !childActive && !blockingWrite() && this.#capabilities.authorize(scope, tool, input), evidence, artifacts)
           return {
             ...wrapped,
             execute: async (id: string, input: unknown, toolSignal?: AbortSignal) => {
@@ -302,7 +283,7 @@ export class MultiAgentOrchestrator {
         },
         execute: async (id, input, toolSignal) => {
           if (!input || typeof input !== 'object' || !('goal' in input) || typeof input.goal !== 'string' ||
-            signal.aborted || toolSignal?.aborted || childActive || workspaceActive || this.#unknownWrite(task.id)) {
+            signal.aborted || toolSignal?.aborted || childActive || workspaceActive || blockingWrite()) {
             return { ok: false, error: 'Delegation unavailable' }
           }
           const goal = input.goal
@@ -327,7 +308,7 @@ export class MultiAgentOrchestrator {
         systemPrompt: this.#extensions.workflow.systemPrompt(role, scope.access, node.check),
         reserveRequest: (request) => {
           signal.throwIfAborted()
-          if (this.#unknownWrite(task.id)) throw new Error('Unconfirmed workspace operation')
+          if (blockingWrite()) throw new Error('Unconfirmed workspace operation')
           lease!.request(request)
         },
         onEvent: (runtime) => {
@@ -360,7 +341,8 @@ export class MultiAgentOrchestrator {
         ]
         const target = workspaceTarget(node.check ?? (scope.path ? undefined : task.check))
         const prompt = await this.#context.build(event, {
-          scope: scope.path ? JSON.stringify([memoryScope(task, session.route), scope.path]) : memoryScope(task, session.route),
+          scope: scope.path || node.worktreeId ? JSON.stringify([memoryScope(task, session.route), scope.path, node.worktreeId])
+            : memoryScope(task, session.route),
           goal: node.goal, constraints,
           artifactRefs: target ? [target] : [], availableTools: tools.map(tool => tool.name), signal,
         })
@@ -369,7 +351,7 @@ export class MultiAgentOrchestrator {
         if (!signal.aborted && outcome.status === 'completed' && outcome.text.trim()) {
           if (node.check) verification = await verifyWorkspace(this.#tasks, this.#extensions.workflow,
             workspace, event, node.check, signal,
-            node.check.command && !scope.path && parentScope.access === 'trusted' && node.access === 'write' ? 'trusted' : scope.access)
+            node.check.command && !node.worktreeId && !scope.path && parentScope.access === 'trusted' && node.access === 'write' ? 'trusted' : scope.access)
           const hardEvidence = node.check ? verification?.passed === true : evidence.size > 0 ||
             (this.#tasks.get(task.id).nodes?.some(child => child.parentNodeId === node.id && child.status === 'succeeded') ?? false)
           const accepted = await this.#judgment.decide(event, 'handoff.sufficiency', {
@@ -397,6 +379,7 @@ export class MultiAgentOrchestrator {
       } catch {
         result = undefined
       } finally {
+        try { await toolRun.close() } catch { result = undefined }
         clearTimeout(timer)
         if (teamLease) this.#activeTeams.delete(teamLease)
         lease?.release()
@@ -416,6 +399,7 @@ export class MultiAgentOrchestrator {
 
 
   async run(task: TaskSnapshot, workspace: CodingWorkspace, stopSignal: AbortSignal): Promise<Outcome> {
+    const toolRun = new ToolRun(this.#tasks, this.#approval)
     const budget = new AbortController()
     const signal = AbortSignal.any([stopSignal, budget.signal])
     const agentKey = task.conversationId ?? task.id
@@ -440,7 +424,7 @@ export class MultiAgentOrchestrator {
     let prompted = new Set<string>()
     let outcome: Outcome = { status: 'runtime_error' }
     const rootScope = this.#capabilities.root(task.workspaceAccess, Boolean(task.check))
-    const hasUnknownWrite = () => this.#unknownWrite(task.id)
+    const hasUnknownWrite = () => this.#tasks.blocksToolWork(task.id)
     const dispatchAllowed = (toolSignal?: AbortSignal) =>
       this.#profile.delegation && !signal.aborted && !toolSignal?.aborted && !workspaceActive && !workerActive && !hasUnknownWrite()
     const runWorker = async (node: WorkerNode): Promise<WorkerResult | undefined> => {
@@ -485,8 +469,9 @@ export class MultiAgentOrchestrator {
     const tools: ExecutionTool[] = this.#extensions.tools(workspace, 'root', rootScope.access)
       .filter(tool => this.#capabilities.describe(rootScope, tool))
       .map(tool => {
-        const wrapped = this.#wrap(tool, () => event, signal, input =>
-          !workerActive && !hasUnknownWrite() && this.#capabilities.authorize(rootScope, tool, input))
+        const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input =>
+          !workerActive && !this.#tasks.blocksToolWork(task.id, tool.policy?.whileActive ? event.agentRunId : undefined) &&
+          this.#capabilities.authorize(rootScope, tool, input))
         return {
           ...wrapped,
           execute: async (id, input, toolSignal) => {
@@ -581,7 +566,7 @@ export class MultiAgentOrchestrator {
       systemPrompt: this.#extensions.workflow.systemPrompt('root', rootScope.access, task.check),
       reserveRequest: (request) => {
         signal.throwIfAborted()
-        if (hasUnknownWrite()) throw new Error('Unconfirmed workspace operation')
+        if (this.#tasks.blocksToolWork(task.id, event.agentRunId)) throw new Error('Unconfirmed workspace operation')
         try { lease!.request(request) } catch (error) {
           if (error instanceof ModelBudgetError) budget.abort()
           throw error
@@ -771,6 +756,7 @@ export class MultiAgentOrchestrator {
       } catch {
         checkpointFailed = true
       } finally {
+        try { await toolRun.close() } catch { checkpointFailed = true }
         unlockRoute()
         clearTimeout(deadline)
         lease?.release()

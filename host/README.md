@@ -98,3 +98,9 @@ node --disable-warning=ExperimentalWarning --test test/host.test.ts test/cli.tes
 桌面启动与用户操作见 [桌面手册](../ui/README.md)。[Sprint 4 桌面协议](../docs/11-desktop-protocol.md) 定义 `createConversation`、`getConversationHistory`、`sendMessage`、`steerConversation`、`stopConversation`、`resumeConversation` 与游标订阅。Host 保留既有 Task CLI，同时在 Conversation 上提供产品级历史。使用 `--faux` 可通过官方 Faux Provider 运行真实 Pi SDK 的离线开发场景。
 
 第三轮新增的 [中台事件](../docs/16-observability-contract.md) 与 [可替换 Judge](../docs/15-jev-integration.md) 沿用每个 Task 的事件回放边界。
+
+## 工具系统
+
+默认 Coding Profile 的工具清单与权限见 [工具系统说明](../docs/18-tool-system.md)。新工具均通过 Capability Plugin 注册，并在执行时验证 Agent、Task 和路径权限。
+
+CLI 在高风险操作前输出临时 `kind: "tool.approval"` 帧。受信任客户端通过 `resolveToolApproval` 命令提交 `approvalId` 和 `decision: { approved: boolean, destination?: string }`。导出目的地由明确的系统保存操作提供。审批 60 秒超时，任务停止后拒绝迟到回复。桌面端由 Electron Main 原生对话框处理该协议。

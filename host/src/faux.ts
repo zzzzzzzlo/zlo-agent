@@ -26,6 +26,7 @@ export class FauxExecution extends PiExecution {
         if (tail?.role === 'toolResult') {
           const content = tail.content.filter((part) => part.type === 'text').map((part) => part.text).join('')
           if (!content.includes('"ok":true')) return fauxAssistantMessage('文件工具未完成请求，请检查工作区和验收路径。')
+          if (tail.toolName === 'export_artifact') return fauxAssistantMessage('已导出工作区文件。')
           if (['read_text_file', 'delegate_worker', 'propose_task_plan'].includes(tail.toolName)) {
             return fauxAssistantMessage('已核对登录页的工具证据。')
           }
@@ -51,6 +52,9 @@ export class FauxExecution extends PiExecution {
         }
         if (text.startsWith('[worker-read]') && available.includes('read_text_file')) {
           return tool('read_text_file', { path: 'login.html' })
+        }
+        if (text.startsWith('[export-check]') && available.includes('export_artifact')) {
+          return tool('export_artifact', { path: 'login.html' })
         }
         if (/(验证码|captcha)/iu.test(text) && available.includes('edit_text_file')) {
           return tool('edit_text_file', {

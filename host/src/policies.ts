@@ -62,10 +62,11 @@ export class ExtensionRegistry {
   readonly #workflows = new Map<string, WorkflowPack>()
   readonly #profiles = new Map<string, AgentProfile>()
 
-  constructor() {
+  constructor(additional: CapabilityPlugin[] = []) {
     this.registerPlugin(workspacePlugin)
+    for (const plugin of additional) this.registerPlugin(plugin)
     this.registerWorkflow(codingWorkflow)
-    this.registerProfile({ id: 'coding', plugins: ['workspace'], workflow: 'coding', ...defaultCodingProfile })
+    this.registerProfile({ id: 'coding', plugins: ['workspace', ...additional.map(plugin => plugin.id)], workflow: 'coding', ...defaultCodingProfile })
   }
 
   #add<T extends { id: string }>(entries: Map<string, T>, item: T): void {
@@ -100,7 +101,10 @@ export class ExtensionRegistry {
 export interface CapabilityScope {
   access: WorkspaceAccess
   path?: string
+  role: AgentRole
 }
+
+const accessRank: Record<WorkspaceAccess, number> = { read: 0, write: 1, trusted: 2 }
 
 export class CodingCapabilities {
   readonly #profile: Readonly<CodingProfile>
@@ -110,25 +114,34 @@ export class CodingCapabilities {
   }
 
   root(access: WorkspaceAccess | undefined, legacyCheck: boolean): CapabilityScope {
-    return { access: this.#profile.workspaceWrites ? access ?? (legacyCheck ? 'write' : 'read') : 'read' }
+    return { role: 'root', access: this.#profile.workspaceWrites ? access ?? (legacyCheck ? 'write' : 'read') : 'read' }
   }
 
-  child(parent: CapabilityScope, requested?: 'read' | 'write', path?: string): CapabilityScope {
+  child(parent: CapabilityScope, requested?: 'read' | 'write', path?: string, role: 'team' | 'worker' = 'worker'): CapabilityScope {
     if (requested === 'write' && parent.access === 'read') throw new Error('Parent workspace scope cannot write')
     const target = path === undefined ? parent.path : workspaceTarget({ path })
     if (path !== undefined && (!target || !within(parent.path, target))) throw new Error('Child workspace scope exceeds its parent')
-    return { access: requested ?? 'read', path: target }
+    return { role, access: requested ?? 'read', path: target }
   }
 
   describe(scope: CapabilityScope, tool: WorkspaceTool): boolean {
-    return tool.effect === 'read' || scope.access !== 'read'
+    if (tool.policy?.rootOnly && scope.role !== 'root') return false
+    const minimum = tool.policy?.minimumAccess ?? (tool.effect === 'write' ? 'write' : 'read')
+    return accessRank[scope.access] >= accessRank[minimum] && (tool.effect === 'read' || scope.access !== 'read')
   }
 
   authorize(scope: CapabilityScope, tool: WorkspaceTool, input: unknown): boolean {
     if (!this.describe(scope, tool)) return false
     if (!scope.path) return true
-    const target = workspaceTarget(input)
-    return target !== undefined && within(scope.path, target)
+    try {
+      const targets = tool.policy?.targets ? tool.policy.targets(input) : [workspaceTarget(input)]
+      return targets.length > 0 && targets.every(value => {
+        const target = workspaceTarget({ path: value })
+        return target !== undefined && within(scope.path, target)
+      })
+    } catch {
+      return false
+    }
   }
 }
 

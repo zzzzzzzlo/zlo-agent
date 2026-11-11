@@ -23,6 +23,7 @@ export interface WorkerNode {
   teamKey?: string
   access?: 'read' | 'write'
   scopePath?: string
+  worktreeId?: string
   check?: VerificationCheck
   route?: ModelRoute
   verification?: VerificationResult
@@ -38,6 +39,7 @@ export interface NodeProposal {
   teamKey?: string
   access?: 'read' | 'write'
   scopePath?: string
+  worktreeId?: string
   check?: VerificationCheck
   route?: ModelRoute
 }
@@ -94,6 +96,8 @@ export interface Operation {
   tool: string
   effect: 'read' | 'write'
   target?: string
+  managed?: boolean
+  worktreeId?: string
   status: 'started' | 'succeeded' | 'failed' | 'interrupted' | 'unknown_effect'
 }
 export interface CreateTask {
@@ -153,6 +157,9 @@ function verificationCheck(check: VerificationCheck | undefined): VerificationCh
 }
 function allNodes(task: TaskSnapshot): WorkerNode[] {
   return [...(task.worker ? [task.worker] : []), ...(task.nodes ?? [])]
+}
+function separateWorktrees(left?: string, right?: string): boolean {
+  return Boolean(left && right && left !== right)
 }
 function planRoute(route: ModelRoute): ModelRoute {
   if (typeof route?.provider !== 'string' || typeof route.model !== 'string' ||
@@ -482,6 +489,11 @@ export class TaskEngine {
         const role = proposal.role ?? 'worker'
         const access = proposal.access ?? 'read'
         const parentNodeId = resolve(proposal.parentNodeId ?? task.rootNodeId)
+        if (proposal.worktreeId !== undefined && (typeof proposal.worktreeId !== 'string' ||
+          !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(proposal.worktreeId) ||
+          parentNodeId !== task.rootNodeId || task.workspaceAccess !== 'trusted')) {
+          throw new Error('Worktree isolation requires an approved root-level assignment')
+        }
         if (role !== 'team' && role !== 'worker') throw new Error('Invalid Agent role')
         if (role === 'team' && (typeof proposal.teamKey !== 'string' || !/^[a-zA-Z0-9_-]{1,64}$/.test(proposal.teamKey))) {
           throw new Error('Team node requires a stable Team key')
@@ -501,6 +513,7 @@ export class TaskEngine {
           goal: checkText(proposal.goal, 'worker goal', 8000),
           dependencies: nodeDependencies(proposal.dependencies, resolve),
           ...(proposal.scopePath !== undefined ? { scopePath: scopePath(proposal.scopePath) } : {}),
+          ...(proposal.worktreeId ? { worktreeId: proposal.worktreeId } : {}),
           ...(proposal.teamKey !== undefined ? { teamKey: proposal.teamKey } : {}),
           ...(check ? { check } : {}),
           ...(proposal.route !== undefined ? { route: planRoute(proposal.route) } : {}),
@@ -511,9 +524,13 @@ export class TaskEngine {
       const proposed = candidates.map((node) => {
         const parent = graph.find(({ id }) => id === node.parentNodeId)
         const scope = node.scopePath ?? parent?.scopePath
+        if ((node.worktreeId || parent?.worktreeId) && node.check?.command) {
+          throw new Error('Worktree nodes require file-based verification')
+        }
         if (parent?.scopePath && scope && !containsScope(parent.scopePath, scope)) throw new Error('Node cannot expand parent scope')
         assertCheckInScope(node.check, scope)
-        return scope ? { ...node, scopePath: scope } : node
+        return { ...node, ...(scope ? { scopePath: scope } : {}),
+          ...(parent?.worktreeId ? { worktreeId: parent.worktreeId } : {}) }
       })
       const version = task.planVersion + 1
       this.#save({ ...task, nodes: [...(task.nodes ?? []), ...proposed], planVersion: version })
@@ -540,6 +557,7 @@ export class TaskEngine {
         Object.keys(update).some((key) => !['goal', 'dependencies', 'check'].includes(key))) throw new Error('Invalid node replan')
       if (nodes.some((node) => node.parentNodeId === nodeId && node.status === 'running')) throw new Error('Node has running children')
       const check = update.check !== undefined ? verificationCheck(update.check) : previous.check
+      if (previous.worktreeId && check?.command) throw new Error('Worktree nodes require file-based verification')
       if (check?.command && (task.workspaceAccess !== 'trusted' || previous.access !== 'write')) {
         throw new Error('Command verification requires trusted workspace access and a write node')
       }
@@ -562,9 +580,11 @@ export class TaskEngine {
     })
   }
 
-  #hasOpenWrite(taskId: string): boolean {
-    return this.operations(taskId).some(({ effect, status }) =>
-      effect === 'write' && (status === 'started' || status === 'unknown_effect'))
+  blocksToolWork(taskId: string, managedOwner?: string, worktreeId?: string): boolean {
+    return this.operations(taskId).some(({ effect, status, managed, agentRunId, worktreeId: operationWorktree }) =>
+      effect === 'write' && (status === 'unknown_effect' ||
+        (status === 'started' && !separateWorktrees(worktreeId, operationWorktree) &&
+          !(managed && managedOwner && agentRunId === managedOwner))))
   }
 
   #nodeRunCapacity(task: TaskSnapshot): number {
@@ -582,13 +602,13 @@ export class TaskEngine {
     const teamsWithoutChildren = scheduled.filter((agent) =>
       agent.role === 'team' && !scheduled.some(({ parentNodeId }) => parentNodeId === agent.id)).length
     if (scheduled.length + teamsWithoutChildren > MAX_CONCURRENT_NODES) return false
-    if (node.access === 'write') return active.length === 0
-    return active.every((other) => other.access !== 'write' || (suspendParent && parent === other))
+    return active.every(other => separateWorktrees(node.worktreeId, other.worktreeId) ||
+      (node.access !== 'write' && (other.access !== 'write' || (suspendParent && parent === other))))
   }
 
   runnableNodes(taskId: string, parentNodeId?: string): WorkerNode[] {
     const task = this.get(taskId)
-    if (task.status !== 'running' || this.#hasOpenWrite(taskId)) return []
+    if (task.status !== 'running') return []
     const nodes = allNodes(task)
     const active = nodes.filter(({ status }) => status === 'running')
     const parentId = parentNodeId ?? task.rootNodeId
@@ -597,6 +617,7 @@ export class TaskEngine {
     for (const node of nodes) {
       if (runnable.length >= remaining) break
       if (node.parentNodeId !== parentId ||
+        this.blocksToolWork(taskId, undefined, node.worktreeId) ||
         !this.#canStartNode(task, node, nodes, active, parentNodeId !== undefined)) continue
       runnable.push(node)
       active.push(node)
@@ -612,7 +633,7 @@ export class TaskEngine {
       const nodes = allNodes(task)
       const node = nodes.find(({ id }) => id === nodeId)
       const active = nodes.filter(({ status }) => status === 'running')
-      if (task.status !== 'running' || !node || this.#hasOpenWrite(taskId) || this.#nodeRunCapacity(task) <= 0 ||
+      if (task.status !== 'running' || !node || this.blocksToolWork(taskId, undefined, node.worktreeId) || this.#nodeRunCapacity(task) <= 0 ||
         !this.#canStartNode(task, node, nodes, active, options.suspendParent === true)) {
         throw new Error('Worker node is not runnable')
       }
@@ -626,7 +647,9 @@ export class TaskEngine {
       const next = parent ? changeNode(task, { ...parent, suspendedFor: nodeId }) : task
       this.#save(changeNode(next, running))
       this.#db.put('attempts', id, attempt)
-      this.#nodeEvent(task, running, 'task.node_started', { parentNodeId: node.parentNodeId, role: node.role ?? 'worker' })
+      this.#nodeEvent(task, running, 'task.node_started', {
+        parentNodeId: node.parentNodeId, role: node.role ?? 'worker', worktreeId: node.worktreeId,
+      })
       return id
     })
   }
@@ -682,17 +705,18 @@ export class TaskEngine {
   }
 
   beginTool(taskId: string, event: EventDraft, id: string, tool: string, effect: Operation['effect'], target?: string,
-    phase?: 'verification'): void {
+    phase?: 'verification', policy?: { deferred?: boolean; whileActive?: boolean }): void {
     this.#db.transaction(() => {
       const task = this.get(taskId)
       const expected = phase === 'verification' ? 'verifying' : 'running'
-      if (task.status !== expected || event.taskId !== taskId || !task.attemptId || this.#hasOpenWrite(taskId)) {
-        throw new Error('Task is not accepting tool work')
-      }
-      if (this.#db.get('operations', id)) throw new Error('Duplicate tool call')
       const nodeId = event.taskNodeId ?? task.rootNodeId
       const active = allNodes(task).filter(({ status }) => status === 'running')
       const node = active.find(({ id: current }) => current === nodeId)
+      if (task.status !== expected || event.taskId !== taskId || !task.attemptId ||
+        this.blocksToolWork(taskId, policy?.whileActive ? event.agentRunId : undefined, node?.worktreeId)) {
+        throw new Error('Task is not accepting tool work')
+      }
+      if (this.#db.get('operations', id)) throw new Error('Duplicate tool call')
       if (nodeId !== task.rootNodeId && (!node || phase === 'verification' || node.suspendedFor)) {
         throw new Error('Node is not accepting tool work')
       }
@@ -704,7 +728,7 @@ export class TaskEngine {
       if (phase === 'verification' && effect === 'write' && task.workspaceAccess !== 'trusted') {
         throw new Error('Command verification requires trusted workspace access')
       }
-      if (active.some((other) => other.id !== nodeId && (effect === 'write' ||
+      if (active.some((other) => other.id !== nodeId && !separateWorktrees(node?.worktreeId, other.worktreeId) && (effect === 'write' ||
         (other.access === 'write' && other.suspendedFor !== nodeId)))) {
         throw new Error('Concurrent workspace access conflicts with a write')
       }
@@ -712,11 +736,12 @@ export class TaskEngine {
         schemaVersion: 1, id, taskId, taskRunId: task.taskRunId, attemptId,
         agentRunId: event.agentRunId, agentId: event.agentId, sessionId: event.sessionId,
         taskNodeId: nodeId, parentAgentRunId: event.parentAgentRunId,
-        tool, effect, target, status: 'started',
+        tool, effect, target, status: 'started', ...(policy?.deferred ? { managed: true } : {}),
+        ...(node?.worktreeId ? { worktreeId: node.worktreeId } : {}),
       }
       this.#db.put('operations', id, operation)
       this.#db.append({ ...event, taskRunId: task.taskRunId, taskAttemptId: attemptId, taskNodeId: nodeId,
-        type: 'tool.started', payload: { id, tool, effect } })
+        type: 'tool.started', payload: { id, tool, effect, ...(policy?.deferred ? { managed: true } : {}) } })
     })
   }
 
@@ -734,6 +759,10 @@ export class TaskEngine {
 
   beginVerification(taskId: string): void {
     this.#db.transaction(() => { this.#transition(this.get(taskId), 'verifying') })
+  }
+
+  auditToolApproval(event: EventDraft, id: string, tool: string, approved: boolean): void {
+    this.#db.transaction(() => { this.#db.append({ ...event, type: 'tool.approval_resolved', payload: { id, tool, approved } }) })
   }
 
   continueExecution(taskId: string): void {

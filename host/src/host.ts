@@ -3,6 +3,13 @@ import { writeHostDiagnostic } from '../../shared/diagnostics.ts'
 import { existsSync, mkdirSync, realpathSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import type { AgentExecution } from './execution.ts'
+import { createArtifactTools } from './artifact-tools.ts'
+import { createBrowserTools } from './browser-tools.ts'
+import { createFileTools } from './file-tools.ts'
+import { createGitTools, ManagedGitWorktrees } from './git-tools.ts'
+import { createProcessTools } from './process-tools.ts'
+import { createWebTools } from './web-tools.ts'
+import type { ToolApprovalCommand } from '../../shared/contracts/tool-approval.ts'
 import type { AgentEvent, EventDraft, ModelRoute, TaskStatus, VerificationCheck, WorkspaceAccess } from './contracts/domain.ts'
 import type {
   ActionResult, ArchiveConversationInput, ConversationAction, ConversationEvent, ConversationHistory,
@@ -24,10 +31,13 @@ import type { CodingProfile } from './policies.ts'
 import { LocalStore } from './store.ts'
 import { isStopping, TaskEngine } from './task-engine.ts'
 import type { CreateTask, NodeProposal, NodeReplan, TaskSnapshot } from './task-engine.ts'
+import { ToolApprovalBroker } from './tool-approval.ts'
+import type { ToolApprover } from './tool-approval.ts'
 import { verifyWorkspace } from './verification.ts'
 import { CodingWorkspace } from './workspace.ts'
 
 export type HostCommand =
+  | ToolApprovalCommand
   | { schemaVersion: 1; type: 'createTask'; requestId: string; goal: string; cwd: string; check?: VerificationCheck; route?: ModelRoute; workspaceAccess?: WorkspaceAccess }
   | { schemaVersion: 1; type: 'getTask' | 'getHistory'; taskId: string }
   | { schemaVersion: 1; type: 'listTasks' | 'getRouteStatus' }
@@ -59,6 +69,7 @@ interface HostOptions {
   judgment?: JudgmentOptions
   defaultWorkspace?: string
   defaultRoute?: ModelRoute
+  approveTool?: ToolApprover
 }
 
 const recoverableAfterCrash = new Set<TaskStatus>(['running', 'verifying', 'stop_requested', 'stopping'])
@@ -87,6 +98,7 @@ export class LocalAgentHost {
   readonly #memory: LocalMemory
   readonly #defaultWorkspace: string
   readonly #defaultRoute?: ModelRoute
+  readonly #approval: ToolApprovalBroker
   #active?: ActiveTask
   #closing = false
   #closed = false
@@ -96,11 +108,20 @@ export class LocalAgentHost {
     mkdirSync(options.directory, { recursive: true, mode: 0o700 })
     this.#directory = realpathSync(options.directory)
     this.#stopTimeoutMs = options.stopTimeoutMs ?? defaultStopTimeoutMs
-    this.#extensions = (options.extensions ?? new ExtensionRegistry()).resolve(options.profileId ?? 'coding')
+    const worktrees = new ManagedGitWorktrees(join(this.#directory, 'worktrees'))
+    this.#extensions = (options.extensions ?? new ExtensionRegistry([
+      { id: 'artifact', tools: workspace => createArtifactTools(workspace, this.#directory) },
+      { id: 'files', tools: createFileTools },
+      { id: 'git', tools: workspace => createGitTools(workspace, worktrees) },
+      { id: 'shell', tools: createProcessTools },
+      { id: 'web', tools: workspace => createWebTools(workspace) },
+      { id: 'browser', tools: workspace => createBrowserTools(workspace) },
+    ])).resolve(options.profileId ?? 'coding')
     this.#profile = { ...(options.profile ?? this.#extensions.profile) }
     this.#capabilities = new CodingCapabilities(this.#profile)
     this.#defaultWorkspace = options.defaultWorkspace ?? this.#directory + '-workspace'
     this.#defaultRoute = options.defaultRoute
+    this.#approval = new ToolApprovalBroker(options.approveTool)
     this.#store = new LocalStore(join(this.#directory, 'tasks.sqlite'))
     try {
       if (options.runtimeId) {
@@ -118,7 +139,11 @@ export class LocalAgentHost {
       this.#scheduler = new LocalModelScheduler(options.execution, this.#store, judgment, options.modelLimits)
       this.#orchestrator = new MultiAgentOrchestrator({
         store: this.#store, tasks: this.#engine, execution: options.execution, scheduler: this.#scheduler,
-        capabilities: this.#capabilities, profile: this.#profile, extensions: this.#extensions,
+        capabilities: this.#capabilities, profile: this.#profile, extensions: this.#extensions, approval: this.#approval,
+        resolveWorkspace: async (workspace, taskId, id, signal) => {
+          const root = await worktrees.resolve(workspace, taskId, id, signal)
+          return root ? new CodingWorkspace(root) : undefined
+        },
         context: new ScopedContext(this.#memory, judgment), judgment,
         sessions: join(this.#directory, 'sessions'),
         onOutput: (event, delta) => this.#conversations.recordDelta(event, delta),
@@ -183,6 +208,11 @@ export class LocalAgentHost {
   subscribeOutput(sink: Parameters<MultiAgentOrchestrator['subscribeOutput']>[0]): () => void {
     this.#assertOpen()
     return this.#orchestrator.subscribeOutput(sink)
+  }
+
+  subscribeToolApprovals(sink: Parameters<ToolApprovalBroker['subscribe']>[0]): () => void {
+    this.#assertOpen()
+    return this.#approval.subscribe(sink)
   }
 
   createConversation(input: CreateConversationInput): ConversationSummary {
@@ -453,6 +483,7 @@ export class LocalAgentHost {
     this.#assertOpen()
     if (command?.schemaVersion !== 1) throw new Error('Unsupported command version')
     switch (command.type) {
+      case 'resolveToolApproval': return this.#approval.resolve(command.approvalId, command.decision)
       case 'createTask': {
         const { requestId, goal, cwd, check, route, workspaceAccess } = command
         return this.createTask({ requestId, goal, cwd, check, route, workspaceAccess })

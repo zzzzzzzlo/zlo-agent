@@ -15,6 +15,7 @@ const properties = {
   teamKey: { ...string, maxLength: 64 },
   access: { type: 'string', enum: ['read', 'write'] },
   scopePath: { ...string, maxLength: 512 },
+  worktreeId: { ...string, maxLength: 36 },
   route: {
     type: 'object', additionalProperties: false, required: ['provider', 'model'],
     properties: { provider: { ...string, maxLength: 80 }, model: { ...string, maxLength: 200 } },
@@ -24,7 +25,7 @@ const properties = {
 export function planTool(execute: (id: string, proposals: NodeProposal[], signal?: AbortSignal) => Promise<unknown>): ExecutionTool {
   return {
     name: 'propose_task_plan',
-    description: 'Execute a bounded task DAG. Use local refs in dependencies. Independent read nodes may run concurrently. Use a stable teamKey for persistent specialists and explicit write access for coding nodes. Return handoffs after verification.',
+    description: 'Execute a bounded task DAG. Use local refs in dependencies. Parallel write nodes each require a distinct approved git_worktree ID. Use a stable teamKey for persistent specialists and explicit write access for coding nodes.',
     parameters: {
       type: 'object', additionalProperties: false, required: ['nodes'],
       properties: { nodes: { type: 'array', minItems: 1, maxItems: 8, items: {

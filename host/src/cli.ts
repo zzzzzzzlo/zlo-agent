@@ -58,6 +58,7 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode): Promise<voi
   const stopOutput = host.subscribeOutput((event) => {
     if (subscriptions.has(event.taskId)) send({ schemaVersion: 1, kind: 'output', event })
   })
+  const stopApprovals = host.subscribeToolApprovals(notice => send({ schemaVersion: 1, ...notice }))
   let shuttingDown = false
   const shutdown = () => {
     if (shuttingDown) return
@@ -143,6 +144,7 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode): Promise<voi
       process.exitCode = 1
     } finally {
       stopOutput()
+      stopApprovals()
       for (const unsubscribe of subscriptions.values()) unsubscribe()
       for (const unsubscribe of conversationSubscriptions.values()) unsubscribe()
       process.off('SIGINT', shutdown)
