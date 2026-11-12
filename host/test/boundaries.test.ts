@@ -15,8 +15,10 @@ const dependencies: Record<string, string[]> = {
   'tool-approval': ['shared/tool-approval'],
   'artifact-tools': ['workspace', 'workspace-process'],
   'browser-runtime': [],
-  'browser-tools': ['workspace', 'web-tools', 'browser-runtime'],
-  'preview-tools': ['workspace', 'browser-runtime', 'execution'],
+  'browser-tools': ['workspace', 'web-tools', 'browser-runtime', 'execution', 'image-tools', 'local-browser'],
+  'local-browser': ['browser-runtime', 'execution', 'workspace'],
+  'image-tools': ['execution', 'local-browser', 'workspace'],
+  'preview-tools': ['workspace', 'execution', 'image-tools', 'local-browser'],
   'visual-workflow': ['contracts/domain', 'execution', 'workspace'],
   'file-tools': ['workspace', 'workspace-process'],
   'git-tools': ['workspace', 'workspace-process'],
@@ -37,7 +39,8 @@ const dependencies: Record<string, string[]> = {
   'workspace-process': ['contracts/domain'],
   store: ['contracts/domain'],
   execution: ['contracts/domain'],
-  pi: ['execution', 'shared/diagnostics', 'shared/management', 'shared/chatgpt', 'model-management', 'chatgpt-responses'],
+  pi: ['execution', 'shared/diagnostics', 'shared/management', 'shared/chatgpt', 'model-management', 'chatgpt-responses', 'coding-resources'],
+  'coding-resources': ['execution'],
   fake: ['execution'],
   faux: ['pi'],
   'contracts/desktop': ['shared/domain'],
@@ -61,7 +64,7 @@ test('Host modules respect the dependency direction and keep Pi behind its adapt
           : path.split('/src/').at(-1)!.replace(/\.ts$/, '')
         assert.ok(allowed.includes(target), file + ' -> ' + specifier)
       }
-      if (specifier.startsWith('@earendil-works/')) assert.ok(file === 'pi' || file === 'faux')
+      if (specifier.startsWith('@earendil-works/')) assert.ok(file === 'pi' || file === 'faux' || file === 'coding-resources')
     }
   }
 })

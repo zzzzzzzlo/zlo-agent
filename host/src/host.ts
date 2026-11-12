@@ -30,6 +30,7 @@ import * as management from './management.ts'
 import { LocalModelScheduler } from './model-scheduler.ts'
 import type { ModelLimits } from './model-scheduler.ts'
 import { MultiAgentOrchestrator, executionFailure, memoryScope, sameRoute } from './orchestrator.ts'
+import type { HarnessMode } from './orchestrator.ts'
 import { accessRank, CodingCapabilities, ExtensionRegistry } from './policies.ts'
 import { probeOperation } from './reconciliation.ts'
 import type { CodingProfile } from './policies.ts'
@@ -80,6 +81,7 @@ interface HostOptions {
   extensions?: ExtensionRegistry
   profileId?: string
   modelLimits?: Partial<ModelLimits>
+  harnessMode?: HarnessMode
   judgment?: JudgmentOptions
   defaultWorkspace?: string
   defaultRoute?: ModelRoute
@@ -173,7 +175,7 @@ export class LocalAgentHost {
           const root = await worktrees.resolve(workspace, taskId, id, signal)
           return root ? new CodingWorkspace(root) : undefined
         },
-        context: new ScopedContext(this.#memory, judgment), judgment,
+        context: new ScopedContext(this.#memory, judgment), judgment, mode: options.harnessMode,
         sessions: join(this.#directory, 'sessions'),
         onOutput: (event, delta) => this.#conversations.recordDelta(event, delta),
         onCheckpoint: (taskId) => this.#conversations.checkpointOutput(taskId),

@@ -11,6 +11,7 @@ const worktreePattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u
 const commitPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u
 const branchSchema = { type: 'string', minLength: 1, maxLength: 96 }
 const idSchema = { type: 'string', minLength: 36, maxLength: 36 }
+const activeRepositories = new Set<string>()
 
 interface WorktreeRecord { version: 1; taskId: string; worktreeId: string; repository: string; branch: string }
 
@@ -135,23 +136,9 @@ export class ManagedGitWorktrees {
     const taskDirectory = await this.#taskDirectory(taskId, false)
     if (!taskDirectory) return undefined
     const path = join(taskDirectory, worktreeId)
-    const metadata = join(taskDirectory, worktreeId + '.json')
     try {
-      const stat = await lstat(metadata)
-      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 4_096 || !samePath(metadata, await realpath(metadata)) ||
-        !await canonicalDirectory(path)) return undefined
-      const file = await open(metadata, 'r')
-      let record: WorktreeRecord
-      try {
-        const current = await file.stat()
-        if (current.ino !== stat.ino || current.dev !== stat.dev || current.size !== stat.size || current.nlink !== 1) return undefined
-        const bytes = Buffer.alloc(4_097)
-        const { bytesRead } = await file.read(bytes)
-        if (bytesRead !== stat.size) return undefined
-        record = JSON.parse(bytes.toString('utf8', 0, bytesRead)) as WorktreeRecord
-      } finally { await file.close() }
-      if (record.version !== 1 || record.taskId !== taskId || record.worktreeId !== worktreeId ||
-        typeof record.repository !== 'string' || !samePath(record.repository, workspace.root) || !branchName(record.branch)) return undefined
+      const record = await this.#record(taskDirectory, taskId, worktreeId)
+      if (!record || !samePath(record.repository, workspace.root) || !await canonicalDirectory(path)) return undefined
       const listed = await git(workspace.root, ['worktree', 'list', '--porcelain', '-z'], signal)
       if (listed?.code !== 0 || listed.truncated || !listed.stdout.split('\0\0').some(entry => {
         const fields = entry.split('\0')
@@ -163,6 +150,39 @@ export class ManagedGitWorktrees {
       if (!linkedStat.isFile() || linkedStat.nlink !== 1 || linkedStat.size > 4_096 || !samePath(linkedGit, await realpath(linkedGit))) return undefined
       const shared = await git(path, ['rev-parse', '--path-format=absolute', '--git-common-dir'], signal)
       return shared?.code === 0 && !shared.truncated && samePath(shared.stdout.trim(), join(workspace.root, '.git')) ? path : undefined
+    } catch { return undefined }
+  }
+
+  async linkedRepository(workspace: CodingWorkspace, taskId: string, signal?: AbortSignal): Promise<string | undefined> {
+    const taskDirectory = await this.#taskDirectory(taskId, false)
+    if (!taskDirectory) return undefined
+    const worktreeId = relative(taskDirectory, workspace.root)
+    if (!worktreePattern.test(worktreeId)) return undefined
+    const record = await this.#record(taskDirectory, taskId, worktreeId)
+    if (!record) return undefined
+    try {
+      const repository = new CodingWorkspace(record.repository)
+      const linked = await this.resolve(repository, taskId, worktreeId, signal)
+      return linked && samePath(linked, workspace.root) ? repository.root : undefined
+    } catch { return undefined }
+  }
+
+  async #record(taskDirectory: string, taskId: string, worktreeId: string): Promise<WorktreeRecord | undefined> {
+    const metadata = join(taskDirectory, worktreeId + '.json')
+    try {
+      const stat = await lstat(metadata)
+      if (!stat.isFile() || stat.nlink !== 1 || stat.size > 4_096 || !samePath(metadata, await realpath(metadata))) return undefined
+      const file = await open(metadata, 'r')
+      try {
+        const current = await file.stat()
+        if (current.ino !== stat.ino || current.dev !== stat.dev || current.size !== stat.size || current.nlink !== 1) return undefined
+        const bytes = Buffer.alloc(4_097)
+        const { bytesRead } = await file.read(bytes)
+        if (bytesRead !== stat.size) return undefined
+        const record = JSON.parse(bytes.toString('utf8', 0, bytesRead)) as WorktreeRecord
+        return record?.version === 1 && record.taskId === taskId && record.worktreeId === worktreeId &&
+          typeof record.repository === 'string' && branchName(record.branch) ? record : undefined
+      } finally { await file.close() }
     } catch { return undefined }
   }
 }
@@ -215,7 +235,10 @@ export function createGitTools(workspace: CodingWorkspace, worktrees?: ManagedGi
   function tool(name: string, description: string, properties: Record<string, unknown>, required: string[],
     execute: (input: Record<string, unknown>, signal?: AbortSignal, context?: ToolInvocationContext) => Promise<unknown>): WorkspaceTool {
     return {
-      name, description, effect: 'write', policy: { minimumAccess: 'trusted', rootOnly: true, approval: 'git' },
+      name, description, effect: 'write', policy: {
+        minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true, approval: 'git',
+        ...(name === 'git_commit' ? { selectsTaskWorkspace: (input: unknown) => object(input)?.worktreeId !== undefined } : {}),
+      },
       parameters: { type: 'object', properties, required, additionalProperties: false },
       async execute(_id, raw, signal, context) {
         const input = object(raw)
@@ -224,8 +247,15 @@ export function createGitTools(workspace: CodingWorkspace, worktrees?: ManagedGi
         const release = workspace.acquireWrite()
         if (!release) return rejected('Another workspace write is active')
         try {
-          if (!await hasPrimaryRepository(workspace)) return rejected('A local primary Git repository is required')
-          return await execute(input, signal, context)
+          const primary = await hasPrimaryRepository(workspace)
+          const repository = primary ? workspace.root : name === 'git_commit' && input.worktreeId === undefined && context
+            ? await worktrees?.linkedRepository(workspace, context.taskId, signal) : undefined
+          if (!repository) return rejected('A primary repository or current task worktree is required')
+          const key = process.platform === 'win32' ? repository.toLowerCase() : repository
+          if (activeRepositories.has(key)) return rejected('Another Git mutation is active in this repository')
+          activeRepositories.add(key)
+          try { return await execute(input, signal, context) }
+          finally { activeRepositories.delete(key) }
         } finally { release() }
       },
     }

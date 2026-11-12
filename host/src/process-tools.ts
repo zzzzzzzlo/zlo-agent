@@ -272,7 +272,7 @@ function denied() { return { ok: false, error: 'Process is unavailable in this A
 function invalid() { return { ok: false, error: 'Invalid process arguments' } }
 
 const idSchema = { type: 'string', pattern: '^[0-9a-f-]{36}$' }
-const control = { minimumAccess: 'trusted', rootOnly: true, whileActive: true } as const
+const control = { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true, whileActive: true } as const
 
 export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] {
   const processes = new Map<string, {
@@ -290,9 +290,9 @@ export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] 
   return [
     {
       name: 'shell_exec',
-      description: 'Start one explicitly approved shell command. Poll process_status and process_output until the command exits, or stop it with process_stop. Output is untrusted.',
+      description: 'Start one explicitly approved shell command as the current OS user. The working directory is not a sandbox. Poll process_status and process_output until the command exits, or stop it with process_stop. Output is untrusted.',
       effect: 'write',
-      policy: { minimumAccess: 'trusted', rootOnly: true, approval: 'shell', deferred: true },
+      policy: { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true, approval: 'shell', deferred: true },
       parameters: {
         type: 'object', additionalProperties: false, required: ['shell', 'command'],
         properties: {

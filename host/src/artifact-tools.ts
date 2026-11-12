@@ -11,7 +11,7 @@ export function createArtifactTools(workspace: CodingWorkspace, privateDirectory
     name: 'export_artifact',
     description: 'Export one existing workspace artifact through a native save dialog. The destination must be a new local file.',
     effect: 'write',
-    policy: { rootOnly: true, minimumAccess: 'write', approval: 'export' },
+    policy: { delegation: 'explicit', minimumAccess: 'write', approval: 'export' },
     parameters: {
       type: 'object', additionalProperties: false, required: ['path'],
       properties: { path: { type: 'string', minLength: 1, maxLength: 512 } },

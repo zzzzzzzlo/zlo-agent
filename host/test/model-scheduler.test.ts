@@ -168,3 +168,31 @@ test('restart preserves confirmed usage and charges an unfinished reservation on
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('adjustable provider output shares the parent ledger and unknown usage stays charged', () => {
+  const store = new LocalStore(':memory:')
+  try {
+    const { execution } = catalogExecution()
+    const scheduler = new LocalModelScheduler(execution, store, new LocalJudgment(store), { tokens: 100 })
+    const parent = { nodeId: 'team', tokens: 60, requests: 3 }
+    const first = scheduler.reserve(() => worker, 'worker', [parent, { nodeId: 'leaf', tokens: 50 }])
+    const second = scheduler.reserve(() => ({ ...worker, agentRunId: 'worker-2', taskNodeId: 'other' }), 'worker', [parent])
+    const adjustable = (input: number): ModelRequest => ({ ...request(input, 120), fixedMaxOutputTokens: false })
+    assert.throws(() => first.request({ ...request(10, 120), fixedMaxOutputTokens: true }), ModelBudgetError)
+    assert.equal(first.request(adjustable(10)), 40)
+    assert.throws(() => second.request(adjustable(10)), ModelBudgetError)
+    const uncertain = first.unknown()
+    assert.ok(uncertain)
+    assert.equal(first.unknown(), undefined)
+    assert.equal(second.request(adjustable(4)), 6)
+    second.usage({ type: 'model.usage', input: 4, output: 2, cacheRead: 0, cacheWrite: 0 })
+    assert.throws(() => first.request(adjustable(0)), ModelBudgetError)
+    assert.deepEqual(scheduler.budget('task'), { requests: 2, confirmed: 6, reserved: 0, uncertain: 50 })
+    assert.deepEqual(store.events('task').filter(event => event.type === 'model.reserved')
+      .map(({ payload }) => payload.maxOutputTokens), [40, 6])
+    first.release()
+    second.release()
+  } finally {
+    store.close()
+  }
+})

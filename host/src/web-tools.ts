@@ -359,7 +359,7 @@ export function createWebTools(_workspace: CodingWorkspace, options: { client?: 
   const client = options.client ?? publicWeb
   const braveKey = process.env.ZLO_AGENT_BRAVE_SEARCH_API_KEY
   const provider = options.provider ?? (braveKey ? new BraveSearch(braveKey) : new HackerNewsSearch(client))
-  const policy = { rootOnly: true, approval: 'network' as const }
+  const policy = { delegation: 'explicit', approval: 'network', targets: () => [] } as const
   const errors: Record<FailureCode, string> = {
     policy: 'URL or input is outside the public network policy',
     timeout: 'Network operation was interrupted or timed out',

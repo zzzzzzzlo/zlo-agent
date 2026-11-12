@@ -17,6 +17,7 @@ export type RuntimeEvent =
   | { type: 'message.delta'; delta: string }
   | { type: 'instruction.applied'; instructionId: string }
   | { type: 'model.request_started' }
+  | { type: 'model.request_unaccounted' }
   | { type: 'model.output_recovery'; trigger: 'automatic' | 'resume' }
   | { type: 'model.usage'; input: number; output: number; cacheRead: number; cacheWrite: number; estimatedCostUsd?: number }
   | { type: 'model.route_changed'; route: ModelRoute }
@@ -35,6 +36,7 @@ export interface ModelRequest {
   route: ModelRoute
   estimatedInputTokens: number
   maxOutputTokens: number
+  fixedMaxOutputTokens?: boolean
   kind: 'prompt' | 'compaction'
 }
 
@@ -47,10 +49,12 @@ export interface ExecutionConfig {
   route?: ModelRoute
   tools: ExecutionTool[]
   systemPrompt: string
-  visualFeedback?(): { quick: boolean; final: boolean; maxOutputTokens?: number } | undefined
+  instructionScopes?: { user?: string; project?: string }
+  skillReadsAllowed?(): boolean
+  reasoningEffort?: 'low' | 'medium' | 'high'
   resumeAfterOutputLimit?: boolean
   canRecoverModelOutput?(): boolean
-  reserveRequest?(request: ModelRequest): void
+  reserveRequest?(request: ModelRequest): number | void
   onEvent(event: RuntimeEvent): void
 }
 

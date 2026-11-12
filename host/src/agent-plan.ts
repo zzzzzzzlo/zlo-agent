@@ -9,17 +9,43 @@ const fileCheck = {
   type: 'object', additionalProperties: false, required: ['path'],
   properties: { path: { ...string, maxLength: 512 }, contains: { ...string, maxLength: 16000 } },
 }
+const grant = {
+  access: { type: 'string', enum: ['read', 'write', 'trusted'] },
+  scopePath: { ...string, maxLength: 512 },
+  tools: { type: 'array', maxItems: 128, uniqueItems: true, items: { ...string, maxLength: 64 } },
+  budget: { type: 'object', additionalProperties: false, properties: {
+    tokens: { type: 'integer', minimum: 1, maximum: 10_000_000 },
+    requests: { type: 'integer', minimum: 1, maximum: 512 },
+    timeMs: { type: 'integer', minimum: 1, maximum: 3_600_000 },
+  } },
+}
 const properties = {
-  ref, goal, dependencies, check: fileCheck,
+  ref, goal, dependencies, check: fileCheck, ...grant,
   role: { type: 'string', enum: ['worker', 'team'] },
   teamKey: { ...string, maxLength: 64 },
-  access: { type: 'string', enum: ['read', 'write'] },
-  scopePath: { ...string, maxLength: 512 },
   worktreeId: { ...string, maxLength: 36 },
   route: {
     type: 'object', additionalProperties: false, required: ['provider', 'model'],
     properties: { provider: { ...string, maxLength: 80 }, model: { ...string, maxLength: 200 } },
   },
+}
+
+export function delegationTool(name: 'delegate_task' | 'delegate_worker', execute: (
+  id: string, proposal: Omit<NodeProposal, 'ref'>, signal?: AbortSignal,
+) => Promise<unknown>): ExecutionTool {
+  return {
+    name,
+    description: 'Run a temporary worker and return its delivery evidence. Describe the goal and acceptance check. Omitted access is read-only. To delegate Shell, Browser, Network, Git or other privileged work, name the exact tools and request the necessary workspace access. Shell and Git require a trusted whole workspace. Optional budgets can narrow the parent budget.',
+    parameters: { type: 'object', additionalProperties: false, required: ['goal'], properties: { goal, check: fileCheck, ...grant } },
+    execute(id, input, signal) {
+      if (!input || typeof input !== 'object' || Array.isArray(input) || !('goal' in input) ||
+        typeof input.goal !== 'string' || input.goal.length > 8000 || !input.goal.trim() ||
+        Object.keys(input).some(key => key !== 'goal' && key !== 'check' && !Object.hasOwn(grant, key))) {
+        return Promise.resolve({ ok: false, error: 'Expected a worker goal and an optional narrower grant' })
+      }
+      return execute(id, input as Omit<NodeProposal, 'ref'>, signal)
+    },
+  }
 }
 
 export function planTool(execute: (id: string, proposals: NodeProposal[], signal?: AbortSignal) => Promise<unknown>): ExecutionTool {

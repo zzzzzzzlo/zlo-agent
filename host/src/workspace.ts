@@ -16,8 +16,13 @@ export { parseProjectCommand } from './workspace-process.ts'
 export type { VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
 export interface ToolPolicy {
   minimumAccess?: WorkspaceAccess
-  rootOnly?: boolean
+  minimumAccessFor?(input: unknown): WorkspaceAccess | undefined
+  effectFor?(input: unknown): 'read' | 'write'
+  delegation?: 'explicit'
+  wholeWorkspace?: boolean
+  selectsTaskWorkspace?(input: unknown): boolean
   approval?: ApprovalKind
+  approvalFor?(input: unknown): ApprovalKind | undefined
   targets?(input: unknown): string[]
   deferred?: boolean
   whileActive?: boolean
@@ -159,6 +164,10 @@ export class CodingWorkspace implements Verifier {
     return (await this.#readBytes(segments(value), 512 * 1024, signal)).bytes
   }
 
+  async readImageAsset(value: unknown, signal?: AbortSignal): Promise<Buffer> {
+    return (await this.#readBytes(segments(value), 4 * 1024 * 1024, signal)).bytes
+  }
+
   async gitDiffSnapshot(value: unknown, staged: boolean, signal?: AbortSignal) {
     const parts = segments(value)
     await this.#checkedPath(parts, false)
@@ -216,16 +225,17 @@ export class CodingWorkspace implements Verifier {
             stderr: redactProcessOutput(result.stderr, result.truncated),
             truncated: result.truncated,
           }
-        }, ['args']),
+        }, ['args'], { delegation: 'explicit', wholeWorkspace: true }),
       this.#tool('git_status', 'Inspect local Git status for allowed workspace paths.', 'write', {},
-        async (_args, signal) => this.#gitStatus(signal)),
+        async (_args, signal) => this.#gitStatus(signal), [], { delegation: 'explicit', wholeWorkspace: true }),
       this.#tool('git_diff', 'Inspect the unstaged or staged Git diff for a single allowed text file.',
         'write', { path: pathProperty, staged: { type: 'boolean' } }, async (args, signal) => {
           if (args.staged !== undefined && typeof args.staged !== 'boolean') throw new WorkspaceDenied('Invalid staged flag')
           return this.gitDiffSnapshot(args.path, args.staged === true, signal)
-        }, ['staged']),
+        }, ['staged'], { delegation: 'explicit', wholeWorkspace: true }),
       this.#tool('git_log', 'Inspect the last ten local commits as abbreviated IDs and dates.', 'write', {},
-        async (_args, signal) => this.#gitText(['log', '-n', '10', '--format=%h%x09%cs'], signal)),
+        async (_args, signal) => this.#gitText(['log', '-n', '10', '--format=%h%x09%cs'], signal), [],
+        { delegation: 'explicit', wholeWorkspace: true }),
     ]
   }
 
@@ -277,11 +287,13 @@ export class CodingWorkspace implements Verifier {
     properties: Record<string, unknown>,
     execute: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>,
     optional: string[] = [],
+    policy?: ToolPolicy,
   ): WorkspaceTool {
     return {
       name,
       description,
       effect,
+      policy,
       parameters: {
         type: 'object', properties,
         required: Object.keys(properties).filter((key) => !optional.includes(key)),

@@ -109,7 +109,9 @@ function safePayload(type: string, p: Record<string, unknown>): Record<string, u
       evidenceRefs: refs(p.evidenceRefs), verification: telemetryVerification(p.verification),
     }
     case 'agent.started': case 'agent.finished': return { status, reason, role: oneOf(p.role, roles), route: route(p.route),
-      parentAgentId: ref(p.parentAgentId), lifecycle: oneOf(p.lifecycle, states), evidenceCount: num(p.evidenceCount) }
+      parentAgentId: ref(p.parentAgentId), lifecycle: oneOf(p.lifecycle, states), evidenceCount: num(p.evidenceCount),
+      harnessMode: oneOf(p.harnessMode, ['fast', 'quality']), reasoningPolicy: oneOf(p.reasoningPolicy, ['low', 'provider_default']),
+      maxDurationMs: num(p.maxDurationMs) }
     case 'model.request_started': return {}
     case 'model.output_recovery': return { trigger: oneOf(p.trigger, ['automatic', 'resume']) }
     case 'visual.draft_ready': case 'visual.preview_started': case 'visual.preview_finished': case 'visual.frames_sent':
@@ -123,7 +125,8 @@ function safePayload(type: string, p: Record<string, unknown>): Record<string, u
     case 'model.route_changed': case 'model.switch_requested': return { route: route(p.route) }
     case 'model.reserved': case 'model.reservation_settled': return { status, route: route(p.route), kind: oneOf(p.kind, ['prompt', 'compaction']),
       estimatedTokens: num(p.estimatedTokens), actualTokens: num(p.actualTokens), estimatedCostUsd: num(p.estimatedCostUsd),
-      estimatedInputTokens: num(p.estimatedInputTokens), maxOutputTokens: num(p.maxOutputTokens), taskTokenLimit: num(p.taskTokenLimit), durationMs: num(p.durationMs) }
+      estimatedInputTokens: num(p.estimatedInputTokens), maxOutputTokens: num(p.maxOutputTokens), taskTokenLimit: num(p.taskTokenLimit),
+      taskRequestLimit: num(p.taskRequestLimit), durationMs: num(p.durationMs) }
     case 'model.usage': return { input: num(p.input), output: num(p.output), cacheRead: num(p.cacheRead), cacheWrite: num(p.cacheWrite), estimatedCostUsd: num(p.estimatedCostUsd) }
     case 'tool.started': case 'tool.finished': case 'tool.approval_resolved': case 'tool.denied':
       return { id: ref(p.id), tool: label(p.tool), effect: oneOf(p.effect, ['read', 'write']), status, managed: bool(p.managed), approved: bool(p.approved),

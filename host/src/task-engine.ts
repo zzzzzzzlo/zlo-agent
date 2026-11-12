@@ -13,6 +13,11 @@ export interface WorkerResult {
   evidenceRefs: string[]
   remainingRisks: string[]
 }
+export interface NodeBudget {
+  tokens?: number
+  requests?: number
+  timeMs?: number
+}
 export interface WorkerNode {
   id: string
   parentNodeId: string
@@ -23,8 +28,10 @@ export interface WorkerNode {
   result?: WorkerResult
   role?: 'team' | 'worker'
   teamKey?: string
-  access?: 'read' | 'write'
+  access?: WorkspaceAccess
   scopePath?: string
+  tools?: string[]
+  budget?: NodeBudget
   worktreeId?: string
   check?: VerificationCheck
   route?: ModelRoute
@@ -39,8 +46,10 @@ export interface NodeProposal {
   dependencies?: string[]
   role?: 'team' | 'worker'
   teamKey?: string
-  access?: 'read' | 'write'
+  access?: WorkspaceAccess
   scopePath?: string
+  tools?: string[]
+  budget?: NodeBudget
   worktreeId?: string
   check?: VerificationCheck
   route?: ModelRoute
@@ -199,6 +208,25 @@ function normalizeTask(task: TaskSnapshot): TaskSnapshot {
 function separateWorktrees(left?: string, right?: string): boolean {
   return Boolean(left && right && left !== right)
 }
+const nodeAccessRank: Record<WorkspaceAccess, number> = { read: 0, write: 1, trusted: 2 }
+const canWrite = (access?: WorkspaceAccess) => access === 'write' || access === 'trusted'
+const nodeBudgetLimits = { tokens: 10_000_000, requests: 512, timeMs: 3_600_000 } as const
+
+function planBudget(value: NodeBudget): NodeBudget {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid node budget')
+  for (const [key, count] of Object.entries(value)) {
+    if (!Object.hasOwn(nodeBudgetLimits, key) || !Number.isSafeInteger(count) || count < 1 || count > nodeBudgetLimits[key as keyof NodeBudget]) {
+      throw new Error('Invalid node budget')
+    }
+  }
+  return { ...value }
+}
+
+function planTools(value: string[]): string[] {
+  if (!Array.isArray(value) || value.length > 128 || new Set(value).size !== value.length ||
+    value.some(name => typeof name !== 'string' || !/^[a-z][a-z_0-9]{0,63}$/u.test(name))) throw new Error('Invalid node tool grant')
+  return [...value].sort()
+}
 function planRoute(route: ModelRoute): ModelRoute {
   if (typeof route?.provider !== 'string' || typeof route.model !== 'string' ||
     !/^[\w-]{1,80}$/.test(route.provider) || !/^[\w.:/-]{1,200}$/.test(route.model)) throw new Error('Invalid node model route')
@@ -258,8 +286,11 @@ function assertValidGraph(rootNodeId: string, nodes: WorkerNode[]): void {
     visiting.add(node.id)
     if (node.parentNodeId !== rootNodeId) {
       const parent = byId.get(node.parentNodeId)
-      if (parent?.role !== 'team' || parent.parentNodeId !== rootNodeId || node.role === 'team' || node.access === 'write') {
-        throw new Error('Invalid parent scope or depth. Team Agents may delegate read-only Workers')
+      if (parent?.role !== 'team' || parent.parentNodeId !== rootNodeId || node.role === 'team') throw new Error('Invalid parent scope or depth')
+      if (nodeAccessRank[node.access ?? 'read'] > nodeAccessRank[parent.access ?? 'read']) throw new Error('Node cannot expand parent access')
+      if (node.tools?.some(name => parent.tools !== undefined && !parent.tools.includes(name))) throw new Error('Node cannot expand parent tools')
+      for (const key of Object.keys(nodeBudgetLimits) as (keyof NodeBudget)[]) {
+        if ((node.budget?.[key] ?? 0) > (parent.budget?.[key] ?? Infinity)) throw new Error('Node cannot expand parent budget')
       }
     }
     for (const id of node.dependencies) {
@@ -510,6 +541,29 @@ export class TaskEngine {
     }
   }
 
+  delegateScoped(taskId: string, requestId: string, parentNodeId: string, input: Pick<NodeProposal,
+    'goal' | 'access' | 'scopePath' | 'tools' | 'budget' | 'check'>): WorkerNode {
+    const task = this.get(taskId)
+    this.#assertPlanning(task, task.planVersion)
+    const parent = task.nodes?.find(node => node.id === parentNodeId)
+    if (parentNodeId !== task.rootNodeId && parent?.status !== 'running') throw new Error('Parent is not accepting delegation')
+    const goal = checkText(input.goal, 'worker goal', 8000)
+    const access = input.access ?? 'read'
+    const path = input.scopePath === undefined ? parent?.scopePath : scopePath(input.scopePath)
+    const tools = input.tools === undefined ? undefined : planTools(input.tools)
+    const budget = input.budget === undefined ? undefined : planBudget(input.budget)
+    const check = verificationCheck(input.check)
+    const prior = task.nodes?.find(node => node.parentNodeId === parentNodeId && node.role === 'worker' &&
+      node.goal === goal && !node.dependencies.length && !node.route && node.worktreeId === parent?.worktreeId &&
+      node.access === access && node.scopePath === path &&
+      JSON.stringify(node.tools) === JSON.stringify(tools) &&
+      (node.budget === undefined) === (budget === undefined) &&
+      node.budget?.tokens === budget?.tokens && node.budget?.requests === budget?.requests && node.budget?.timeMs === budget?.timeMs &&
+      JSON.stringify(node.check) === JSON.stringify(check))
+    return prior ?? this.proposePlan(taskId, requestId, task.planVersion,
+      [{ ref: 'child', role: 'worker', parentNodeId, goal, access, scopePath: path, tools, budget, check }])[0]!
+  }
+
   proposePlan(taskId: string, requestId: string, expectedVersion: number, proposals: NodeProposal[]): WorkerNode[] {
     return this.#command(requestId, ['proposePlan', taskId, expectedVersion, proposals], () => {
       const task = this.get(taskId)
@@ -541,20 +595,22 @@ export class TaskEngine {
           throw new Error('Team node requires a stable Team key')
         }
         if (role === 'worker' && proposal.teamKey !== undefined) throw new Error('Worker cannot claim a Team key')
-        if (access !== 'read' && access !== 'write') throw new Error('Invalid node access')
-        if (access === 'write' && !(task.workspaceAccess === 'write' || task.workspaceAccess === 'trusted' ||
-          (task.workspaceAccess === undefined && task.check?.path))) throw new Error('Node cannot expand workspace access')
+        if (access !== 'read' && access !== 'write' && access !== 'trusted') throw new Error('Invalid node access')
+        const taskAccess = task.workspaceAccess ?? (task.check?.path ? 'write' : 'read')
+        if (nodeAccessRank[access] > nodeAccessRank[taskAccess]) throw new Error('Node cannot expand workspace access')
         const parent = existing.find(({ id }) => id === parentNodeId)
         if (parent && parent.status !== 'ready' && parent.status !== 'running') throw new Error('Parent is not accepting work')
         const check = verificationCheck(proposal.check)
-        if (check?.command && (task.workspaceAccess !== 'trusted' || access !== 'write')) {
-          throw new Error('Command verification requires trusted workspace access and a write node')
+        if (check?.command && (access !== 'trusted' || parentNodeId !== task.rootNodeId || proposal.scopePath)) {
+          throw new Error('Command verification requires an explicitly trusted root-level node with the whole workspace')
         }
         return {
           id: ids.get(proposal.ref)!, parentNodeId, role, access, status: 'ready',
           goal: checkText(proposal.goal, 'worker goal', 8000),
           dependencies: nodeDependencies(proposal.dependencies, resolve),
           ...(proposal.scopePath !== undefined ? { scopePath: scopePath(proposal.scopePath) } : {}),
+          ...(proposal.tools !== undefined ? { tools: planTools(proposal.tools) } : {}),
+          ...(proposal.budget !== undefined ? { budget: planBudget(proposal.budget) } : {}),
           ...(proposal.worktreeId ? { worktreeId: proposal.worktreeId } : {}),
           ...(proposal.teamKey !== undefined ? { teamKey: proposal.teamKey } : {}),
           ...(check ? { check } : {}),
@@ -600,8 +656,8 @@ export class TaskEngine {
       if (nodes.some((node) => node.parentNodeId === nodeId && node.status === 'running')) throw new Error('Node has running children')
       const check = update.check !== undefined ? verificationCheck(update.check) : previous.check
       if (previous.worktreeId && check?.command) throw new Error('Worktree nodes require file-based verification')
-      if (check?.command && (task.workspaceAccess !== 'trusted' || previous.access !== 'write')) {
-        throw new Error('Command verification requires trusted workspace access and a write node')
+      if (update.check && check?.command && (previous.access !== 'trusted' || previous.parentNodeId !== task.rootNodeId || previous.scopePath)) {
+        throw new Error('Command verification requires an explicitly trusted root-level node with the whole workspace')
       }
       assertCheckInScope(check, previous.scopePath)
       const replan: WorkerNode = {
@@ -644,8 +700,8 @@ export class TaskEngine {
     const teamsWithoutChildren = scheduled.filter((agent) =>
       agent.role === 'team' && !scheduled.some(({ parentNodeId }) => parentNodeId === agent.id)).length
     if (scheduled.length + teamsWithoutChildren > MAX_CONCURRENT_NODES) return false
-    return active.every(other => separateWorktrees(node.worktreeId, other.worktreeId) ||
-      (node.access !== 'write' && (other.access !== 'write' || (suspendParent && parent === other))))
+    return active.every(other => (suspendParent && parent === other) || separateWorktrees(node.worktreeId, other.worktreeId) ||
+      (!canWrite(node.access) && !canWrite(other.access)))
   }
 
   runnableNodes(taskId: string, parentNodeId?: string): WorkerNode[] {
@@ -664,7 +720,7 @@ export class TaskEngine {
       runnable.push(node)
       active.push(node)
       // A writing Team can yield to one child at a time.
-      if (active.some((other) => other.id === parentId && other.access === 'write')) break
+      if (active.some((other) => other.id === parentId && canWrite(other.access))) break
     }
     return runnable
   }
@@ -685,7 +741,7 @@ export class TaskEngine {
         startedAt: new Date().toISOString(), status: 'running',
       }
       const running: WorkerNode = { ...node, attemptId: id, status: 'running' }
-      const parent = active.find((other) => other.id === node.parentNodeId && other.access === 'write')
+      const parent = options.suspendParent ? active.find(other => other.id === node.parentNodeId) : undefined
       const next = parent ? changeNode(task, { ...parent, suspendedFor: nodeId }) : task
       this.#save(changeNode(next, running))
       this.#db.put('attempts', id, attempt)
@@ -759,11 +815,9 @@ export class TaskEngine {
       const task = this.get(taskId)
       if (task.workspaceAccess === access) { onChanged(); return }
       let next: TaskSnapshot = { ...task, workspaceAccess: access }
-      if (access === 'read') {
-        for (const node of allNodes(task)) {
-          if ((node.status === 'ready' || node.status === 'running') && node.access === 'write') {
-            next = changeNode(next, { ...node, access: 'read' })
-          }
+      for (const node of allNodes(task)) {
+        if ((node.status === 'ready' || node.status === 'running') && nodeAccessRank[node.access ?? 'read'] > nodeAccessRank[access]) {
+          next = changeNode(next, { ...node, access })
         }
       }
       this.#save(next)
@@ -813,14 +867,14 @@ export class TaskEngine {
       }
       const attemptId = node?.attemptId ?? task.attemptId
       if (event.taskAttemptId !== undefined && event.taskAttemptId !== attemptId) throw new Error('Tool attempt is stale')
-      if (effect === 'write' && ((node && node.access !== 'write') || task.workspaceAccess === 'read')) {
+      if (effect === 'write' && ((node && !canWrite(node.access)) || task.workspaceAccess === 'read')) {
         throw new Error('Task scope denies writes')
       }
       if (phase === 'verification' && effect === 'write' && task.workspaceAccess !== 'trusted') {
         throw new Error('Command verification requires trusted workspace access')
       }
-      if (active.some((other) => other.id !== nodeId && !separateWorktrees(node?.worktreeId, other.worktreeId) && (effect === 'write' ||
-        (other.access === 'write' && other.suspendedFor !== nodeId)))) {
+      if (active.some(other => other.id !== nodeId && other.suspendedFor !== nodeId &&
+        !separateWorktrees(node?.worktreeId, other.worktreeId) && (effect === 'write' || canWrite(other.access)))) {
         throw new Error('Concurrent workspace access conflicts with a write')
       }
       const operation: Operation = {

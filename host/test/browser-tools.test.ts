@@ -1,10 +1,13 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { createServer } from 'node:http'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { createBrowserTools } from '../src/browser-tools.ts'
+import { previewImageLimits, toolImages } from '../src/execution.ts'
+import type { ToolImage } from '../src/execution.ts'
+import { createImageTool } from '../src/image-tools.ts'
 import type { WebClient } from '../src/web-tools.ts'
 import { CodingWorkspace } from '../src/workspace.ts'
 import type { ToolInvocationContext } from '../src/workspace.ts'
@@ -59,9 +62,11 @@ test('real Edge browser renders, interacts and captures without relaying unappro
   }
   const call = (name: string, input: unknown, selected = context) => {
     const tool = tools.find(candidate => candidate.name === name)!
-    return tool.execute('browser-call', input, undefined, selected) as Promise<Record<string, unknown>>
+    return tool.execute('browser-call', input, undefined, selected) as Promise<Record<string, unknown> & { [toolImages]?: ToolImage[] }>
   }
-  assert.equal(tools.find(tool => tool.name === 'browser_open')?.policy?.approval, 'network')
+  const openPolicy = tools.find(tool => tool.name === 'browser_open')!.policy!
+  assert.equal(openPolicy.approvalFor?.({ url: 'https://example.com/' }), 'network')
+  assert.equal(openPolicy.approvalFor?.({ path: 'index.html' }), undefined)
   assert.equal(tools.find(tool => tool.name === 'browser_click')?.policy?.approval, 'browser_action')
   const launched = await call('browser_open', { url: 'https://example.com/' })
   assert.equal(launched.ok, true, JSON.stringify(launched))
@@ -80,6 +85,8 @@ test('real Edge browser renders, interacts and captures without relaying unappro
   assert.equal((await call('browser_scroll', { browserId, pixels: 10 })).ok, true)
   const screenshot = await call('browser_screenshot', { browserId, path: 'capture.png' })
   assert.equal(screenshot.ok, true, JSON.stringify(screenshot))
+  assert.equal(screenshot[toolImages]?.length, 1)
+  assert.ok(screenshot[toolImages]?.[0].bytes.subarray(0, 3).equals(Buffer.from([255, 216, 255])))
   assert.equal((await readFile(join(directory, 'capture.png'))).subarray(1, 4).toString(), 'PNG')
   assert.equal((await call('browser_screenshot', { browserId, path: 'capture.png' })).ok, false)
   assert.equal((await call('browser_click', { browserId, selector: '#next' })).ok, true)
@@ -97,4 +104,39 @@ test('real Edge browser renders, interacts and captures without relaying unappro
   abort.abort()
   assert.equal((await waiting as { ok: boolean }).ok, false)
   assert.equal((await call('browser_snapshot', { browserId: reopened.browserId })).ok, false)
+
+  await writeFile(join(directory, 'allowed.js'), 'document.querySelector("h1").textContent = "Workspace page rendered"')
+  await writeFile(join(directory, 'unselected.js'), 'document.querySelector("h1").textContent = "Unexpected asset loaded"')
+  await writeFile(join(directory, 'index.html'), `<!doctype html><title>Local check</title><h1>Loading</h1>
+    <script src="allowed.js"></script><script src="unselected.js"></script><img src="${local}image">
+    <a id="private" href="${local}">Disallowed link</a>`)
+  const secondRun = { ...context, agentRunId: 'worker-run' }
+  const localPage = await call('browser_open', { path: 'index.html', assets: ['allowed.js'], width: 480, height: 320 }, secondRun)
+  assert.equal(localPage.ok, true, JSON.stringify(localPage))
+  assert.equal(localPage.mode, 'workspace')
+  assert.equal(localPage.path, 'index.html')
+  const localHandle = { browserId: localPage.browserId }
+  assert.equal((await call('browser_snapshot', localHandle)).ok, false)
+  const localSnapshot = await call('browser_snapshot', localHandle, secondRun)
+  assert.match(String(localSnapshot.text), /Workspace page rendered/)
+  assert.ok(Number(localSnapshot.blockedRequests) >= 1)
+  assert.equal((await call('browser_click', { ...localHandle, selector: '#private' }, secondRun)).ok, false)
+  const localFrame = await call('browser_screenshot', localHandle, secondRun)
+  assert.equal(localFrame.ok, true, JSON.stringify(localFrame))
+  assert.equal(localFrame.path, undefined)
+  assert.equal(localFrame[toolImages]?.[0].width, 480)
+  assert.equal(localFrame[toolImages]?.[0].height, 320)
+  assert.equal((await call('browser_close', localHandle, secondRun)).ok, true)
+  assert.equal(localHits, 0)
+  assert.deepEqual(relay, ['https://example.com/', 'https://example.com/next', 'https://example.com/'])
+
+  const viewImage = createImageTool(new CodingWorkspace(directory))
+  await writeFile(join(directory, 'diagram.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080"><rect width="1920" height="1080" fill="green"/></svg>')
+  const inspected = await viewImage.execute('inspect', { path: 'diagram.svg' }) as Record<string, unknown> & { [toolImages]?: ToolImage[] }
+  assert.equal(inspected.ok, true, JSON.stringify(inspected))
+  assert.equal(inspected.originalWidth, 1920)
+  assert.equal(inspected[toolImages]?.[0].width, previewImageLimits.width)
+  assert.ok(inspected[toolImages]?.[0].bytes.subarray(0, 3).equals(Buffer.from([255, 216, 255])))
+  assert.deepEqual(await viewImage.execute('inspect-outside', { path: '../diagram.svg' }),
+    { ok: false, error: 'Expected a workspace PNG, JPEG, WebP, GIF or SVG path.' })
 })

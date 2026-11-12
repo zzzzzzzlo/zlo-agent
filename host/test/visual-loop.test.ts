@@ -13,7 +13,7 @@ import { LocalAgentHost } from '../src/host.ts'
 import { PiExecution } from '../src/pi.ts'
 import { telemetryEvent } from '../src/telemetry-projection.ts'
 import type { AgentEvent } from '../src/contracts/domain.ts'
-import { VisualWorkflow, visualMode } from '../src/visual-workflow.ts'
+import { VisualTelemetry } from '../src/visual-workflow.ts'
 
 const route = { provider: 'deepseek', model: 'deepseek-flash' }
 function modelReply(step: number, action?: { name: string; args: object }): Response {
@@ -139,41 +139,26 @@ test('text-only Pi model receives an explicit downgrade without pixels', async t
   } finally { await session.dispose() }
 })
 
-test('visual modes bound frames, previews and estimated feedback tokens', () => {
-  assert.equal(visualMode('Repair the API schema.'), undefined)
-  assert.equal(visualMode('创建 SVG 动画，不要预览'), undefined)
-  const budget = new VisualWorkflow('HTML 动画，快速模式', [], () => {}, () => {})
-  try {
-    assert.equal(budget.mode, 'quick')
-    assert.match(budget.beginPreview({ timesMs: [0, 200] })!, /one frame/u)
-    assert.equal(budget.beginPreview({ timesMs: [200] }), undefined)
-    assert.equal(budget.reserve({ route, estimatedInputTokens: 59_000, maxOutputTokens: 5000, kind: 'prompt' }), true)
-    assert.equal(budget.reserve({ route, estimatedInputTokens: 1, maxOutputTokens: 1, kind: 'prompt' }), false)
-    budget.observe({ type: 'model.usage', input: 100, output: 50, cacheRead: 100, cacheWrite: 0 })
-    assert.equal(budget.reserve({ route, estimatedInputTokens: 60_000, maxOutputTokens: 2_000, kind: 'prompt' }), true)
-    assert.equal(budget.beginPreview({}), undefined)
-    budget.previewResult({ path: 'index.html' }, { ok: true, samples: [{ frame: 1 }] })
-    assert.deepEqual(budget.feedback(), { quick: true, final: true, maxOutputTokens: 2048 })
-    assert.equal(budget.acceptsEdit('edit_text_file', { path: 'index.html' }), false)
-    assert.equal(budget.acceptsEdit('apply_patch', { edits: [{ path: 'style.css' }] }), false)
-    assert.equal(budget.acceptsEdit('edit_text_file', { path: 'README.md' }), true)
-    assert.match(budget.beginPreview({})!, /exhausted/u)
-  } finally { budget.finish() }
-  const event = (seq: number, type: string, payload: Record<string, unknown>, correlationId?: string): AgentEvent => ({
-    schemaVersion: 1, id: 'event-' + seq, seq, occurredAt: new Date().toISOString(), taskId: 'task', taskNodeId: 'root', type, payload, correlationId,
+test('visual telemetry records repeated previews and later edits without setting execution limits', () => {
+  const event = (seq: number, type: string): AgentEvent => ({
+    schemaVersion: 1, id: 'event-' + seq, seq, occurredAt: new Date().toISOString(), taskId: 'task', taskNodeId: 'root', type, payload: {},
   })
-  const history = [event(1, 'visual.preview_started', {}), event(2, 'model.reserved', { estimatedTokens: 63_900 }, 'receipt')]
-  const resumed = new VisualWorkflow('HTML 快速模式', history, () => {}, () => {})
-  try {
-    assert.equal(resumed.beginPreview({}), undefined)
-    assert.equal(resumed.reserve({ route, estimatedInputTokens: 100, maxOutputTokens: 1, kind: 'prompt' }), false)
-  } finally { resumed.finish() }
-  const longRun = new VisualWorkflow('高质量模式 HTML 动画', [event(1, 'visual.preview_started', {}),
-    event(2, 'model.reserved', { estimatedTokens: 130_000 }, 'usage'),
-    event(3, 'model.reservation_settled', { actualTokens: 128_598 }, 'usage'), event(4, 'visual.preview_started', {})], () => {}, () => {})
-  try {
-    assert.equal(longRun.beginPreview({}), undefined)
-    longRun.previewResult({ path: 'index.html' }, { ok: true, samples: [{ frame: 1 }] })
-    assert.equal(longRun.reserve({ route, estimatedInputTokens: 45_000, maxOutputTokens: 2048, kind: 'prompt' }), true)
-  } finally { longRun.finish() }
+  const emitted: { type: string; payload: Record<string, unknown> }[] = []
+  const visual = new VisualTelemetry('fast', [event(1, 'visual.preview_started'), event(2, 'visual.draft_ready')],
+    (type, payload) => emitted.push({ type, payload }))
+  for (let i = 0; i < 5; i++) {
+    visual.beginPreview()
+    visual.previewResult({ ok: true, samples: [{ frame: 1 }, { frame: 2 }, { frame: 3 }] })
+    visual.requestStarted()
+    visual.observe({ type: 'model.usage', input: 100, output: 50, cacheRead: 100, cacheWrite: 0 })
+  }
+  visual.recordEdit('edit_text_file', { path: 'index.html' }, { ok: true })
+  visual.finish()
+  assert.deepEqual(emitted.filter(e => e.type === 'visual.preview_started').map(e => e.payload.round), [2, 3, 4, 5, 6])
+  const rounds = emitted.filter(e => e.type === 'visual.round_finished')
+  assert.equal(rounds.length, 5)
+  assert.equal(rounds.at(-1)?.payload.tokens, 250)
+  assert.equal(rounds.at(-1)?.payload.modified, true)
+  assert.equal(emitted.at(-1)?.payload.editedAfterLastRender, true)
+  assert.ok(!emitted.some(e => e.type === 'visual.draft_ready'))
 })

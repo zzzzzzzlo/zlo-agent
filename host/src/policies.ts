@@ -104,6 +104,9 @@ export interface CapabilityScope {
   access: WorkspaceAccess
   path?: string
   role: AgentRole
+  tools?: readonly string[]
+  explicitDelegation?: boolean
+  canSelectTaskWorkspace?: boolean
 }
 
 export const accessRank: Record<WorkspaceAccess, number> = { read: 0, write: 1, trusted: 2 }
@@ -118,19 +121,29 @@ export class CodingCapabilities {
   }
 
   root(access: WorkspaceAccess | undefined, legacyCheck: boolean): CapabilityScope {
-    return { role: 'root', access: this.#profile.workspaceWrites ? access ?? (legacyCheck ? 'write' : 'read') : 'read' }
+    return { role: 'root', access: this.#profile.workspaceWrites ? access ?? (legacyCheck ? 'write' : 'read') : 'read',
+      explicitDelegation: true, canSelectTaskWorkspace: true }
   }
 
-  child(parent: CapabilityScope, requested?: 'read' | 'write', path?: string, role: 'team' | 'worker' = 'worker'): CapabilityScope {
-    if (requested === 'write' && parent.access === 'read') throw new Error('Parent workspace scope cannot write')
+  child(parent: CapabilityScope, requested?: WorkspaceAccess, path?: string, role: 'team' | 'worker' = 'worker',
+    tools?: readonly string[]): CapabilityScope {
+    const access = requested ?? 'read'
+    if (!Object.hasOwn(accessRank, access) || accessRank[access] > accessRank[parent.access]) throw new Error('Requested access exceeds its parent workspace grant')
     const target = path === undefined ? parent.path : workspaceTarget({ path })
     if (path !== undefined && (!target || !within(parent.path, target))) throw new Error('Child workspace scope exceeds its parent')
-    return { role, access: requested ?? 'read', path: target }
+    if (tools !== undefined && (!Array.isArray(tools) || tools.length > 128 || new Set(tools).size !== tools.length ||
+      tools.some(name => typeof name !== 'string' || !/^[a-z][a-z_0-9]{0,63}$/u.test(name) || !this.enabled(name) ||
+        (parent.tools !== undefined && !parent.tools.includes(name))))) {
+      throw new Error('Requested tool set exceeds its parent capability grant')
+    }
+    return { role, access, path: target, tools: tools === undefined ? parent.tools : [...tools],
+      explicitDelegation: parent.explicitDelegation === true && tools !== undefined }
   }
 
   describe(scope: CapabilityScope, tool: WorkspaceTool): boolean {
-    if (!this.enabled(tool.name)) return false
-    if (tool.policy?.rootOnly && scope.role !== 'root') return false
+    if (!this.enabled(tool.name) || (scope.tools !== undefined && !scope.tools.includes(tool.name))) return false
+    if (tool.policy?.delegation === 'explicit' && !scope.explicitDelegation) return false
+    if (tool.policy?.wholeWorkspace && scope.path !== undefined) return false
     const minimum = tool.policy?.minimumAccess ?? (tool.effect === 'write' ? 'write' : 'read')
     return accessRank[scope.access] >= accessRank[minimum] && (tool.effect === 'read' || scope.access !== 'read')
   }
@@ -139,10 +152,14 @@ export class CodingCapabilities {
 
   authorize(scope: CapabilityScope, tool: WorkspaceTool, input: unknown): boolean {
     if (!this.describe(scope, tool)) return false
-    if (!scope.path) return true
     try {
+      if (tool.policy?.selectsTaskWorkspace?.(input) && !scope.canSelectTaskWorkspace) return false
+      const effect = tool.policy?.effectFor?.(input) ?? tool.effect
+      const minimum = tool.policy?.minimumAccessFor?.(input) ?? 'read'
+      if (accessRank[scope.access] < accessRank[minimum] || (effect === 'write' && scope.access === 'read')) return false
+      if (scope.path === undefined) return true
       const targets = tool.policy?.targets ? tool.policy.targets(input) : [workspaceTarget(input)]
-      return targets.length > 0 && targets.every(value => {
+      return targets.every(value => {
         const target = workspaceTarget({ path: value })
         return target !== undefined && within(scope.path, target)
       })

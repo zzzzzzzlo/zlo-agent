@@ -63,16 +63,19 @@ export function operationId(value: unknown): string {
 
 export function toolCatalog(extensions: ReturnType<ExtensionRegistry['resolve']>, capabilities: CodingCapabilities,
   workspace: CodingWorkspace, rootAccess: WorkspaceAccess, enabled: (name: string) => boolean): ManagedTool[] {
-  const childAccess = rootAccess === 'read' ? 'read' : 'write'
+  const rootScope = capabilities.root(rootAccess, false)
   const roles = ['root', 'team', 'worker'] as const
   const catalog = new Map<string, ManagedTool>()
   for (const role of roles) {
-    for (const { plugin, tool } of extensions.catalog(workspace, role, role === 'root' ? 'trusted' : 'write')) {
+    for (const { plugin, tool } of extensions.catalog(workspace, role, 'trusted')) {
       const entry = catalog.get(tool.name) ?? {
-        name: tool.name, plugin, effect: tool.effect, approval: Boolean(tool.policy?.approval), enabled: enabled(tool.name),
+        name: tool.name, plugin, effect: tool.effect, approval: Boolean(tool.policy?.approval || tool.policy?.approvalFor), enabled: enabled(tool.name),
         root: false, team: false, worker: false,
       }
-      entry[role] = capabilities.describe({ role, access: role === 'root' ? rootAccess : childAccess }, tool)
+      if (entry.enabled && capabilities.enabled(tool.name)) {
+        const scope = role === 'root' ? rootScope : capabilities.child(rootScope, rootScope.access, undefined, role, [tool.name])
+        entry[role] = capabilities.describe(scope, tool)
+      }
       catalog.set(tool.name, entry)
     }
   }
@@ -147,7 +150,7 @@ export function taskView(task: TaskSnapshot, events: AgentEvent[], operations: O
       ...[...(task.worker ? [task.worker] : []), ...(task.nodes ?? [])].map(node => ({
         id: node.id, role: node.role ?? 'worker' as const, goal: node.goal, status: node.status,
         parentNodeId: node.parentNodeId, dependencies: node.dependencies,
-        access: rootAccess !== 'read' && node.access === 'write' ? 'write' as const : 'read' as const,
+        access: rootAccess === 'read' ? 'read' : node.access === 'trusted' && rootAccess === 'write' ? 'write' : (node.access ?? 'read'),
         scopePath: node.scopePath, route: routeFor(node.id) ?? node.route, verification: node.verification,
         result: node.result && redactProcessOutput(node.result.summary), tools: [...(toolsByNode.get(node.id) ?? [])],
       })),

@@ -101,11 +101,11 @@ test('node verification gates dependencies and permits one versioned replan', (t
   assert.equal(engine.attempts(taskId).find(({ id }) => id === failedAttempt)?.status, 'failed')
 })
 
-test('Team scopes inherit and only allow read children while same-workspace writers are serialized', (t) => {
+test('Team scopes inherit and same-workspace writers serialize while a Team yields to its child', (t) => {
   const store = new LocalStore(':memory:')
   t.after(() => store.close())
   const engine = new TaskEngine(store)
-  const { taskId } = engine.create({ requestId: 'root', goal: 'Team work', cwd: 'ignored', workspaceAccess: 'write' })
+  const { taskId } = engine.create({ requestId: 'root', goal: 'Team work', cwd: 'ignored', workspaceAccess: 'trusted' })
   const [team, child, sibling] = engine.proposePlan(taskId, 'plan', 0, [
     { ref: 'team', goal: 'Fix feature', role: 'team', teamKey: 'feature', access: 'write', scopePath: 'src' },
     { ref: 'child', goal: 'Inspect feature', parentNodeId: 'team' },
@@ -117,7 +117,7 @@ test('Team scopes inherit and only allow read children while same-workspace writ
   assert.throws(() => engine.proposePlan(taskId, 'check-scope', 1,
     [{ ref: 'outside', goal: 'Check outside scope', parentNodeId: team.id, check: { path: 'docs/demo.md' } }]), /outside the node scope/)
   assert.throws(() => engine.proposePlan(taskId, 'unsafe-child', 1,
-    [{ ref: 'write', goal: 'Edit', parentNodeId: team.id, access: 'write' }]), /read-only Workers/)
+    [{ ref: 'trusted', goal: 'Run outside the Team grant', parentNodeId: team.id, access: 'trusted' }]), /expand parent access/)
   assert.throws(() => engine.proposePlan(taskId, 'wrong-dependency', 1,
     [{ ref: 'cross', goal: 'Read', dependencies: [child.id] }]), /parent scope/)
   assert.throws(() => engine.replanNode(taskId, 'expanded-replan', 1, child.id,

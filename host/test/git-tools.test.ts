@@ -40,7 +40,8 @@ async function fixture(context: TestContext) {
 
 test('approved Git tools use durable task-owned worktrees, commit specific files and integrate a clean root', async context => {
   const { root, workspace, worktrees, tools, run } = await fixture(context)
-  assert.ok(tools.every(tool => tool.effect === 'write' && tool.policy?.rootOnly && tool.policy.approval === 'git'))
+  assert.ok(tools.every(tool => tool.effect === 'write' && tool.policy?.delegation === 'explicit' &&
+    tool.policy.wholeWorkspace && tool.policy.minimumAccess === 'trusted' && tool.policy.approval === 'git'))
   assert.equal((await run('git_branch', { branch: '--force' })).ok, false)
   assert.equal((await run('git_branch', { branch: 'local/proof' })).ok, true)
   assert.equal(git(root, ['branch', '--show-current']), 'main')

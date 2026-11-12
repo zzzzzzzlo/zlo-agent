@@ -47,12 +47,12 @@ test('DeepSeek recovers once, retains completed tool history, and resumes a pers
       return fauxAssistantMessage(fauxThinking('second output-limit fixture'), { stopReason: 'length' })
     },
   ])
-  const host = new LocalAgentHost({ directory: join(root, 'state'), execution })
+  const host = new LocalAgentHost({ directory: join(root, 'state'), execution, harnessMode: 'fast' })
   try {
     const conversation = host.createConversation({ requestId: 'create', workspace, workspaceAccess: 'write', route })
     const { taskId } = await host.sendMessage({ conversationId: conversation.id, requestId: 'message', text: 'Inspect the workspace and create demo.html' })
     await host.idle()
-    assert.deepEqual(budgets, [16_384, 16_384, 16_384])
+    assert.deepEqual(budgets, [32_768, 32_768, 32_768])
     assert.deepEqual(efforts, ['low', 'low', undefined])
     const task = host.getHistory(taskId)
     assert.equal(task.task.status, 'blocked')
@@ -93,7 +93,7 @@ test('DeepSeek recovers once, retains completed tool history, and resumes a pers
   }
 })
 
-test('the DeepSeek wire payload enables low thinking and disables it only for an allowed recovery', async (t) => {
+test('the DeepSeek wire uses Pi defaults, disables thinking for recovery and obeys an explicit request budget', async (t) => {
   const route = { provider: 'deepseek', model: 'deepseek-flash' }
   const cwd = await mkdtemp(join(tmpdir(), 'zlo-deepseek-wire-'))
   t.after(() => rm(cwd, { recursive: true, force: true }))
@@ -120,17 +120,24 @@ test('the DeepSeek wire payload enables low thinking and disables it only for an
   try {
     assert.deepEqual(await session.run('Return a short answer.'), { status: 'completed', text: 'Done' })
     assert.deepEqual(requests.map(request => [request.max_tokens, request.thinking, request.reasoning_effort]), [
-      [16_384, { type: 'enabled' }, 'low'],
-      [16_384, { type: 'disabled' }, undefined],
+      [384_000, { type: 'enabled' }, 'high'],
+      [384_000, { type: 'disabled' }, undefined],
     ])
     assert.ok(!JSON.stringify(requests[1]).includes('reasoning-only wire fixture'))
   } finally {
     await session.dispose()
   }
-  const guarded = await execution.open({ ...config, canRecoverModelOutput: () => false })
+  const guarded = await execution.open({ ...config, reasoningEffort: 'low', canRecoverModelOutput: () => false,
+    reserveRequest(request) {
+      assert.equal(request.maxOutputTokens, 384_000)
+      assert.equal(request.fixedMaxOutputTokens, false)
+      return 12_345
+    } })
   try {
     assert.deepEqual(await guarded.run('Return a short answer.'), { status: 'model_output_limit' })
     assert.equal(requests.length, 3)
+    assert.deepEqual([requests[2].max_tokens, requests[2].thinking, requests[2].reasoning_effort],
+      [12_345, { type: 'enabled' }, 'low'])
   } finally {
     await guarded.dispose()
   }

@@ -32,6 +32,12 @@ else {
   process.exitCode = 1
 }
 
+function configuredLimit(value: string | undefined): number | undefined {
+  if (value === undefined) return undefined
+  if (!/^\d+$/u.test(value) || !Number.isSafeInteger(Number(value)) || Number(value) < 1) throw new Error('Invalid task budget')
+  return Number(value)
+}
+
 async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Promise<{ host: LocalAgentHost; runtimeId: HostMode } | undefined> {
   let failure: HostDiagnosticCode = 'host.startup_config_invalid'
   try {
@@ -43,6 +49,10 @@ async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Pro
     const directory = args[2] ? resolve(args[2]) : defaultDirectory
     const modelProvider = process.env.ZLO_AGENT_MODEL_PROVIDER
     const modelId = process.env.ZLO_AGENT_MODEL_ID
+    const harnessMode = process.env.ZLO_AGENT_HARNESS_MODE ?? 'quality'
+    if (harnessMode !== 'quality' && harnessMode !== 'fast') throw new Error('Invalid harness mode')
+    const tokens = configuredLimit(process.env.ZLO_AGENT_TASK_TOKEN_LIMIT)
+    const requests = configuredLimit(process.env.ZLO_AGENT_TASK_REQUEST_LIMIT)
     const defaultRoute = mode === '--faux' ? { provider: 'faux', model: 'desktop-test' }
       : modelProvider || modelId ? parseRoute({ provider: modelProvider, model: modelId }) : undefined
     failure = 'host.startup_runtime_failed'
@@ -66,6 +76,7 @@ async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Pro
     failure = 'host.startup_storage_failed'
     const host = new LocalAgentHost({
       directory, execution, runtimeId, providerRuntime, defaultRoute, defaultWorkspace: process.env.ZLO_AGENT_DEFAULT_WORKSPACE,
+      harnessMode, modelLimits: { ...(tokens === undefined ? {} : { tokens }), ...(requests === undefined ? {} : { requests }) },
     })
     return { host, runtimeId }
   } catch {

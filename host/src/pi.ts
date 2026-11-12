@@ -5,12 +5,10 @@ import { dirname, join, relative } from 'node:path'
 import { InMemoryCredentialStore, type AssistantMessage, type ImageContent } from '@earendil-works/pi-ai'
 import {
   createAgentSession,
-  createExtensionRuntime,
   estimateTokens,
   ModelRuntime,
   SessionManager,
   SettingsManager,
-  type ResourceLoader,
   type ToolDefinition,
 } from '@earendil-works/pi-coding-agent'
 import { ModelUnavailableError, previewImageLimits, toolImages } from './execution.ts'
@@ -20,6 +18,7 @@ import type { ProviderCatalog } from './model-management.ts'
 import type { ManagedModel, ManagedProvider, ProviderId } from '../../shared/contracts/management.ts'
 import type { ChatGptSession } from '../../shared/contracts/chatgpt.ts'
 import { chatGptResponsesFetch, chatGptResponsesPayload } from './chatgpt-responses.ts'
+import { codingResources } from './coding-resources.ts'
 
 function fingerprint(key: string): string { return createHash('sha256').update(key).digest('hex') }
 
@@ -259,19 +258,23 @@ export class PiExecution implements AgentExecution {
     let stopping = false
     const pendingImages = new Map<string, ToolImage[]>()
     const vision = model.input.includes('image')
-    const customTools = config.tools.map(tool => asPiTool(tool, () => stopping, vision, pendingImages))
+    const resources = await codingResources(config.systemPrompt, config.instructionScopes, config.skillReadsAllowed)
+    const enabledTools = resources.skillTool ? [...config.tools, resources.skillTool] : config.tools
+    const customTools = enabledTools.map(tool => asPiTool(tool, () => stopping, vision, pendingImages))
     const { session } = await createAgentSession({
       cwd,
       modelRuntime,
       model,
+      thinkingLevel: config.reasoningEffort,
       sessionManager: manager,
       settingsManager: SettingsManager.inMemory({
-        compaction: { enabled: false, keepRecentTokens: Math.min(12_000, Math.floor(model.contextWindow / 4)) },
-        retry: { enabled: false, provider: { maxRetries: 0 } },
+        compaction: { keepRecentTokens: Math.min(12_000, Math.floor(model.contextWindow / 4)) },
+        // Pi retries whole requests through the metered stream. Transport-level retries would be hidden from the budget.
+        retry: { provider: { maxRetries: 0 } },
         cacheWarming: 'off',
         enableAnalytics: false,
       }),
-      resourceLoader: explicitResources(config.systemPrompt),
+      resourceLoader: resources.loader,
       tools: customTools.map(tool => tool.name),
       customTools,
     })
@@ -283,10 +286,14 @@ export class PiExecution implements AgentExecution {
     let compacting = false
     let recoveringOutput = false
     let outputRecoveryUsed = false
-    let lastProviderInput = 0
     let lastRequestHadFrames = false
     const deepSeekThinking = model.provider === 'deepseek' && model.reasoning
-    const previousAssistant = session.messages.findLast(message => message.role === 'assistant') as AssistantMessage | undefined
+    // Pi may omit an unsuccessful response from the projected context after overflow recovery.
+    const previousEntry = config.resumeAfterOutputLimit
+      ? manager.getBranch().findLast(entry => entry.type === 'message' && entry.message.role === 'assistant')
+      : undefined
+    const previousAssistant = previousEntry?.type === 'message' && previousEntry.message.role === 'assistant'
+      ? previousEntry.message : undefined
     const resumeOutputRecovery = deepSeekThinking && config.resumeAfterOutputLimit &&
       previousAssistant?.provider === model.provider && previousAssistant.model === model.id &&
       isThinkingOnlyTruncation(previousAssistant)
@@ -298,8 +305,9 @@ export class PiExecution implements AgentExecution {
     }
     const reserve = (estimatedInputTokens: number, maxOutputTokens: number, kind: 'prompt' | 'compaction') => {
       if (stopping) throw new Error('Run is stopping')
-      config.reserveRequest?.({ route, estimatedInputTokens, maxOutputTokens, kind })
+      const allowedOutput = config.reserveRequest?.({ route, estimatedInputTokens, maxOutputTokens, kind, fixedMaxOutputTokens: chatGpt })
       emit({ type: 'model.request_started' })
+      return allowedOutput ?? maxOutputTokens
     }
     const stream = session.agent.streamFunction
     const canUseProvider = (provider: string, id: string, maxTokens: number) => chatGpt
@@ -313,53 +321,52 @@ export class PiExecution implements AgentExecution {
       if (!canUseProvider(model.provider, model.id, model.maxTokens)) throw modelUnavailable('Provider authorization or model is unavailable')
       // Sign in with ChatGPT omits max_output_tokens. Reserve the documented model maximum.
       // DeepSeek counts reasoning and the answer or tool arguments against the same limit.
-      const visual = vision ? config.visualFeedback?.() : undefined
-      const outputLimit = Math.min(deepSeekThinking ? 16_384 : 4_096, visual?.maxOutputTokens ?? Infinity)
-      const maxTokens = chatGpt ? model.maxTokens : Math.min(options?.maxTokens ?? model.maxTokens, model.maxTokens, outputLimit)
+      const requestedOutput = chatGpt ? model.maxTokens : Math.min(options?.maxTokens ?? model.maxTokens, model.maxTokens)
       // Keep valid reasoning/tool pairs. An exhausted thinking-only turn has no result to replay.
       const textContext = deepSeekThinking
         ? { ...context, messages: context.messages.filter(message => message.role !== 'assistant' || !isThinkingOnlyTruncation(message)) }
         : context
-      let frames = 0
+      const attached = new Set<string>()
       let requestContext = textContext
       if (!compacting && pendingImages.size) {
         if (model.input.includes('image')) requestContext = { ...textContext, messages: textContext.messages.map(message => {
           if (message.role !== 'toolResult') return message
           const images = pendingImages.get(message.toolCallId)
           if (!images) return message
-          pendingImages.delete(message.toolCallId)
-          frames += images.length
+          attached.add(message.toolCallId)
           const content: ImageContent[] = images.map(({ bytes }) => ({ type: 'image', mimeType: 'image/jpeg', data: bytes.toString('base64') }))
           return { ...message, content: [...message.content, ...content] }
         }) }
-        // Pixels belong to the immediate next request. Pi's durable transcript retains only metadata.
-        pendingImages.clear()
+        for (const id of pendingImages.keys()) if (!attached.has(id)) pendingImages.delete(id)
       }
+      const frames = [...attached].reduce((sum, id) => sum + (pendingImages.get(id)?.length ?? 0), 0)
       const estimatedImageTokens = frames * previewImageLimits.estimatedTokens
       const textBytes = Buffer.byteLength(JSON.stringify(textContext))
-      // Calibrate on the latest provider input and leave margin for source code and tool schemas.
-      const estimatedText = visual ? Math.max(lastProviderInput, Math.ceil(textBytes / 3) + 512) : textBytes
-      reserve(estimatedText + estimatedImageTokens, maxTokens, compacting ? 'compaction' : 'prompt')
+      const estimatedText = Math.ceil(textBytes / 3) + 512
+      const maxTokens = reserve(estimatedText + estimatedImageTokens, requestedOutput, compacting ? 'compaction' : 'prompt')
       lastRequestHadFrames = frames > 0
       if (frames) emit({ type: 'visual.frames_sent', frames, estimatedImageTokens })
       writeHostDiagnostic('host.model_started', traceId)
-      const requestFailed = () => writeHostDiagnostic(options?.signal?.aborted ? 'host.model_interrupted' : 'host.model_failed', traceId)
+      const requestFailed = () => {
+        emit({ type: 'model.request_unaccounted' })
+        writeHostDiagnostic(options?.signal?.aborted ? 'host.model_interrupted' : 'host.model_failed', traceId)
+      }
       try {
         const response = await stream(model, requestContext, { ...options, maxTokens,
-          ...(deepSeekThinking && (recoveringOutput || (frames > 0 && (visual?.quick || visual?.final))) ? { reasoning: undefined }
-            : deepSeekThinking && model.id === 'deepseek-flash' ? { reasoning: 'low' as const } : {}),
+          ...(deepSeekThinking && recoveringOutput ? { reasoning: undefined } : {}),
           ...(chatGpt ? { apiKey: this.chatGptSession?.accessToken, cacheRetention: 'none' as const,
             onPayload: chatGptResponsesPayload, fetch: chatGptFetch } : {}) })
         // Inspect only the completion category. Provider errors may contain request data.
         void response.result().then((message) => {
           providerMessages.add(message)
           const { input, output, cacheRead, cacheWrite, cost } = message.usage
-          if (input || cacheRead || cacheWrite) lastProviderInput = input + cacheRead + cacheWrite
+          // Keep pixels through a Pi request retry. A completed request consumes its images.
+          if (message.stopReason !== 'error') for (const id of attached) pendingImages.delete(id)
           if (input || output || cacheRead || cacheWrite || !['aborted', 'error'].includes(message.stopReason)) {
             const estimate = chatGpt ? undefined : cost?.total
             emit({ type: 'model.usage', input, output, cacheRead, cacheWrite,
               ...(estimate !== undefined && Number.isFinite(estimate) && estimate > 0 ? { estimatedCostUsd: estimate } : {}) })
-          }
+          } else emit({ type: 'model.request_unaccounted' })
           writeHostDiagnostic(message.stopReason === 'aborted' ? 'host.model_interrupted'
             : message.stopReason === 'length' ? 'host.model_output_limit'
               : message.stopReason === 'error' ? 'host.model_failed' : 'host.model_completed', traceId)
@@ -372,6 +379,12 @@ export class PiExecution implements AgentExecution {
     }
     const unsubscribe = session.subscribe(event => {
       if (event.type === 'agent_start' && stopping) void session.abort().catch(() => {})
+      if (event.type === 'compaction_start') compacting = true
+      if (event.type === 'compaction_end') {
+        compacting = false
+        if (event.result) emit({ type: 'context.compacted', tokensBefore: event.result.tokensBefore,
+          estimatedTokensAfter: event.result.estimatedTokensAfter })
+      }
       if (event.type === 'message_update' && event.assistantMessageEvent.type === 'text_delta') {
         emit({ type: 'message.delta', delta: event.assistantMessageEvent.delta })
       }
@@ -425,13 +438,7 @@ export class PiExecution implements AgentExecution {
           try {
             const contextTokens = session.messages.reduce((sum, message) => sum + estimateTokens(message), 0)
             if (session.messages.length > 6 && contextTokens > model.contextWindow * 0.7) {
-              compacting = true
-              try {
-                const compacted = await session.compact('Keep task constraints, verified changes, and pending work with their references.')
-                emit({ type: 'context.compacted', tokensBefore: compacted.tokensBefore, estimatedTokensAfter: compacted.estimatedTokensAfter })
-              } finally {
-                compacting = false
-              }
+              await session.compact('Keep task constraints, verified changes, and pending work with their references.')
             }
             if (stopping) return { status: 'interrupted' }
             if (resumeOutputRecovery && canRecoverOutput()) {
@@ -490,29 +497,13 @@ function modelUnavailable(message: string): ModelUnavailableError {
   return new ModelUnavailableError(message)
 }
 
-function explicitResources(systemPrompt: string): ResourceLoader {
-  const runtime = createExtensionRuntime()
-  return {
-    getExtensions: () => ({ extensions: [], errors: [], runtime }),
-    getSkills: () => ({ skills: [], diagnostics: [] }),
-    getPrompts: () => ({ prompts: [], diagnostics: [] }),
-    getThemes: () => ({ themes: [], diagnostics: [] }),
-    getAgentsFiles: () => ({ agentsFiles: [] }),
-    getSystemPrompt: () => systemPrompt,
-    getSystemPromptSource: () => undefined,
-    getAppendSystemPrompt: () => [],
-    getAppendSystemPromptSources: () => [],
-    extendResources() {},
-    async reload() {},
-  }
-}
-
 function asPiTool(tool: ExecutionTool, stopping: () => boolean, vision: boolean, pending: Map<string, ToolImage[]>): ToolDefinition {
   if (!/^[a-zA-Z0-9_-]+$/.test(tool.name)) throw new Error('Invalid Pi tool name')
   return {
     name: tool.name,
     label: tool.name,
     description: tool.description,
+    promptSnippet: tool.description,
     // The v1.5 tool validator accepts JSON Schema. The SDK declaration still uses TSchema.
     parameters: tool.parameters as ToolDefinition['parameters'],
     executionMode: 'sequential',
@@ -528,7 +519,8 @@ function asPiTool(tool: ExecutionTool, stopping: () => boolean, vision: boolean,
         result = { ...metadata, visualInput: !vision ? 'unavailable_on_selected_model' : accepted.length ? 'attached_for_next_request' : 'no_frames_available',
           attachedFrames: accepted.length }
       }
-      return { content: [{ type: 'text', text: JSON.stringify(result) ?? 'null' }], details: undefined }
+      const isError = Boolean(result && typeof result === 'object' && 'ok' in result && result.ok === false)
+      return { content: [{ type: 'text', text: JSON.stringify(result) ?? 'null' }], details: undefined, isError }
     },
   }
 }

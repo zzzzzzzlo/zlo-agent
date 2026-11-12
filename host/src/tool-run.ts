@@ -44,24 +44,30 @@ export class ToolRun {
         const combined = toolSignal ? AbortSignal.any([signal, toolSignal]) : signal
         if (this.#closed || combined.aborted) return unavailable
         const ref = event()
+        let effect = tool.effect
         const deny = (reason: 'policy' | 'approval_safety') => {
-          try { this.#tasks.auditToolDenial(ref, tool.name, tool.effect, reason) } catch { /* A diagnostic cannot change a denial. */ }
+          try { this.#tasks.auditToolDenial(ref, tool.name, effect, reason) } catch { /* A diagnostic cannot change a denial. */ }
         }
+        let approvalKind
+        try {
+          effect = tool.policy?.effectFor?.(input) ?? effect
+          approvalKind = tool.policy?.approvalFor?.(input) ?? tool.policy?.approval
+        } catch { deny('policy'); return unavailable }
         if (!authorize(input)) { deny('policy'); return unavailable }
         const operationId = ref.agentRunId + ':' + callId
         const target = workspaceTarget(input)
         let destination: string | undefined
-        if (tool.policy?.approval) {
+        if (approvalKind) {
           const detail = JSON.stringify(input) ?? 'null'
           if (detail.length > 8_000 || redactProcessOutput(detail) !== detail || /[\u202a-\u202e\u2066-\u2069]/u.test(detail)) {
             deny('approval_safety')
             return { ok: false, error: 'The operation cannot be safely displayed for approval' }
           }
           const approval = await this.#approval.request({
-            kind: tool.policy.approval, tool: tool.name, detail, workspace: workspace.root,
-            ...(tool.policy.approval === 'export' && target ? { suggestedName: basename(target) } : {}),
+            kind: approvalKind, tool: tool.name, detail, workspace: workspace.root,
+            ...(approvalKind === 'export' && target ? { suggestedName: basename(target) } : {}),
           }, combined)
-          this.#tasks.auditToolApproval(ref, operationId, tool.name, approval.approved && !combined.aborted, tool.policy.approval)
+          this.#tasks.auditToolApproval(ref, operationId, tool.name, approval.approved && !combined.aborted, approvalKind)
           if (!approval.approved || this.#closed || combined.aborted || !authorize(input)) {
             return { ok: false, error: 'Operation was not authorized' }
           }
@@ -71,8 +77,8 @@ export class ToolRun {
           const filePostcondition = tool.name === 'create_text_file'
             ? await prepareFilePostcondition(tool.name, workspace, target, input) : undefined
           if (this.#closed || combined.aborted || !authorize(input)) return unavailable
-          this.#tasks.beginTool(ref.taskId, ref, operationId, tool.name, tool.effect,
-            tool.effect === 'write' ? target : undefined, undefined, tool.policy, filePostcondition)
+          this.#tasks.beginTool(ref.taskId, ref, operationId, tool.name, effect,
+            effect === 'write' ? target : undefined, undefined, tool.policy, filePostcondition)
         } catch {
           return unavailable
         }
@@ -93,9 +99,9 @@ export class ToolRun {
             },
           })
         } catch {
-          if (!deferred) this.#finish(ref, operationId, tool.effect === 'write' ? 'unknown_effect' : 'failed',
+          if (!deferred) this.#finish(ref, operationId, effect === 'write' ? 'unknown_effect' : 'failed',
             combined.aborted ? 'tool_cancelled' : 'tool_exception')
-          return { ok: false, error: tool.effect === 'write' ? 'Write result requires reconciliation' : 'Tool failed' }
+          return { ok: false, error: effect === 'write' ? 'Write result requires reconciliation' : 'Tool failed' }
         }
         const successful = Boolean(result && typeof result === 'object' && 'ok' in result && result.ok === true)
         if (!deferred) {
@@ -106,7 +112,7 @@ export class ToolRun {
         }
         if (!deferred && successful) {
           evidence?.add(operationId)
-          if (target && (tool.name === 'read_text_file' || tool.effect === 'write')) artifacts?.add(target)
+          if (target && (tool.name === 'read_text_file' || tool.name === 'view_image' || effect === 'write')) artifacts?.add(target)
         }
         return redactResult(result)
       },

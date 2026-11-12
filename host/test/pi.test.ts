@@ -116,6 +116,59 @@ test('Pi executes an allowlisted tool, streams output and restores its transcrip
   try { assert.deepEqual(restored.route, nextRoute) } finally { await restored.dispose() }
 })
 
+test('Pi assembles trusted instructions and skill descriptions, then reads only an available skill', async t => {
+  const { execution, config, faux } = await fixture(t)
+  const user = join(config.cwd, 'instructions')
+  const project = join(config.cwd, 'project')
+  const guide = join(project, '.agents', 'skills', 'test-guide')
+  const privateGuide = join(project, '.agents', 'skills', 'private-guide')
+  await mkdir(user)
+  await mkdir(guide, { recursive: true })
+  await mkdir(privateGuide, { recursive: true })
+  await writeFile(join(config.cwd, 'AGENTS.md'), 'OUTSIDE_SCOPE_GUIDE')
+  await writeFile(join(user, 'AGENTS.md'), 'USER_SCOPE_GUIDE')
+  await writeFile(join(project, 'AGENTS.md'), 'PROJECT_SCOPE_GUIDE')
+  await writeFile(join(guide, 'SKILL.md'), '---\nname: test-guide\ndescription: Skill summary for a scoped task\n---\nSKILL_BODY_ON_DEMAND')
+  await writeFile(join(privateGuide, 'SKILL.md'), '---\nname: private-guide\ndescription: PRIVATE_SKILL_SUMMARY\ndisable-model-invocation: true\n---\nPRIVATE_SKILL_BODY')
+  let allowed = true
+  faux.setResponses([
+    context => {
+      const rendered = JSON.stringify(context)
+      for (const text of ['USER_SCOPE_GUIDE', 'PROJECT_SCOPE_GUIDE', 'Skill summary for a scoped task', config.systemPrompt]) {
+        assert.ok(rendered.includes(text), 'Missing prompt material: ' + text)
+      }
+      for (const text of ['OUTSIDE_SCOPE_GUIDE', 'SKILL_BODY_ON_DEMAND', 'PRIVATE_SKILL_SUMMARY', 'PRIVATE_SKILL_BODY']) {
+        assert.ok(!rendered.includes(text), 'Unexpected prompt material: ' + text)
+      }
+      assert.deepEqual(getCurrentTools(context.messages).map(tool => tool.name), ['read_skill'])
+      return fauxAssistantMessage(fauxToolCall('read_skill', { name: 'test-guide' }, { id: 'skill-before' }), { stopReason: 'toolUse' })
+    },
+    context => {
+      assert.match(JSON.stringify(context.messages.findLast(message => message.role === 'toolResult')), /SKILL_BODY_ON_DEMAND/)
+      allowed = false
+      return fauxAssistantMessage(fauxToolCall('read_skill', { name: 'test-guide' }, { id: 'skill-after' }), { stopReason: 'toolUse' })
+    },
+    context => {
+      const result = context.messages.findLast(message => message.role === 'toolResult')
+      assert.equal(result?.isError, true)
+      assert.match(JSON.stringify(result), /Skill access is unavailable/)
+      return fauxAssistantMessage('Scope enforced')
+    },
+  ])
+  const session = await execution.open({ ...config, cwd: project, instructionScopes: { user, project }, skillReadsAllowed: () => allowed })
+  try { assert.deepEqual(await session.run('Use the approved guidance'), { status: 'completed', text: 'Scope enforced' }) }
+  finally { await session.dispose() }
+
+  faux.setResponses([context => {
+    assert.deepEqual(getCurrentTools(context.messages).map(tool => tool.name), [])
+    assert.doesNotMatch(JSON.stringify(context), /read_skill|Skill summary for a scoped task/)
+    return fauxAssistantMessage('Skill hidden')
+  }])
+  const restricted = await execution.open({ ...config, cwd: project, instructionScopes: { user, project }, skillReadsAllowed: () => false })
+  try { assert.deepEqual(await restricted.run('Complete this without skills'), { status: 'completed', text: 'Skill hidden' }) }
+  finally { await restricted.dispose() }
+})
+
 test('Pi queues steering while a provider call is active and persists the user message', { timeout: 5_000 }, async t => {
   const { execution, config, faux } = await fixture(t)
   const entered = Promise.withResolvers<void>()
@@ -234,16 +287,51 @@ test('Pi can checkpoint before a first assistant response and rejects damaged or
   await assert.rejects(execution.open({ ...config, session: fresh.ref }), { code: 'ENOENT' })
 })
 
-test('a resolved Pi model error is reported without retry and observer exceptions do not escape', async t => {
+test('a nonretryable Pi model error is reported and observer exceptions do not escape', async t => {
   const { execution, config, faux } = await fixture(t)
   config.onEvent = () => { throw new Error('broken observer') }
-  faux.setResponses([fauxAssistantMessage('', { stopReason: 'error', errorMessage: '429 retryable test error' })])
+  faux.setResponses([fauxAssistantMessage('', { stopReason: 'error', errorMessage: '401 invalid test credential' })])
   const session = await execution.open(config)
   try {
     assert.deepEqual(await session.run('Trigger a provider error'), { status: 'model_error' })
     assert.equal(faux.state.callCount, 1)
     await session.checkpoint()
   } finally { await session.dispose() }
+})
+
+test('Pi serializes a tool batch and retries a transient provider error without repeating completed work', async t => {
+  const { execution, config, faux } = await fixture(t)
+  const metering: string[] = []
+  let tools = 0
+  let toolActive = false
+  config.reserveRequest = () => { metering.push('reserve') }
+  config.onEvent = event => {
+    if (event.type === 'model.request_unaccounted') metering.push('uncertain')
+    if (event.type === 'model.usage') metering.push('usage')
+  }
+  config.tools = [{ name: 'record_test_result', description: 'Return a completed verification receipt', parameters: { type: 'object' },
+    async execute() {
+      assert.equal(toolActive, false)
+      toolActive = true
+      await new Promise(resolve => setImmediate(resolve))
+      toolActive = false
+      tools++
+      return { evidence: 'confirmed test result ' + tools }
+    } }]
+  faux.setResponses([
+    fauxAssistantMessage([fauxToolCall('record_test_result', {}), fauxToolCall('record_test_result', {})], { stopReason: 'toolUse' }),
+    () => { throw new Error('429 transient test error') },
+    context => {
+      assert.match(JSON.stringify(context.messages), /confirmed test result 1/)
+      assert.match(JSON.stringify(context.messages), /confirmed test result 2/)
+      return fauxAssistantMessage('Verified')
+    },
+  ])
+  const session = await execution.open(config)
+  try { assert.deepEqual(await session.run('Verify the fixture'), { status: 'completed', text: 'Verified' }) }
+  finally { await session.dispose() }
+  assert.equal(tools, 2)
+  assert.deepEqual(metering, ['reserve', 'usage', 'reserve', 'uncertain', 'reserve', 'usage'])
 })
 
 test('Pi rejects missing model configuration before a session is created', async t => {
