@@ -48,7 +48,7 @@
       {
         "from": "../shared",
         "to": "shared",
-        "filter": ["package.json", "contracts/**/*", "diagnostics.ts"]
+        "filter": ["package.json", "contracts/**/*", "diagnostics.ts", "loopback-http.ts"]
       },
       {
         "from": "out/agent-host",

@@ -1,11 +1,9 @@
-import { Brain, ChartNoAxesColumn, Check, CircleHelp, KeyRound, Moon, Palette, ShieldCheck, Sun, Workflow, Wrench } from 'lucide-react'
+import { Check, CircleHelp, Moon, Palette, Sun } from 'lucide-react'
 import { useState } from 'react'
 import { version } from '../../../package.json'
 import type { GlassStrength } from '../../features/appearance/preferences'
 import { useWorkspace } from '../../stores/workspace'
 import { Modal } from '../ui/Modal'
-import { managementLabels, ManagementSections } from './ManagementSections'
-import type { ManagementSection } from './ManagementSections'
 
 const themes = [
   { id: 'dark', label: '深色', icon: Moon },
@@ -18,21 +16,15 @@ const strengths: { id: GlassStrength; label: string; description: string }[] = [
   { id: 'vivid', label: '通透', description: '桌面更清晰，折射更强' },
 ]
 
-export type SettingsSection = ManagementSection | 'appearance' | 'about'
+type SettingsSection = 'appearance' | 'about'
 
 const sections = [
   { id: 'appearance', label: '外观', icon: Palette },
-  { id: 'models', label: managementLabels.models, icon: KeyRound },
-  { id: 'permissions', label: managementLabels.permissions, icon: ShieldCheck },
-  { id: 'tasks', label: managementLabels.tasks, icon: Workflow },
-  { id: 'tools', label: managementLabels.tools, icon: Wrench },
-  { id: 'memory', label: managementLabels.memory, icon: Brain },
-  { id: 'diagnostics', label: managementLabels.diagnostics, icon: ChartNoAxesColumn },
   { id: 'about', label: '关于', icon: CircleHelp },
 ] as const
 
-export function Settings({ onClose, initialSection }: { onClose: () => void; initialSection: SettingsSection }) {
-  const [section, setSection] = useState<SettingsSection>(initialSection)
+export function Settings({ onClose }: { onClose: () => void }) {
+  const [section, setSection] = useState<SettingsSection>('appearance')
   const theme = useWorkspace((state) => state.theme)
   const strength = useWorkspace((state) => state.strength)
   const setTheme = useWorkspace((state) => state.setTheme)
@@ -77,7 +69,7 @@ export function Settings({ onClose, initialSection }: { onClose: () => void; ini
               <p className="settings-hint">设备不支持折射时，自动使用磨砂效果。</p>
             </fieldset>
           </section>
-        ) : section === 'about' ? (
+        ) : (
           <section className="settings-content settings-about">
             <h3>Zlo Agent <span className="mono">v{version}</span></h3>
             <p>{mock ? '个人 AI Agent 桌面工作区。当前启用了界面演示。' : '个人 AI Agent 桌面工作区。会话和执行记录由本地 Agent Host 保存。'}</p>
@@ -88,7 +80,7 @@ export function Settings({ onClose, initialSection }: { onClose: () => void; ini
               <div><dt>换行</dt><dd><kbd>Shift Enter</kbd></dd></div>
             </dl>
           </section>
-        ) : <ManagementSections section={section} />}
+        )}
       </div>
     </Modal>
   )

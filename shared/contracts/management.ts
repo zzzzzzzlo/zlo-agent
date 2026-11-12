@@ -95,8 +95,21 @@ export interface ManagementSnapshot {
   diagnostics: ManagedDiagnostic[]
 }
 
+export interface ConversationObservatory {
+  conversationId: string
+  turns: number
+  usage: UsageTotals
+  modelRequests: number
+  usageReports: number
+  pricedReports: number
+  estimatedCostUsd: number | null
+  tools: { name: string; status: string; count: number }[]
+  latestTask?: { id: string; tokenLimit: number; requests: number; confirmed: number; reserved: number; uncertain: number }
+}
+
 export interface DesktopManagementApi {
   snapshot(input: { conversationId?: string }): Promise<ManagementSnapshot>
+  conversationObservatory(input: { conversationId: string }): Promise<ConversationObservatory>
   recentDiagnostics(): Promise<ManagedDiagnostic[]>
   savePreferences(input: AgentPreferences): Promise<AgentPreferences>
   setWorkspaceAccess(input: { conversationId: string; access: WorkspaceAccess }): Promise<ConversationSummary>
@@ -110,6 +123,7 @@ export interface DesktopManagementApi {
 type ManagementRequest<T extends string, I = object> = { schemaVersion: 1; type: T } & I
 export type ManagementCommand =
   | ManagementRequest<'managementSnapshot', { conversationId?: string }>
+  | ManagementRequest<'conversationObservatory', { conversationId: string }>
   | ManagementRequest<'saveAgentPreferences', { preferences: AgentPreferences }>
   | ManagementRequest<'setWorkspaceAccess', { conversationId: string; access: WorkspaceAccess; expected: WorkspaceAccess }>
   | ManagementRequest<'deleteConversationMemory', { conversationId: string; ids: string[] }>

@@ -1,18 +1,26 @@
 import { useRef, useState } from 'react'
 import type { MouseEvent } from 'react'
-import { MessageSquare, MoreHorizontal, PanelLeft, Pencil, Plus, Settings2, Trash2 } from 'lucide-react'
+import { Activity, Brain, KeyRound, MessageSquare, MoreHorizontal, PanelLeft, Pencil, Plus, Settings2, ShieldCheck, Trash2, Workflow, Wrench } from 'lucide-react'
 import { useWorkspace } from '../../stores/workspace'
 import type { Session } from '../../features/sessions/model'
 import { isBusy } from '../../integrations/agent/conversationProjection'
 import { Glass } from '../glass/Glass'
 import { IconButton } from '../ui/IconButton'
+import { managementLabels } from '../settings/ManagementSections'
+import type { ManagementSection } from '../settings/ManagementSections'
 
 export type SessionAction = { type: 'rename' | 'delete'; session: Session }
 
-export function Sidebar({ onCreate, onSettings, onSessionAction }: {
+const destinations = [
+  ['models', KeyRound], ['permissions', ShieldCheck], ['tasks', Workflow], ['tools', Wrench], ['memory', Brain], ['diagnostics', Activity],
+] as const
+
+export function Sidebar({ onCreate, onSettings, onSessionAction, page, onNavigate }: {
   onCreate: () => void
   onSettings: () => void
   onSessionAction: (action: SessionAction) => void
+  page?: ManagementSection
+  onNavigate(section?: ManagementSection): void
 }) {
   const sessions = useWorkspace((state) => state.sessions)
   const activeId = useWorkspace((state) => state.activeId)
@@ -51,13 +59,20 @@ export function Sidebar({ onCreate, onSettings, onSessionAction }: {
           <button className="new-session" onClick={onCreate} disabled={!ready}>
             <Plus size={17} /><span>新建会话</span><kbd>Ctrl N</kbd>
           </button>
-          <div className="sidebar-label"><span>会话历史</span><span className="mono">{String(sessions.length).padStart(2, '0')}</span></div>
         </div>
+        <nav className="workspace-nav" aria-label="工作台">
+          {destinations.map(([section, Icon]) => (
+            <button key={section} type="button" aria-current={page === section ? 'page' : undefined} onClick={() => onNavigate(section)}>
+              <Icon size={15} /><span>{managementLabels[section]}</span>
+            </button>
+          ))}
+        </nav>
+        <div className="sidebar-label session-label">会话历史</div>
         <nav className="session-list" aria-label="会话历史">
           {sessions.length === 0 && <p className="list-empty">暂无会话</p>}
           {sessions.map((session) => (
-            <div className={`session-row ${session.id === activeId ? 'is-selected' : ''}`} key={session.id}>
-              <button className="session-select" onClick={() => select(session.id)} aria-current={session.id === activeId ? 'page' : undefined} title={session.title}>
+            <div className={`session-row ${!page && session.id === activeId ? 'is-selected' : ''}`} key={session.id}>
+              <button className="session-select" onClick={() => { select(session.id); onNavigate() }} aria-current={!page && session.id === activeId ? 'page' : undefined} title={session.title}>
                 <MessageSquare size={14} />
                 <span>{session.title}</span>
                 {isBusy(session.turns.at(-1)?.status ?? session.latestStatus) && <i className="live-dot" aria-label="运行中" />}
@@ -71,7 +86,7 @@ export function Sidebar({ onCreate, onSettings, onSessionAction }: {
         <div className="sidebar-footer">
           <button className="settings-entry" onClick={onSettings}>
             <span className="settings-tile"><Settings2 size={16} /></span>
-            <span><strong>设置</strong><small>账号与工作区</small></span>
+            <span><strong>设置</strong></span>
           </button>
           <IconButton className="mobile-sidebar-close" label="关闭会话导航" onClick={toggle}><PanelLeft size={16} /></IconButton>
         </div>

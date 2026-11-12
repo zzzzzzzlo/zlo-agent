@@ -124,6 +124,33 @@ export class LocalStore {
     `).all(path, namespace, limit).flatMap(row => typeof row.field === 'string' ? [row.field] : []);
   }
 
+  conversationActivity(namespace: string) {
+    const model = this.#db.prepare(`
+      WITH activity AS (
+        SELECT json_extract(e.event, '$.type') AS type, json_extract(e.event, '$.payload') AS payload
+        FROM records r JOIN events e ON e.task_id = json_extract(r.value, '$.taskId')
+        WHERE r.namespace = ? AND json_extract(e.event, '$.type') IN ('model.request_started', 'model.usage')
+      )
+      SELECT count(*) FILTER (WHERE type = 'model.request_started') AS requests,
+        count(*) FILTER (WHERE type = 'model.usage') AS reports,
+        count(json_extract(payload, '$.estimatedCostUsd')) FILTER (WHERE type = 'model.usage') AS priced,
+        sum(json_extract(payload, '$.estimatedCostUsd')) FILTER (WHERE type = 'model.usage') AS cost,
+        sum(json_extract(payload, '$.input')) FILTER (WHERE type = 'model.usage') AS input,
+        sum(json_extract(payload, '$.output')) FILTER (WHERE type = 'model.usage') AS output,
+        sum(json_extract(payload, '$.cacheRead')) FILTER (WHERE type = 'model.usage') AS cacheRead,
+        sum(json_extract(payload, '$.cacheWrite')) FILTER (WHERE type = 'model.usage') AS cacheWrite
+      FROM activity
+    `).get(namespace)!;
+    const tools = this.#db.prepare(`
+      SELECT json_extract(tool.value, '$.name') AS name, json_extract(tool.value, '$.status') AS status, count(*) AS count
+      FROM records r, json_each(r.value, '$.tools') tool
+      WHERE r.namespace = ? GROUP BY name, status ORDER BY name, status
+    `).all(namespace).map(row => ({ name: row.name as string, status: row.status as string, count: Number(row.count) }));
+    return { modelRequests: Number(model.requests), usageReports: Number(model.reports), pricedReports: Number(model.priced),
+      estimatedCostUsd: typeof model.cost === 'number' ? model.cost : null,
+      usage: { input: Number(model.input ?? 0), output: Number(model.output ?? 0), cacheRead: Number(model.cacheRead ?? 0), cacheWrite: Number(model.cacheWrite ?? 0) }, tools };
+  }
+
   matchingRecords<T>(namespace: string, path: string, value: string): T[] {
     return this.#db.prepare(`
       SELECT value FROM records WHERE namespace = ? AND json_extract(value, ?) = ? ORDER BY id

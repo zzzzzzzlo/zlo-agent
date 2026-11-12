@@ -299,6 +299,12 @@ export class ConversationService {
     return this.#store.recentField(turnNamespace(this.#record(id).id), '$.taskId', limit)
   }
 
+  activity(id: string) {
+    const conversation = this.#record(id)
+    return { conversationId: conversation.id, turns: conversation.turnCount,
+      latestTaskId: conversation.latestTaskId, ...this.#store.conversationActivity(turnNamespace(conversation.id)) }
+  }
+
   history({ conversationId, before }: HistoryInput): ConversationHistory {
     if (before !== undefined && (!Number.isSafeInteger(before) || before < 1)) {
       throw new ConversationError('INVALID_INPUT', 'Invalid history cursor')

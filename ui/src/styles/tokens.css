@@ -40,7 +40,7 @@
   --font-display: "Segoe UI Variable Display", "Microsoft YaHei UI", "Segoe UI", sans-serif;
   --font-mono: "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
   --sidebar-width: 230px;
-  --activity-width: 278px;
+  --activity-width: 326px;
   --title-height: 55px;
   --chat-width: 770px;
   --chat-gutter: clamp(20px, 5%, 56px);

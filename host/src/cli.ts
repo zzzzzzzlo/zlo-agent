@@ -88,7 +88,7 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode, desktop: boo
     'setConversationModel', 'subscribeConversation', 'unsubscribeConversation',
   ])
   const managementTypes = new Set([
-    'managementSnapshot', 'saveAgentPreferences', 'setWorkspaceAccess', 'deleteConversationMemory', 'reconcileOperation',
+    'managementSnapshot', 'conversationObservatory', 'saveAgentPreferences', 'setWorkspaceAccess', 'deleteConversationMemory', 'reconcileOperation',
     'testProviderAccount', 'validateProviderKey', 'applyProviderKey', 'applyChatGptSession', 'initializeProviderKeys',
   ])
   const stopOutput = host.subscribeOutput((event) => {

@@ -102,6 +102,10 @@ export function registerManagementIpc(options: {
     noInput(value)
     return diagnostics()
   })
+  register('conversationObservatory', async (_window, value) => {
+    const { conversationId } = object(value, ['conversationId'])
+    return host.request({ schemaVersion: 1, type: 'conversationObservatory', conversationId: entityId(conversationId) })
+  })
 
   register('savePreferences', (window, value) => mutate(async () => {
     const next = preferences(value)

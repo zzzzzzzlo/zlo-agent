@@ -8,6 +8,7 @@ module.exports = async ({ appOutDir, electronPlatformName }) => {
   await access(join(host, 'src', 'cli.ts'))
   await access(join(appOutDir, 'resources', 'shared', 'contracts', 'desktop.ts'))
   await access(join(appOutDir, 'resources', 'shared', 'diagnostics.ts'))
+  await access(join(appOutDir, 'resources', 'shared', 'loopback-http.ts'))
   for (const dependency of Object.keys(dependencies)) {
     await access(join(host, 'node_modules', dependency, 'package.json'))
   }

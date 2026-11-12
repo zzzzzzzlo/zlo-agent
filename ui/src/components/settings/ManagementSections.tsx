@@ -62,7 +62,7 @@ export function ManagementSections({ section }: { section: ManagementSection }) 
   return (
     <section className="settings-content management-content" aria-labelledby="management-title">
       <div className="management-heading">
-        <h3 id="management-title">{managementLabels[section]}</h3>
+        <h1 id="management-title" tabIndex={-1}>{managementLabels[section]}</h1>
         {api && ready && <button className="button-neutral" type="button" disabled={busy} onClick={() => void refresh()}>刷新</button>}
       </div>
       {scoped && conversations.length > 0 && (

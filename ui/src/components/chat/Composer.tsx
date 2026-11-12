@@ -1,11 +1,9 @@
-import { ArrowUp, CircleHelp, Paperclip, Play, RotateCw, Square } from 'lucide-react'
+import { ArrowUp, CircleHelp, Play, RotateCw, Square } from 'lucide-react'
 import { useWorkspace, activeDraft, activeSession } from '../../stores/workspace'
 import { isBusy } from '../../integrations/agent/conversationProjection'
 import { IconButton } from '../ui/IconButton'
 import { Glass } from '../glass/Glass'
-import { workspaceAccessLabels } from '../../features/sessions/model'
-
-export function Composer({ notify, onReconcile }: { notify: (text: string) => void; onReconcile: () => void }) {
+export function Composer({ onReconcile }: { onReconcile: () => void }) {
   const session = useWorkspace(activeSession)
   const value = useWorkspace(activeDraft)
   const status = session?.turns.at(-1)?.status ?? session?.latestStatus
@@ -26,7 +24,6 @@ export function Composer({ notify, onReconcile }: { notify: (text: string) => vo
   const label = host.state === 'starting' ? 'Host 启动中' : host.state === 'offline' ? 'Host 已断开'
     : mock ? 'Mock 演示' : host.mode === 'faux' ? 'Pi · Faux' : 'Pi Host 已连接'
   const alert = error ?? (host.state === 'offline' ? host.message : undefined)
-  const access = session?.workspaceAccess ?? 'read'
 
   return (
     <footer className="composer-dock">
@@ -49,8 +46,6 @@ export function Composer({ notify, onReconcile }: { notify: (text: string) => vo
             }}
           />
           <div className="composer-tools">
-            <IconButton label="添加附件" className="attach-button" onClick={() => notify('附件暂未接入。你可以粘贴文字到输入框。')}><Paperclip size={17} /></IconButton>
-            <span className="composer-divider" />
             <span className="composer-mode" role="status" data-host-state={host.state}>
               {host.state === 'ready' && <i className="live-dot" />}{label}
             </span>
@@ -63,7 +58,7 @@ export function Composer({ notify, onReconcile }: { notify: (text: string) => vo
         </Glass>
         <div className="composer-footnote">
           <CircleHelp size={12} />
-          <span>{mock ? '本地界面演示' : '本地 Host' + (session ? ' · ' + workspaceAccessLabels[access] : '') +
+          <span>{mock ? '本地界面演示' : '本地 Host' +
             (session?.check ? (session.check.command ? ' · 命令验收' : ' · 文件验收') : '')}</span>
           {status === 'reconciliation' && globalThis.window?.agentManagement && (
             <button type="button" className="composer-reconcile" onClick={onReconcile}>核对异常操作</button>

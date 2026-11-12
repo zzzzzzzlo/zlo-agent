@@ -1,27 +1,12 @@
 import { useEffect, useState } from 'react'
-import { Box, Minus, PanelLeft, PanelRight, Square, X } from 'lucide-react'
+import { Minus, PanelLeft, Square, X } from 'lucide-react'
 import { useWorkspace, activeSession } from '../../stores/workspace'
 import { IconButton } from '../ui/IconButton'
 import { BrandMark } from '../ui/BrandMark'
-import { Glass } from '../glass/Glass'
-import { ConversationModelDialog, routeLabel } from './ConversationModelDialog'
-
-export function TitleBar({ activity, onActivity, notify }: {
-  activity: boolean
-  onActivity: () => void
-  notify: (text: string) => void
-}) {
+export function TitleBar({ destination }: { destination?: string }) {
   const sidebar = useWorkspace((state) => state.sidebar)
   const toggle = useWorkspace((state) => state.toggleSidebar)
   const session = useWorkspace(activeSession)
-  const ready = useWorkspace((state) => state.host.state === 'ready')
-  const busy = useWorkspace((state) => state.pending)
-  const mock = useWorkspace((state) => state.mock)
-  const [modelDialogId, setModelDialogId] = useState<string>()
-  const modelLabel = mock ? 'Mock 模型' : routeLabel(session?.route)
-  const pendingLabel = session?.pendingRoute ? '待应用 · ' + routeLabel(session.pendingRoute) : undefined
-  const modelStatus = session?.turns.at(-1)?.status ?? session?.latestStatus
-  const canChangeModel = Boolean(session?.loaded && ready && !busy && modelStatus !== 'stopping' && modelStatus !== 'reconciliation')
   return (
     <header className="titlebar">
       <div className={`title-brand ${sidebar ? '' : 'is-collapsed'}`}>
@@ -29,22 +14,9 @@ export function TitleBar({ activity, onActivity, notify }: {
         <IconButton label={sidebar ? '收起侧栏' : '展开侧栏'} aria-expanded={sidebar} onClick={toggle}><PanelLeft size={17} /></IconButton>
       </div>
       <div className="title-main">
-        <div className="title-location"><span>工作区</span><span aria-hidden="true">/</span><strong>{session?.title ?? '新会话'}</strong></div>
-        <div className="title-actions">
-          <Glass variant="control" className="model-shell">
-            <button className="model-button" aria-label="会话模型设置" aria-haspopup={mock ? undefined : 'dialog'}
-              title={pendingLabel ? modelLabel + ' / ' + pendingLabel : modelLabel}
-              disabled={!mock && !canChangeModel}
-              onClick={() => { if (mock) notify('界面演示使用固定模型。'); else setModelDialogId(session?.id) }}>
-              <Box size={13} /><span data-model-current>{modelLabel}</span>
-              {pendingLabel && <span className="status-stopping" data-model-pending>{pendingLabel}</span>}
-            </button>
-          </Glass>
-          <IconButton label={activity ? '收起活动面板' : '展开活动面板'} aria-expanded={activity} className={activity ? 'is-on' : ''} onClick={onActivity}><PanelRight size={17} /></IconButton>
-        </div>
+        <div className="title-location"><span>工作区</span><span aria-hidden="true">/</span><strong>{destination ?? session?.title ?? '新会话'}</strong></div>
       </div>
       <WindowControls />
-      {session && modelDialogId === session.id && <ConversationModelDialog key={session.id} session={session} onClose={() => setModelDialogId(undefined)} />}
     </header>
   )
 }

@@ -19,6 +19,8 @@ const credentialLabels: Record<ManagedProvider['credential'], string> = {
 
 export type PerformManagement = (operation: () => Promise<unknown>, success?: string) => void
 
+const sections = [['api', 'API 接入'], ['account', 'ChatGPT 账号'], ['policy', '默认模型']] as const
+
 export function ModelManagement({ snapshot, api, busy, perform, save }: {
   snapshot: ManagementSnapshot
   api: DesktopManagementApi
@@ -27,16 +29,20 @@ export function ModelManagement({ snapshot, api, busy, perform, save }: {
   save(patch: Partial<AgentPreferences>): void
 }) {
   const account = useChatGptAccount(true)
+  const [section, setSection] = useState<typeof sections[number][0]>('api')
   return (
     <div className="management-stack">
-      <section className="management-group">
-        <h4>API Provider</h4>
-        {snapshot.providers.map((provider) => (
+      <nav className="model-sections" aria-label="模型与账号分类">
+        {sections.map(([id, label]) => <button type="button" key={id} aria-current={section === id ? 'page' : undefined}
+          onClick={() => setSection(id)}>{label}</button>)}
+      </nav>
+      {section === 'api' && <section className="management-group provider-page">
+        <h4>API 供应商</h4>
+        {snapshot.providers.length ? <div className="provider-grid">{snapshot.providers.map((provider) => (
           <ProviderControls key={provider.id} provider={provider} api={api} busy={busy} perform={perform} />
-        ))}
-        {!snapshot.providers.length && <p className="management-note">当前 Host 未提供可配置的 Provider。</p>}
-      </section>
-      <section className="management-group">
+        ))}</div> : <p className="management-note">当前 Host 未提供可配置的供应商。</p>}
+      </section>}
+      {section === 'policy' && <section className="management-group">
         <h4>模型策略</h4>
         <ModelCatalogSelect label="默认模型" providers={modelGroups(snapshot.providers, account.status)} value={snapshot.preferences.defaultRoute}
           empty="使用 Host 默认模型" disabled={busy} onChange={(defaultRoute) =>
@@ -51,8 +57,8 @@ export function ModelManagement({ snapshot, api, busy, perform, save }: {
           </select>
         </label>
         {!snapshot.preferences.defaultRoute && <p className="management-note">选择默认模型后即可使用固定策略。</p>}
-      </section>
-      <ChatGptManagement account={account} unavailable={snapshot.account.reason} busy={busy} perform={perform} />
+      </section>}
+      {section === 'account' && <ChatGptManagement account={account} unavailable={snapshot.account.reason} busy={busy} perform={perform} />}
     </div>
   )
 }

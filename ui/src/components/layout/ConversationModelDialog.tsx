@@ -11,7 +11,7 @@ export function routeLabel(route?: ModelRoute): string {
   return routeDisplayLabel(route)
 }
 
-export function ConversationModelDialog({ session, onClose }: { session: Session; onClose: () => void }) {
+export function ConversationModelDialog({ session, onClose, onManageModels }: { session: Session; onClose: () => void; onManageModels(): void }) {
   const change = useWorkspace((state) => state.setConversationModel)
   const ready = useWorkspace((state) => state.host.state === 'ready')
   const busy = useWorkspace((state) => state.pending)
@@ -64,6 +64,7 @@ export function ConversationModelDialog({ session, onClose }: { session: Session
           </>
         )}
         <p className="settings-hint">已有会话在同一 Provider 内切换。Host 会在安全边界应用切换。</p>
+        {pi && <button type="button" className="page-back" onClick={onManageModels}>管理 API 与账号</button>}
         {!pi && !valid && (provider.trim() || model.trim()) && <p className="dialog-error" role="alert">请填写有效的 Provider 和模型 ID。</p>}
         {catalog.error && <p className="dialog-error" role="alert">{catalog.error}</p>}
         {!ready && <p className="dialog-error" role="alert">Host 未连接。</p>}

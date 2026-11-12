@@ -21,6 +21,7 @@ export const agentChannels = {
 
 export const managementChannels = {
   snapshot: 'agent-management:snapshot',
+  conversationObservatory: 'agent-management:conversation-observatory',
   recentDiagnostics: 'agent-management:recent-diagnostics',
   savePreferences: 'agent-management:save-preferences',
   setWorkspaceAccess: 'agent-management:set-workspace-access',

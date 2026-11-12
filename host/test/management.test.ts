@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import type { ManagedOperation } from '../../shared/contracts/management.ts'
+import type { ConversationObservatory, ManagedOperation } from '../../shared/contracts/management.ts'
 import { FakeExecution } from '../src/fake.ts'
 import type { AgentExecution, ExecutionConfig } from '../src/execution.ts'
 import { LocalAgentHost } from '../src/host.ts'
@@ -49,6 +49,61 @@ test('workspace revocation quiesces the current run and persists across Host res
     const next = restarted.createConversation({ requestId: 'next', workspace })
     assert.equal(next.workspaceAccess, 'read')
   } finally { await restarted.close() }
+})
+
+test('conversation observatory aggregates beyond a history page, preserves pricing coverage and isolates conversations', async (t) => {
+  const { directory, workspace } = await fixture(t)
+  const fake = new FakeExecution()
+  const execution: AgentExecution = {
+    validateRoute: route => fake.validateRoute(route),
+    async open(config) {
+      const session = await fake.open(config)
+      return { ...session, async run(prompt) {
+        config.onEvent({ type: 'model.request_started' })
+        await config.tools.find(tool => tool.name === 'list_directory')!.execute(randomUUID(), { path: '.' })
+        config.onEvent({ type: 'model.usage', input: 12, output: 8, cacheRead: 4, cacheWrite: 2,
+          ...(prompt.includes('priced-turn') ? { estimatedCostUsd: 0.125 } : {}) })
+        return { status: 'completed', text: 'Workspace inspected' }
+      } }
+    },
+  }
+  const options = { directory, execution }
+  const host = new LocalAgentHost(options)
+  const first = host.createConversation({ requestId: 'first', workspace }).id
+  const second = host.createConversation({ requestId: 'second', workspace }).id
+  const inspect = (instance: LocalAgentHost, conversationId: string) => instance.managementCommand({
+    schemaVersion: 1, type: 'conversationObservatory', conversationId,
+  }) as Promise<ConversationObservatory>
+  let expected: ConversationObservatory
+  try {
+    let latestTaskId: string | undefined
+    for (let index = 0; index < 52; index++) {
+      const { taskId } = await host.sendMessage({ conversationId: first, requestId: 'turn-' + index,
+        text: index === 0 ? 'List files priced-turn' : 'List workspace files' })
+      await host.idle()
+      latestTaskId = taskId
+    }
+    await host.sendMessage({ conversationId: second, requestId: 'other-turn', text: 'List files separately' })
+    await host.idle()
+    assert.equal(host.getConversationHistory({ conversationId: first }).turns.length, 50)
+    expected = await inspect(host, first)
+    assert.equal(expected.turns, 52)
+    assert.deepEqual(expected.usage, { input: 624, output: 416, cacheRead: 208, cacheWrite: 104 })
+    assert.equal(expected.modelRequests, 52)
+    assert.equal(expected.usageReports, 52)
+    assert.equal(expected.pricedReports, 1)
+    assert.equal(expected.estimatedCostUsd, 0.125)
+    assert.deepEqual(expected.tools, [{ name: 'list_directory', status: 'succeeded', count: 52 }])
+    assert.equal(expected.latestTask?.id, latestTaskId)
+    const other = await inspect(host, second)
+    assert.equal(other.turns, 1)
+    assert.equal(other.modelRequests, 1)
+    assert.equal(other.estimatedCostUsd, null)
+    await assert.rejects(inspect(host, randomUUID()), /does not exist/)
+  } finally { await host.close() }
+  const restarted = new LocalAgentHost(options)
+  try { assert.deepEqual(await inspect(restarted, first), expected) }
+  finally { await restarted.close() }
 })
 
 test('the tool gateway revokes an already exposed capability before its next invocation', { timeout: 15000 }, async (t) => {

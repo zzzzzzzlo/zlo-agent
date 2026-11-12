@@ -53,6 +53,7 @@ contextBridge.exposeInMainWorld('agentHost', agentHost)
 
 const agentManagement: DesktopManagementApi = {
   snapshot: input => ipcRenderer.invoke(managementChannels.snapshot, input),
+  conversationObservatory: input => ipcRenderer.invoke(managementChannels.conversationObservatory, input),
   recentDiagnostics: () => ipcRenderer.invoke(managementChannels.recentDiagnostics, undefined),
   savePreferences: input => ipcRenderer.invoke(managementChannels.savePreferences, input),
   setWorkspaceAccess: input => ipcRenderer.invoke(managementChannels.setWorkspaceAccess, input),

@@ -695,6 +695,11 @@ export class LocalAgentHost {
     this.#assertOpen()
     switch (command.type) {
       case 'managementSnapshot': return this.managementSnapshot(command.conversationId)
+      case 'conversationObservatory': {
+        const { latestTaskId, ...activity } = this.#conversations.activity(management.id(command.conversationId))
+        return { ...activity, latestTask: latestTaskId ? { id: latestTaskId, tokenLimit: this.#scheduler.tokenLimit,
+          ...this.#scheduler.budget(latestTaskId) } : undefined }
+      }
       case 'saveAgentPreferences': return this.saveAgentPreferences(command.preferences)
       case 'setWorkspaceAccess': return this.setConversationWorkspaceAccess(command.conversationId, command.access, command.expected)
       case 'deleteConversationMemory': return this.#removeMemory(command.conversationId, command.ids)
