@@ -1,7 +1,6 @@
 import { useLayoutEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { X } from 'lucide-react'
-import { Glass } from '../glass/Glass'
 import { IconButton } from './IconButton'
 
 export function Modal({ title, subtitle, onClose, children, className = '' }: {
@@ -22,7 +21,7 @@ export function Modal({ title, subtitle, onClose, children, className = '' }: {
       onCancel={(event) => { event.preventDefault(); onClose() }}
       onClick={(event) => { if (event.target === event.currentTarget) onClose() }}
     >
-      <Glass variant="popover" elevated className="modal-glass">
+      <div className="modal-panel">
         <header className="modal-header">
           <div>
             <h2 id="modal-title">{title}</h2>
@@ -31,7 +30,7 @@ export function Modal({ title, subtitle, onClose, children, className = '' }: {
           <IconButton label="关闭弹窗" onClick={onClose}><X size={17} /></IconButton>
         </header>
         {children}
-      </Glass>
+      </div>
     </dialog>
   )
 }

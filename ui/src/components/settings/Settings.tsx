@@ -1,7 +1,6 @@
 import { Check, CircleHelp, Moon, Palette, Sun } from 'lucide-react'
 import { useState } from 'react'
 import { version } from '../../../package.json'
-import type { GlassStrength } from '../../features/appearance/preferences'
 import { useWorkspace } from '../../stores/workspace'
 import { Modal } from '../ui/Modal'
 
@@ -9,12 +8,6 @@ const themes = [
   { id: 'dark', label: '深色', icon: Moon },
   { id: 'light', label: '浅色', icon: Sun },
 ] as const
-
-const strengths: { id: GlassStrength; label: string; description: string }[] = [
-  { id: 'soft', label: '柔和', description: '桌面更淡，磨砂边缘' },
-  { id: 'balanced', label: '均衡', description: '适度透出桌面' },
-  { id: 'vivid', label: '通透', description: '桌面更清晰，折射更强' },
-]
 
 type SettingsSection = 'appearance' | 'about'
 
@@ -26,9 +19,7 @@ const sections = [
 export function Settings({ onClose }: { onClose: () => void }) {
   const [section, setSection] = useState<SettingsSection>('appearance')
   const theme = useWorkspace((state) => state.theme)
-  const strength = useWorkspace((state) => state.strength)
   const setTheme = useWorkspace((state) => state.setTheme)
-  const setStrength = useWorkspace((state) => state.setStrength)
   const mock = useWorkspace((state) => state.mock)
 
   return (
@@ -56,18 +47,7 @@ export function Settings({ onClose }: { onClose: () => void }) {
                 ))}
               </div>
             </fieldset>
-            <fieldset>
-              <legend>玻璃强度</legend>
-              <div className="strength-options">
-                {strengths.map(({ id, label, description }) => (
-                  <label key={id} className="strength-option">
-                    <input type="radio" name="strength" checked={strength === id} onChange={() => setStrength(id)} />
-                    <strong>{label}</strong><small>{description}</small>
-                  </label>
-                ))}
-              </div>
-              <p className="settings-hint">设备不支持折射时，自动使用磨砂效果。</p>
-            </fieldset>
+            <p className="settings-hint">界面使用统一的温暖中性色与细边框，不随设备图形能力改变材质。</p>
           </section>
         ) : (
           <section className="settings-content settings-about">

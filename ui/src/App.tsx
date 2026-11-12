@@ -3,6 +3,7 @@ import { LiquiThemeProvider } from '@liqui-design/glass'
 import { optics } from './features/appearance/preferences'
 import { activeSession, useWorkspace } from './stores/workspace'
 import { TitleBar } from './components/layout/TitleBar'
+import { WorkspaceStatusBar } from './components/layout/WorkspaceStatusBar'
 import { ConversationToolbar } from './components/layout/ConversationToolbar'
 import { ManagementPage } from './components/layout/ManagementPage'
 import { ActivityPanel } from './components/layout/ActivityPanel'
@@ -69,11 +70,12 @@ export function App() {
           <main className="chat-surface" aria-label="对话" hidden={Boolean(page)}>
             <ConversationToolbar expanded={activity} onObservatory={() => setActivity(visible => !visible)} onManageModels={() => navigate('models')} />
             <ChatSurface />
-            <Composer onReconcile={() => navigate('diagnostics')} />
+            <Composer />
           </main>
           {page && <ManagementPage section={page} onBack={() => setPage(undefined)} />}
           {!page && activity && session && <ActivityPanel key={session.id} session={session} onClose={() => setActivity(false)} onManage={navigate} />}
         </div>
+        <WorkspaceStatusBar onReconcile={() => navigate('diagnostics')} />
         {settings && <Settings onClose={() => setSettings(false)} />}
         {sessionAction && <SessionDialog action={sessionAction} onClose={() => setSessionAction(undefined)} />}
         {newConversation && <NewConversationDialog onClose={() => setNewConversation(false)} />}
