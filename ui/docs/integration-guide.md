@@ -1,5 +1,7 @@
 # Electron 与 Agent Host
 
+重构 Renderer 时可先阅读 [后端功能与接口](../../docs/29-frontend-backend-handoff.md)，其中列出当前桌面 API、可用页面数据与验收边界。
+
 Electron 主进程使用自身附带的 Node 启动独立 Host，通过 stdin/stdout 的版本化 JSONL 通信。应用启动会等待 `ready`。Host 退出或握手超时后 UI 显示离线，可从 UI 重新启动。窗口关闭时发送 `exit`，等待 Host 停止、刷盘并释放写锁。
 
 Preload 通过 `window.agentHost` 暴露固定的 `DesktopHostApi`。Main 校验主框架来源、参数及工作区选择，Renderer 保持 sandbox、contextIsolation 和关闭 Node 集成。文件路径只由系统选择器授权。Host 继续校验路径边界、链接和文件类型。
