@@ -1,10 +1,10 @@
 # 本地视觉开发闭环
 
-在有 Workspace 写入权限的会话中，提交 HTML 页面或 SVG 动画开发任务。普通静态页面进入快速模式，动画默认进入高质量模式。任务说明可以显式指定「快速模式」「高质量模式」或「不要预览」。模型视觉能力来自当前 Pi 模型目录。DeepSeek V4.1 Flash 对应 `deepseek/deepseek-flash`，支持原生图片输入。[DeepSeek Vision](https://api-docs.deepseek.com/guides/vision/)
+在有 Workspace 写入权限的会话中提交 HTML 页面或 SVG 动画任务。模型根据任务、授权和工具说明选择渲染、截图和复验。模型视觉能力来自 Pi 模型目录。DeepSeek V4.1 Flash 对应 `deepseek/deepseek-flash`，支持原生图片输入。[DeepSeek Vision](https://api-docs.deepseek.com/guides/vision/)
 
 ## 本地预览
 
-`preview_page` 是独立的 Root 只读工具，可在授权工作区内调用。下面的调用在三个时间点渲染同一个入口。
+`preview_page` 可在授权工作区内只读渲染页面。`browser_open` 使用同一套本地资源校验，提供可继续检查的浏览器会话。`browser_screenshot` 和 `view_image` 能把图片传给视觉模型。下面的预览在三个时间点渲染同一个入口。
 
 ```json
 {
@@ -20,16 +20,11 @@
 - 入口支持 HTML，样式、脚本、字体和图片可以内嵌或从列表加载。工作区按现有规则校验每个文件，最多显式指定 16 个资源，总体上限 2 MiB。预览视口为 240×160 至 1280×900，时间点为 0 至 4000 ms。单次浏览器预览限时 12 秒。
 - 使用 Playwright 虚拟时钟推进 JavaScript 定时器及动画帧。CSS、Web Animations 和内嵌 SVG 动画按采样位置定位。异步创建且依赖真实时钟的复杂 CSS 时间线及外部 SVG 图像内的时间线只能近似采样。每帧记录布局溢出指标，浏览器异常只回传类别和计数，控制台正文留在预览边界内。[Playwright Clock](https://playwright.dev/docs/clock)
 
-## 图像、轮次和预算
+## 图像与预算
 
-| 模式 | 预览调用上限 | 单次帧数 | 反馈阶段墙钟和 Token 预算 |
-| --- | ---: | ---: | --- |
-| 快速 | 2，包含初稿 | 1 | 每次运行 75 秒，任务累计 64,000 Token |
-| 高质量 | 3，包含初稿 | 3 | 每次运行 150 秒，任务累计 192,000 Token |
+Pi 的工具适配器为有视觉能力的模型构造 `image` 内容块。JPEG 每帧最多 160 KiB，每次模型请求最多三帧，预留每帧 2048 Token。图片只进入下一次请求，历史会话保存工具状态与诊断。文字模型收到 `unavailable_on_selected_model` 和结构诊断。图像和文字一起使用任务和委派预算，未确认用量仍占用原预留。[Pi Agent SDK](https://github.com/earendil-works/pi/blob/main/packages/agent/README.md)
 
-Pi 的工具适配器为有视觉能力的模型构造 `image` 内容块。JPEG 每帧最多 160 KiB，每次模型请求最多三帧，预留每帧 2048 Token。图片只进入下一次请求，历史会话仅保存工具状态与诊断。文字模型收到 `unavailable_on_selected_model` 和结构诊断。视觉任务文本预留使用已报告的输入用量和本地估算，已核销的请求按供应商实际用量计入反馈预算，未确认用量仍占用原预留。[Pi Agent SDK](https://github.com/earendil-works/pi/blob/main/packages/agent/README.md)
-
-视觉工作流要求先渲染再检查主体、比例、配色、遮挡、溢出和动作连续性，发现问题做定向编辑后复验。静态页与简单动作使用适当的简单技术，涉及自然踏板动作时可使用联动关键帧或关节连杆。高质量任务若已经改动可识别的 HTML 产物但忘记渲染，视觉模型可收到一次有界的预览提示。无可见缺陷时可以在首次预览后结束。最后一次成功预览用于验收，缩小模型输出预留并结束该任务的视觉文件编辑轮次。
+视觉工作可按渲染、检查、定向编辑和复验推进。可检查主体、比例、配色、遮挡、溢出和动作连续性。模型可在满足目标时提前结束，也可在预算内继续验证。运行模式和资源上限见 [Harness 与能力委派](27-harness-alignment.md)。
 
 ## 运行证据
 

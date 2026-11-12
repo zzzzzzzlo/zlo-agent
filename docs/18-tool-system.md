@@ -10,15 +10,16 @@
 
 | 能力 | 工具 | 授权和限制 |
 | --- | --- | --- |
-| Shell 与进程 | `shell_exec`、`process_status`、`process_output`、`process_stop` | Root、受信任工作区、逐次确认完整命令。Windows 支持 PowerShell 和 CMD。一次执行一个长命令，最长 10 分钟。由本次 Agent Run 持有不透明句柄。 |
+| Shell 与进程 | `shell_exec`、`process_status`、`process_output`、`process_stop` | 受信任的完整工作区。子节点需明确获准使用对应工具。逐次确认完整命令。Windows 支持 PowerShell 和 CMD。由本次 Agent Run 持有句柄。 |
 | 文件搜索 | `search_files`、`search_content` | 使用当前可读范围，支持 Glob 和正则搜索，限制遍历、字节、匹配结果及正则运行时间。 |
 | 文件修改 | `apply_patch`、`move_file`、`rename_file`、`delete_file` | 当前写入范围覆盖所有源和目标。Patch 预检精确内容，单文件通过临时文件提交。部分完成需要核对。移动拒绝覆盖，删除仅允许单个文件且逐次确认。 |
-| Git | `git_branch`、`git_commit`、`git_worktree`、`git_merge` | Root、受信任工作区、逐次确认。本地分支、显式文件提交、归属当前 Task 的独立 Worktree、干净主工作区合并。 |
-| Web | `web_search`、`web_fetch` | Root 对外发送搜索词或 URL 前确认。可替换搜索 Provider。HTTPS 严格验证地址和重定向，每次请求绑定已验证的公共 IP。 |
-| 浏览器 | `browser_open`、`browser_snapshot`、`browser_click`、`browser_type`、`browser_scroll`、`browser_screenshot`、`browser_wait`、`browser_close` | 受信任 Root。打开网页与点击、输入分开确认。独立 Playwright Context，仅使用受控公共 HTTPS GET。截图限于工作区，关闭或任务结束时释放会话。 |
-| 导出 | `export_artifact` | Root 且可写。原生系统保存对话框授权一个新文件，限制为本地路径和 32 MiB，拒绝覆盖及 Host 私有目录。 |
+| Git | `git_branch`、`git_commit`、`git_worktree`、`git_merge` | 受信任的完整工作区，逐次确认。子节点的 Git 操作限于自身分配的工作区。Task 级 Worktree 分配和集成由 Host 管理。 |
+| Web | `web_search`、`web_fetch` | 子节点需获得明确工具授权。对外发送搜索词或 URL 前确认。HTTPS 验证地址和重定向，请求绑定已验证的公共 IP。 |
+| 浏览器 | `browser_open`、`browser_snapshot`、`browser_click`、`browser_type`、`browser_scroll`、`browser_screenshot`、`browser_wait`、`browser_close` | 使用 AgentRun 专属上下文。只读权限可打开已授权的本地页面并截图。公共网页要求 Trusted 和网络确认。点击和输入另行确认。保存截图需要路径写入权限。 |
+| 本地视觉 | `preview_page`、`view_image` | 在授权范围内离线渲染本地 HTML 或读取图片，向视觉模型返回受限图像。 |
+| 导出 | `export_artifact` | 需要写入及相应工具授权。原生保存对话框授权一个新文件，限制本地路径和 32 MiB，拒绝覆盖及 Host 私有目录。 |
 
-子节点只有父节点和本身路径范围的交集，根工具权限无法通过委派继承。带多个文件参数的工具会校验所有路径。Worktree ID 由 Host 签发并核对 Git 注册，只有不同 Worktree 的写节点可同时执行。根节点确认各分支提交后再合并。共享工作区的写入仍然串行。
+子节点的有效能力是用户授权、父节点权限和本次委派的交集。带多个文件参数的工具会校验所有路径。Worktree ID 由 Host 签发并核对 Git 注册，只有不同 Worktree 的写节点可同时执行。根节点确认各分支提交后再合并。共享工作区的写入仍然串行。详见 [Harness 与能力委派](27-harness-alignment.md)。
 
 ## 回执与停止
 
@@ -55,7 +56,7 @@ Host 冷启动握手限时 45 秒，以容纳 Windows 初次加载 SDK 与工具
 | `git_branch / git_worktree / git_merge` | `branch` |
 | `git_commit` | `paths`、单行 `message`、可选当前 Task 的 `worktreeId` |
 | `web_search / web_fetch` | 分别为 `query, limit?` 与 `url` |
-| `browser_open` | 公共 HTTPS `url`，返回 `browserId` |
+| `browser_open` | 本地 `path` 和可选 `assets`、`width`、`height`，或公共 HTTPS `url`。返回 `browserId` |
 | 其余浏览器工具 | `browserId`，另按工具接受 `selector`、`text`、`pixels`、`path` 或 `timeoutMs` |
 | `export_artifact` | 工作区相对 `path`。目的地通过原生保存授权单独绑定 |
 

@@ -10,7 +10,7 @@
 
 - 在左侧打开「模型与账号」，从「API 接入」选择 DeepSeek、OpenAI、Anthropic 或 Google Gemini。复制供应商 API Key 后点击添加。系统确认后由 Electron Main 读取并验证剪贴板。凭证通过 Electron safeStorage 保存，Windows 使用 DPAPI。连接测试可指定模型并发起短推理。页面只接收凭证状态、模型目录和连接结果。「ChatGPT 账号」与「默认模型」各有独立入口，底部「设置」提供外观与版本信息。
 - 可设默认模型并为会话选择模型。自动策略可在同 Provider 内为子任务独立选型，固定策略沿用父模型。新会话未显式选模或配置默认路由时，会从已授权的 API Provider 选择可用模型。正在使用的 Pi Session 只接受同 Provider 的路由变化。
-- DeepSeek 思考模型的单次输出预算最高为 16384 Token，包含思考、正式回复和工具调用参数。Flash 默认使用低思考强度。若一轮只有思考且耗尽输出预算，Root 在权限、取消与任务预算校验下至多追加一次关闭思考的续接。恢复这种已阻塞的任务时，同一模型可直接使用该方式。续接保留已完成的工具结果，从发送给模型的上下文移除仅含思考的截断回复。Pi 本地会话保存原始记录，聊天只展示正式回复。续接仍因输出上限中断时，任务进入可恢复的阻塞状态。
+- DeepSeek 的思考、正式回复和工具参数共用输出预算。Host 使用 Pi 模型目录的输出上限，并按任务和委派剩余额度缩减。默认模式使用 Pi 的推理策略，快速模式请求低推理强度。若 Root 的一轮只有思考且耗尽输出预算，Host 可在权限、取消和预算校验下追加一次关闭思考的续接。恢复这种阻塞时，同一模型也可使用该方式。续接保留已完成的工具结果，模型上下文排除仅含思考的截断回复。Pi 会话保留原始记录，聊天展示正式回复。仍因输出上限中断时，任务进入可恢复的阻塞状态。详见 [Harness 与能力委派](27-harness-alignment.md)。
 
 思考强度和输出预算分开配置，参考 [DSH Provider 指南](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/user/guide/providers.md) 和 [DeepSeek API](https://api-docs.deepseek.com/guides/thinking_mode/)。DSH 的[公开复现](https://github.com/deepseek-ai/deepseek-harness/discussions/12347)也记录了仅有思考内容时的空答复。Pi 负责拦截截断回复中的工具调用，Zlo 在 SDK 的正常请求路径上执行有限续接。
 

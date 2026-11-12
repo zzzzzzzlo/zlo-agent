@@ -12,8 +12,8 @@
 | --- | --- |
 | `task.created`、`task.state_changed`、`task.stop_requested`、`task.stopped`、`task.resumed` | 状态、原因、时间。按 Run/Attempt 计算完成、停止、阻塞率和时长。 |
 | `task.plan_changed`、`task.node_started`、`task.node_settled`、`task.worker_settled` | 计划版本、节点、父节点、角色和依赖标识。结算事件携带状态及可用的验收和证据引用。用 `getTask` 获取权威 DAG 快照。 |
-| `agent.started`、`agent.finished` | 角色、开始路由、父 Agent、Run/Session、完成状态、生命周期和证据计数。Team 进入 idle 时保留 Agent 与 Session。Worker 释放运行资源。 |
-| `model.request_started`、`model.usage`、`model.route_changed`、`model.reserved`、`model.reservation_settled` | 模型、调用和预算。预留/核销共享 reservation correlationId，含 prompt/compaction 类型、预估 Token、实际 Token 或 uncertain 状态。用量给出 input/output/cacheRead/cacheWrite，目录有价格时给出 estimatedCostUsd。目录价格估算与账单分开，额度仍为 unknown。 |
+| `agent.started`、`agent.finished` | 角色、开始路由、父 Agent、Run/Session、完成状态、生命周期和证据计数。开始事件附带运行模式、推理策略和当前 Run 的时间上限。Team 进入 idle 时保留 Agent 与 Session。Worker 释放运行资源。 |
+| `model.request_started`、`model.usage`、`model.route_changed`、`model.reserved`、`model.reservation_settled` | 模型、调用和预算。预留与核销共享 correlationId。包括请求类型、预估输入、获准输出、任务预算、实际用量或 uncertain 状态。用量给出 input/output/cacheRead/cacheWrite，目录有价格时给出 estimatedCostUsd。目录价格估算与账单分开，额度仍为 unknown。 |
 | `tool.started`、`tool.finished`、`operation.reconciliation_required` | 工具名、效果类别、回执 ID、状态。开始/结束可计算时长；未确认动作明确列出回执 ID 并阻塞恢复。 |
 | `tool.approval_resolved` | 工具名、回执关联 ID 和本次是否同意。完整参数与系统保存路径保留在临时授权通道。长进程的 `tool.started` 带 managed 标记，直到实际退出才结算原操作。 |
 | `verification.finished`、`context.compacted` | 根任务验收记录包含 `executionStatus`、`verdict`、`basis`、`passed` 和 `evidence`。压缩事件记录压缩前后 Token 估计。 |
