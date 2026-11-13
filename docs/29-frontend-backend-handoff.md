@@ -61,7 +61,7 @@ Renderer 通过 `window.agentHost`、`window.agentManagement`、`window.agentCha
 | `conversation.model_requested`、`model.route_changed` | 刷新 `route` 与 `pendingRoute`。 |
 | `message.created`、`task.created`、`task.updated` | 合并 `payload.turn`。一轮以 `taskId` 为键，`taskRunId` 和 `taskAttemptId` 用于标识执行与尝试。 |
 | `message.delta`、`message.completed` | 按 `messageId` 更新助理消息，只拼接已去重的增量。 |
-| `tool.started`、`tool.updated` | 按 `payload.tool.id` 更新调用卡片。可用 `agentRunId` 归属到对应执行者。 |
+| `tool.started`、`tool.updated` | 按 `payload.tool.id` 更新调用卡片。`assistantOffset` 是工具开始时助理累计文本的 UTF-16 长度。聊天按该位置插入工具组，旧数据没有位置时集中显示在回复前。`reason` 是可选的失败类别。 |
 | `agent.started`、`agent.finished`、`task.node_updated` | 更新节点和 Agent 的运行投影。完整 DAG 来自管理快照。 |
 | `model.usage` | `payload.usage` 是该轮当前累计值，直接覆盖对应累计字段。 |
 | `run.finished`、`run.interrupted` | 展示运行结束状态与原因，可刷新任务详情和会话中台。 |
@@ -79,6 +79,8 @@ Renderer 通过 `window.agentHost`、`window.agentManagement`、`window.agentCha
 | `succeeded`、`failed` | 展示执行结果和单独的验收结论。使用 `verification.verdict` 或共享的 `verificationVerdict()` 处理旧数据。 |
 
 验收结果有 `verified`、`unverified`、`failed`、`not_applicable`。`succeeded` 表示 Task 已完成，可能仍为 `unverified`。工具 `succeeded` 只说明该次工具操作成功。 [任务与验收类型](../shared/contracts/domain.ts)
+
+聊天按 Markdown 渲染助理文本。原文继续用于历史和游标回放。工具事件独立于文本，工具组可展开。验收结论显示在会话中台和任务详情，验收失败也可在聊天看到。布局参考 Codex 的消息渲染和工具活动分离。 [Codex 消息渲染](https://github.com/openai/codex/blob/main/codex-rs/tui/src/history_cell/messages.rs) · [Codex 运行活动](https://github.com/openai/codex/blob/main/codex-rs/tui/src/chatwidget/turn_runtime.rs)
 
 ## `window.agentManagement` · 工作台
 

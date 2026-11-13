@@ -4,6 +4,7 @@ export const windowChannels = {
   close: 'window:close',
   maximized: 'window:is-maximized',
   changed: 'window:maximized-changed',
+  openExternalLink: 'window:open-external-link',
 } as const
 
 export interface WindowApi {
@@ -11,5 +12,6 @@ export interface WindowApi {
   toggleMaximize(): Promise<void>
   close(): Promise<void>
   isMaximized(): Promise<boolean>
+  openExternalLink(url: string): Promise<void>
   onMaximizedChange(listener: (maximized: boolean) => void): () => void
 }

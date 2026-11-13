@@ -7,6 +7,7 @@ Zlo Agent 的原创代码和图形采用 [MIT](LICENSE)。[PI-Desktop](https://g
 | [Liqui Design](https://github.com/leefanv/liqui-design) | MIT，Copyright (c) 2026 Fan Li | 官方玻璃组件与折射内核 |
 | [Electron](https://github.com/electron/electron) | MIT，附 Chromium 和其它第三方许可 | 桌面窗口与渲染引擎 |
 | [React / React DOM](https://github.com/facebook/react) | MIT | 渲染器 |
+| [react-markdown](https://github.com/remarkjs/react-markdown)、[remark-gfm](https://github.com/remarkjs/remark-gfm) | MIT，传递依赖许可见 `licenses/markdown.txt` | 聊天 Markdown 和表格渲染 |
 | [Zustand](https://github.com/pmndrs/zustand) | MIT | 界面状态 |
 | [Lucide](https://github.com/lucide-icons/lucide) | ISC，部分 Feather 图标为 MIT | 图标 |
 | [Tailwind CSS](https://github.com/tailwindlabs/tailwindcss) | MIT | 样式构建 |

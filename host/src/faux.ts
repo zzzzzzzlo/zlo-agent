@@ -1,5 +1,5 @@
 import { InMemoryCredentialStore, getCurrentTools } from '@earendil-works/pi-ai'
-import { fauxAssistantMessage, fauxProvider, fauxToolCall } from '@earendil-works/pi-ai/providers/faux'
+import { fauxAssistantMessage, fauxProvider, fauxText, fauxToolCall } from '@earendil-works/pi-ai/providers/faux'
 import type { FauxResponseFactory } from '@earendil-works/pi-ai/providers/faux'
 import { ModelRuntime } from '@earendil-works/pi-coding-agent'
 import { PiExecution } from './pi.ts'
@@ -23,8 +23,18 @@ export class FauxExecution extends PiExecution {
           fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' })
         const previous = context.messages.findLast((message) => message.role === 'user')
         const tail = context.messages.findLast((message) => message.role === 'user' || message.role === 'toolResult')
+        const text = previous?.role === 'user'
+          ? (typeof previous.content === 'string' ? previous.content
+            : previous.content.filter((part) => part.type === 'text').map((part) => part.text).join(''))
+          : ''
         if (tail?.role === 'toolResult') {
           const content = tail.content.filter((part) => part.type === 'text').map((part) => part.text).join('')
+          if (text.includes('[transcript]')) return fauxAssistantMessage([
+            '### 实现要点', '', '| 部分 | 做法 |', '| --- | --- |', '| 踏蹬 | **两段骨骼** |', '',
+            '- 更新 `bike.html`', '', '```js', 'const cadence = 60', '```', '',
+            '[公开文档](https://example.com/docs)', '', '<img src="https://example.com/raw.png">', '',
+            '![预览图片](https://example.com/preview.png)', '', '[无效链接](file:///C:/private.txt)',
+          ].join('\n'))
           if (!content.includes('"ok":true')) return fauxAssistantMessage('文件工具未完成请求，请检查工作区和验收路径。')
           if (tail.toolName === 'export_artifact') return fauxAssistantMessage('已导出工作区文件。')
           if (['read_text_file', 'delegate_worker', 'propose_task_plan'].includes(tail.toolName)) {
@@ -32,11 +42,12 @@ export class FauxExecution extends PiExecution {
           }
           return fauxAssistantMessage(tail.toolName === 'edit_text_file' ? '已在登录页中添加验证码输入框。' : '已创建简单登录页面，包含用户名和密码输入框。')
         }
-        const text = previous?.role === 'user'
-          ? (typeof previous.content === 'string' ? previous.content
-            : previous.content.filter((part) => part.type === 'text').map((part) => part.text).join(''))
-          : ''
         const available = getCurrentTools(context.messages).map(({ name }) => name)
+        if (text.includes('[transcript]') && available.includes('create_text_file')) {
+          return fauxAssistantMessage([fauxText('先生成自行车页面。\n\n'),
+            fauxToolCall('create_text_file', { path: 'bike.html', content: '<svg></svg>' }),
+            fauxToolCall('read_text_file', { path: 'missing.txt' })], { stopReason: 'toolUse' })
+        }
         if (text.startsWith('Additional user instruction (')) return fauxAssistantMessage('已应用追加指令：' + text.split('): ').slice(1).join('): '))
         if (text.startsWith('Resume the task')) return fauxAssistantMessage('已从保存的会话继续。')
         if (text.includes('[slow]') || text.includes('[steer]')) {

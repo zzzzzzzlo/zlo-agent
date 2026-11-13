@@ -2,7 +2,7 @@ import { useState } from 'react'
 import type { TaskStatus } from '../../../../shared/contracts/desktop.ts'
 import type { DesktopManagementApi, ManagedOperation, ManagedTask, ManagementSnapshot } from '../../../../shared/contracts/management.ts'
 import { workspaceAccessLabels } from '../../features/sessions/model'
-import { verificationLabel } from '../../features/sessions/verification'
+import { verificationExplanation, verificationLabel } from '../../features/sessions/verification'
 import { routeDisplayLabel } from './managementData'
 import type { PerformManagement } from './ModelManagement'
 
@@ -98,6 +98,7 @@ export function TaskManagement({ snapshot, busy, perform }: {
           </select>
         </label>
         <p className="management-note">{statuses[task.status]}{task.verification && ' · ' + verificationLabel(task.verification)}</p>
+        {task.verification && verificationExplanation(task.verification) && <p className="management-note">{verificationExplanation(task.verification)}</p>}
         {task.taskId === latest && control && (running || resumable) && (
           <div className="management-actions">
             {running && <button type="button" className="button-neutral" disabled={busy} onClick={() => command('stopConversation')}>停止任务</button>}

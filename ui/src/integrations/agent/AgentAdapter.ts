@@ -17,6 +17,7 @@ export interface ToolUpdate {
   name: string
   status: RunStatus
   detail: string
+  assistantOffset?: number
 }
 
 export type AgentEvent = RunKey & (

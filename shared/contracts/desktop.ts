@@ -1,4 +1,4 @@
-import type { EndReason, ModelRoute, TaskStatus, VerificationCheck, VerificationResult, WorkspaceAccess } from './domain.ts'
+import type { EndReason, ModelRoute, TaskStatus, ToolFailureReason, VerificationCheck, VerificationResult, WorkspaceAccess } from './domain.ts'
 
 export type { ModelRoute, TaskStatus, VerificationCheck, WorkspaceAccess } from './domain.ts'
 
@@ -30,6 +30,8 @@ export interface ConversationTool {
   name: string
   status: 'running' | 'succeeded' | 'failed' | 'interrupted' | 'unknown_effect'
   agentRunId?: string
+  assistantOffset?: number
+  reason?: ToolFailureReason
 }
 
 export interface UsageTotals {

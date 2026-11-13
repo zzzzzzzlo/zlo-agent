@@ -313,7 +313,7 @@ test('Windows Electron authorizes a writable workspace without a file check and 
       assert.ok(writeTurn.tools.some(({ name, status }) => name === 'create_text_file' && status === 'succeeded'))
       assert.equal(writeTurn.verification.verdict, 'unverified')
       assert.equal(writeTurn.verification.passed, false)
-      await page.getByText('目标尚未验证', { exact: true }).first().waitFor()
+      assert.equal(await page.getByRole('main', { name: '对话' }).getByText('未自动验收', { exact: true }).count(), 0)
       await send(page, '[team-check] 请用团队核对登录页')
       await waitForRun(page, writeConversation.id, 2, 'succeeded')
       const teamTurn = (await history(page, writeConversation.id)).turns[1]
@@ -321,6 +321,7 @@ test('Windows Electron authorizes a writable workspace without a file check and 
       await page.getByRole('button', { name: '展开会话中台' }).click()
       const activity = page.getByRole('complementary', { name: '会话中台' })
       await activity.getByText('Team Agent', { exact: true }).waitFor()
+      await activity.getByText('未自动验收', { exact: true }).waitFor()
       await activity.getByRole('button', { name: '查看任务详情' }).click()
       const tasks = page.getByRole('main', { name: 'Agent 与任务' })
       await tasks.getByRole('heading', { name: '任务 DAG' }).waitFor()
@@ -441,6 +442,62 @@ test('Windows Electron authorizes a writable workspace without a file check and 
     } finally {
       await app?.close()
       await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+    }
+  })
+
+test('Windows Electron renders Markdown and interleaves tools in live and restored chat',
+  { skip: process.platform !== 'win32', timeout: 90000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'zlo-electron-transcript-'))
+    const data = join(root, 'desktop-data')
+    const workspace = join(root, 'workspace')
+    await mkdir(workspace)
+    let app
+    try {
+      app = await launch(data)
+      const page = await ready(app, data)
+      await app.evaluate(({ dialog }, path) => {
+        dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] })
+      }, workspace)
+      await page.getByRole('button', { name: /新建会话/ }).click()
+      await page.getByLabel('会话名称').fill('Markdown 与工具记录')
+      await page.getByRole('button', { name: '选择工作区' }).click()
+      await page.getByRole('button', { name: '创建会话' }).click()
+      await page.getByRole('button', { name: '创建会话' }).waitFor({ state: 'hidden' })
+      await send(page, '[transcript] 创建自行车页面')
+      const [{ id }] = await page.evaluate(() => window.agentHost.listConversations())
+      await waitForRun(page, id, 1, 'succeeded')
+      const [{ tools, assistant }] = (await history(page, id)).turns
+      assert.equal(tools.length, 2)
+      assert.ok(tools.every(tool => tool.assistantOffset === '先生成自行车页面。\n\n'.length))
+      assert.equal(tools[1].reason, 'tool_result_failed')
+      assert.match(assistant.text, /\| 部分 \| 做法 \|/u)
+      const check = async target => {
+        const turn = target.locator('.assistant-body')
+        await turn.getByRole('heading', { name: '实现要点' }).waitFor()
+        assert.deepEqual(await turn.locator(':scope > :is(.message-markdown, .tool-group)').evaluateAll(blocks =>
+          blocks.map(block => block.className.split(' ')[0])), ['message-markdown', 'tool-group', 'message-markdown'])
+        assert.equal(await turn.getByRole('table').getByRole('cell', { name: '两段骨骼' }).locator('strong').count(), 1)
+        assert.equal(await turn.locator('li code').textContent(), 'bike.html')
+        assert.match(await turn.locator('pre code').textContent(), /const cadence = 60/)
+        assert.equal(await turn.locator('img').count(), 0)
+        assert.equal(await turn.getByRole('link', { name: '无效链接' }).count(), 0)
+        assert.equal(await turn.getByRole('link', { name: '公开文档' }).getAttribute('href'), 'https://example.com/docs')
+        const group = turn.locator('.tool-group')
+        assert.equal(await group.getAttribute('open'), null)
+        await group.locator(':scope > summary').click()
+        await group.getByText('create_text_file', { exact: true }).waitFor()
+        await group.getByText('read_text_file', { exact: true }).click()
+        await group.getByText('工具返回了失败结果。', { exact: true }).waitFor()
+        assert.equal(await turn.getByText('未自动验收', { exact: true }).count(), 0)
+      }
+      await check(page)
+      if (process.env.ZLO_UI_REVIEW_DIR) await page.screenshot({ path: join(process.env.ZLO_UI_REVIEW_DIR, 'markdown-transcript.png') })
+      await app.close()
+      app = await launch(data)
+      await check(await ready(app, data))
+    } finally {
+      await app?.close()
+      await rm(root, { recursive: true, force: true })
     }
   })
 

@@ -46,7 +46,11 @@ const reasons: Partial<Record<EndReason, string>> = {
 
 function toTool(tool: ConversationTool): ToolUpdate {
   const [status, detail] = toolStates[tool.status]
-  return { id: tool.id, name: tool.name, status, detail }
+  const reason = tool.reason && {
+    tool_result_failed: '工具返回了失败结果。', tool_exception: '工具执行时发生异常。',
+    nonzero_exit: '命令以非零退出码结束。', tool_cancelled: '工具调用已取消。',
+  }[tool.reason]
+  return { id: tool.id, name: tool.name, status, detail: reason ?? detail, assistantOffset: tool.assistantOffset }
 }
 
 export function toTurn(turn: ConversationTurn): Turn {

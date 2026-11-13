@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import { ChevronRight, X } from 'lucide-react'
 import type { ConversationObservatory } from '../../../../shared/contracts/management.ts'
 import type { Session, Turn } from '../../features/sessions/model'
-import { verificationLabel } from '../../features/sessions/verification'
+import { verificationExplanation, verificationLabel } from '../../features/sessions/verification'
 import type { RunStatus } from '../../integrations/agent/AgentAdapter'
 import { isBusy } from '../../integrations/agent/conversationProjection'
 import { useWorkspace } from '../../stores/workspace'
@@ -82,7 +82,10 @@ export function ActivityPanel({ session, onClose, onManage }: {
                     {[...session.turns].reverse().map(item => <option key={item.id} value={item.id}>{item.prompt.slice(0, 48) || item.id}</option>)}
                   </select>
                 </label>}
-                {turn.verification && <p className="management-note">{verificationLabel(turn.verification)}</p>}
+                {turn.verification && <div>
+                  <p className="management-note">{verificationLabel(turn.verification)}</p>
+                  {verificationExplanation(turn.verification) && <p className="management-note">{verificationExplanation(turn.verification)}</p>}
+                </div>}
                 {turn.nodes && turn.nodes.length > 0 && <ul className="observatory-nodes" aria-label="协作进度">
                   {turn.nodes.map(node => <li className="activity-run" key={node.id}>
                     <span>{node.role === 'team' ? 'Team Agent' : '临时 Worker'}</span><RunBadge status={nodeStates[node.status]} />

@@ -1,10 +1,10 @@
 import { randomUUID } from 'node:crypto'
 import type { ApprovalKind } from '../../shared/contracts/tool-approval.ts'
 import { normalizeVerification, projectCommands } from './contracts/domain.ts'
-import type { EndReason, EventDraft, ModelRoute, TaskStatus, VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
+import type { EndReason, EventDraft, ModelRoute, TaskStatus, ToolFailureReason, VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
 import type { LocalStore } from './store.ts'
 
-export type { EndReason, TaskStatus } from './contracts/domain.ts'
+export type { EndReason, TaskStatus, ToolFailureReason } from './contracts/domain.ts'
 export interface WorkerResult {
   resultStatus: 'succeeded' | 'failed'
   executionStatus?: 'completed' | 'failed'
@@ -129,7 +129,6 @@ export interface Operation {
   status: 'started' | 'succeeded' | 'failed' | 'interrupted' | 'unknown_effect'
 }
 
-export type ToolFailureReason = 'tool_result_failed' | 'tool_exception' | 'nonzero_exit' | 'tool_cancelled'
 export interface CreateTask {
   requestId: string
   goal: string

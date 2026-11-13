@@ -9,6 +9,7 @@ export interface ModelCatalogEntry {
 }
 
 export type WorkspaceAccess = 'read' | 'write' | 'trusted'
+export type ToolFailureReason = 'tool_result_failed' | 'tool_exception' | 'nonzero_exit' | 'tool_cancelled'
 
 export const projectCommands = ['npm_test', 'npm_build', 'npm_lint', 'npm_typecheck', 'node_script'] as const
 export interface ProjectCommand {

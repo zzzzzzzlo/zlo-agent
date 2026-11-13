@@ -32,3 +32,22 @@ export function ToolCard({ tool }: { tool: ToolUpdate }) {
     </details>
   )
 }
+
+export function ToolGroup({ tools }: { tools: readonly ToolUpdate[] }) {
+  const running = tools.filter(tool => tool.status === 'running').length
+  const failed = tools.filter(tool => tool.status === 'error').length
+  const unresolved = tools.filter(tool => tool.status === 'reconciliation').length
+  const stopped = tools.filter(tool => tool.status === 'stopped' || tool.status === 'cancelled').length
+  const status = unresolved ? 'reconciliation' : running ? 'running' : failed ? 'error' : stopped ? 'stopped' : 'completed'
+  const counts = [running && `${running} 项运行中`, failed && `${failed} 项失败`,
+    unresolved && `${unresolved} 项待核对`, stopped && `${stopped} 项已停止`].filter(Boolean)
+  return <details className="tool-group">
+    <summary>
+      <Wrench size={14} aria-hidden="true" />
+      <span>{tools.length} 项工具操作</span>
+      <RunBadge status={status} label={counts.length ? counts.join(' · ') : undefined} />
+      <ChevronDown className="tool-chevron" size={14} aria-hidden="true" />
+    </summary>
+    <div className="tool-group-list">{tools.map(tool => <ToolCard key={tool.id} tool={tool} />)}</div>
+  </details>
+}

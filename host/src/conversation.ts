@@ -618,11 +618,18 @@ export class ConversationService {
 
   #projectTool(binding: TurnBinding, source: AgentEvent): void {
     const turn = this.#turn(binding)
+    const id = String(source.payload.id)
+    const index = turn.tools.findIndex(entry => entry.id === id)
+    const started = source.type === 'tool.started'
+    const assistantOffset = started ? (this.#readAssistant(binding.conversationId, turn)?.text ?? turn.assistant.text).length
+      : turn.tools[index]?.assistantOffset
+    const reason = source.payload.reason
     const tool: ConversationTool = {
-      id: String(source.payload.id), name: String(source.payload.tool), agentRunId: source.agentRunId,
-      status: source.type === 'tool.started' ? 'running' : source.payload.status as ConversationTool['status'],
+      id, name: String(source.payload.tool), agentRunId: source.agentRunId,
+      status: started ? 'running' : source.payload.status as ConversationTool['status'],
+      ...(assistantOffset === undefined ? {} : { assistantOffset }),
+      ...(reason === 'tool_result_failed' || reason === 'tool_exception' || reason === 'nonzero_exit' || reason === 'tool_cancelled' ? { reason } : {}),
     }
-    const index = turn.tools.findIndex((entry) => entry.id === tool.id)
     if (index < 0) turn.tools.push(tool)
     else turn.tools[index] = tool
     this.#saveTurn(binding, turn)

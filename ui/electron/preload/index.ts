@@ -12,6 +12,7 @@ const windowApi: WindowApi = {
   toggleMaximize: () => ipcRenderer.invoke(windowChannels.toggleMaximize),
   close: () => ipcRenderer.invoke(windowChannels.close),
   isMaximized: () => ipcRenderer.invoke(windowChannels.maximized),
+  openExternalLink: (url) => ipcRenderer.invoke(windowChannels.openExternalLink, url),
   onMaximizedChange(listener) {
     const receive = (_event: IpcRendererEvent, maximized: boolean) => listener(maximized)
     ipcRenderer.on(windowChannels.changed, receive)

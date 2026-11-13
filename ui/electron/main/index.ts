@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { app, BrowserWindow, ipcMain, session } from 'electron'
+import { app, BrowserWindow, ipcMain, session, shell } from 'electron'
 import type { IpcMainInvokeEvent } from 'electron'
 import { windowChannels } from '../window-api'
 import { localDirectory } from './agent-input.ts'
@@ -110,6 +110,13 @@ app.whenReady().then(() => {
   ipcMain.handle(windowChannels.minimize, (event) => windowFor(event).minimize())
   ipcMain.handle(windowChannels.close, (event) => windowFor(event).close())
   ipcMain.handle(windowChannels.maximized, (event) => windowFor(event).isMaximized())
+  ipcMain.handle(windowChannels.openExternalLink, async (event, value: unknown) => {
+    windowFor(event)
+    if (typeof value !== 'string' || value.length > 2048) return
+    const url = URL.parse(value)
+    if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password) return
+    await shell.openExternal(url.href)
+  })
   ipcMain.handle(windowChannels.toggleMaximize, (event) => {
     const window = windowFor(event)
     if (window.isMaximized()) window.unmaximize()
