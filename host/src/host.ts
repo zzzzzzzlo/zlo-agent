@@ -12,7 +12,8 @@ import { createProcessTools } from './process-tools.ts'
 import { BraveSearch, createWebTools, HackerNewsSearch, publicWeb } from './web-tools.ts'
 import type { ToolApprovalCommand } from '../../shared/contracts/tool-approval.ts'
 import type { ChatGptSession } from '../../shared/contracts/chatgpt.ts'
-import { parseJevSettings } from '../../shared/contracts/jev.ts'
+import { judgeEndpoint, judgeKeyMatches, parseJevSettings } from '../../shared/contracts/jev.ts'
+import type { JudgeCredentials } from '../../shared/contracts/jev.ts'
 import type { AgentPreferences, ManagedMemory, ManagedModel, ManagedOperation, ManagedProvider, ManagementCommand, ManagementSnapshot, PrivateCredentialCommand, ProviderId } from '../../shared/contracts/management.ts'
 import type { AgentEvent, EventDraft, ModelRoute, TaskStatus, VerificationCheck, WorkspaceAccess } from './contracts/domain.ts'
 import type {
@@ -86,6 +87,7 @@ interface HostOptions {
   harnessMode?: HarnessMode
   judgment?: JudgmentOptions
   jevKey?: string | null
+  judgeKeys?: JudgeCredentials
   jevFetch?: typeof fetch
   defaultWorkspace?: string
   defaultRoute?: ModelRoute
@@ -157,7 +159,7 @@ export class LocalAgentHost {
     this.#approval = new ToolApprovalBroker(options.approveTool)
     this.#store = new LocalStore(join(this.#directory, 'tasks.sqlite'))
     try {
-      this.#jev = new JevConfiguration(this.#store, options.jevKey, options.jevFetch)
+      this.#jev = new JevConfiguration(this.#store, options.jevKey, options.jevFetch, options.judgeKeys)
       const saved = this.#store.get<AgentPreferences>('desktop-preferences', 'v1')
       if (saved) this.#agentPreferences = management.preferences(saved)
       if (options.runtimeId) {
@@ -710,10 +712,11 @@ export class LocalAgentHost {
         return this.#jev.save(settings)
       }
       case 'applyJevKey': {
-        if (command.key !== null && (typeof command.key !== 'string' || !/^[\x21-\x7e]{8,2048}$/u.test(command.key))) {
+        const endpoint = judgeEndpoint(command.endpoint)
+        if (!endpoint || (command.key !== null && !judgeKeyMatches(endpoint, command.key))) {
           throw new ConversationError('INVALID_INPUT', 'Invalid Jev credential')
         }
-        return this.#jev.setKey(command.key)
+        return this.#jev.setKey(command.key, endpoint)
       }
       case 'managementSnapshot': return this.managementSnapshot(command.conversationId)
       case 'conversationObservatory': {

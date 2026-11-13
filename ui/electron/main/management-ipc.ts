@@ -4,7 +4,7 @@ import { dialog, ipcMain } from 'electron'
 import type { BrowserWindow, IpcMainInvokeEvent } from 'electron'
 import type { ConversationSummary } from '../../../shared/contracts/desktop.ts'
 import type { WorkspaceAccess } from '../../../shared/contracts/domain.ts'
-import { parseJevSettings } from '../../../shared/contracts/jev.ts'
+import { judgeProviders, parseJevSettings } from '../../../shared/contracts/jev.ts'
 import type { JevStatus } from '../../../shared/contracts/jev.ts'
 import type { AgentPreferences, ManagedProvider, ManagementSnapshot, ProviderId } from '../../../shared/contracts/management.ts'
 import type { DiagnosticEntry } from '../../../shared/diagnostics.ts'
@@ -176,9 +176,9 @@ export function registerManagementIpc(options: {
   }))
 
   const getJevStatus = () => host.request<JevStatus>({ schemaVersion: 1, type: 'getJevStatus' })
-  async function applyJevKey(key: string | null) {
-    await options.jevCredentials.set(key)
-    try { return await host.request({ schemaVersion: 1, type: 'applyJevKey', key }) }
+  async function applyJevKey(endpoint: string, key: string | null) {
+    await options.jevCredentials.set(endpoint, key)
+    try { return await host.request({ schemaVersion: 1, type: 'applyJevKey', endpoint, key }) }
     catch {
       await host.restart()
       return getJevStatus()
@@ -192,22 +192,25 @@ export function registerManagementIpc(options: {
   register('saveJevSettings', (window, value) => mutate(async () => {
     const settings = parseJevSettings(value)
     if (!settings) return invalid()
-    if (settings.enabled && !(await getJevStatus()).settings.enabled) {
-      await confirm(window, '允许 Jev 处理任务证据？', '开启后，已启用的判定点会向 TypeSafe 发送任务相关信息。',
-        '可能包括经裁剪和脱敏的任务目标、交付摘要或已获准召回的记忆片段。Shadow 也会发送这些数据。')
+    const previous = (await getJevStatus()).settings
+    if (settings.enabled && (!previous.enabled || previous.endpoint !== settings.endpoint)) {
+      await confirm(window, '允许判定服务处理任务证据？', '已启用的判定点会把经裁剪和脱敏的目标、交付摘要或授权记忆发送到以下地址。Shadow 也会发送。',
+        settings.endpoint)
     }
     return host.request({ schemaVersion: 1, type: 'saveJevSettings', settings })
   }))
   register('setJevKey', (window, value) => mutate(async () => {
     noInput(value)
-    const key = await captureKey(window, 'Jev / System One')
+    const { settings } = await getJevStatus()
+    const key = await captureKey(window, settings.provider === 'custom' ? settings.endpoint : judgeProviders[settings.provider].label)
     if (key === null) throw new HostTransportError('CONFLICT', '操作已取消。')
-    return applyJevKey(key)
+    return applyJevKey(settings.endpoint, key)
   }))
   register('removeJevKey', (window, value) => mutate(async () => {
     noInput(value)
-    await confirm(window, '删除 Jev 凭证', '删除凭证后，判定会回退到本地规则。')
-    return applyJevKey(null)
+    const { settings } = await getJevStatus()
+    await confirm(window, '删除判定模型凭证', '删除此地址的凭证后，判定会回退到本地规则。', settings.endpoint)
+    return applyJevKey(settings.endpoint, null)
   }))
   register('testJevConnection', async (_window, value) => {
     noInput(value)

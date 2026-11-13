@@ -1,5 +1,36 @@
 export const jevEndpoint = 'https://api.typesafe.ai/v1/systemone'
 export const jevDefaultModel = 'jev-latest'
+export const openCodeJudgeEndpoint = 'https://opencode.ai/inference/systemone/v1/systemone'
+export const openCodeFreeJudgeModel = 'jev-1.13-free'
+
+export const judgeProviders = {
+  typesafe: { label: 'TypeSafe', endpoint: jevEndpoint, model: jevDefaultModel },
+  opencode: { label: 'OpenCode', endpoint: openCodeJudgeEndpoint, model: openCodeFreeJudgeModel },
+  custom: { label: '自定义 System One', endpoint: '', model: '' },
+} as const
+
+export type JudgeProviderId = keyof typeof judgeProviders
+export type JudgeCredentials = Record<string, string>
+
+export function judgeEndpoint(value: unknown): string | undefined {
+  if (typeof value !== 'string' || value.length > 500 || !/^https?:\/\/[^\s\\?#]+$/iu.test(value)) return
+  const url = URL.canParse(value) ? new URL(value) : undefined
+  if (!url || url.username || url.password || url.pathname === '/' ||
+    (url.protocol !== 'https:' && !['127.0.0.1', '[::1]'].includes(url.hostname))) return
+  return url.href
+}
+
+export function judgeKeyMatches(endpoint: string, key: unknown): key is string {
+  return typeof key === 'string' && /^[\x21-\x7e]{8,2048}$/u.test(key) &&
+    (!/^oc_sk_/u.test(key) || endpoint === openCodeJudgeEndpoint)
+}
+
+export function parseJudgeCredentials(value: unknown): JudgeCredentials | undefined {
+  if (typeof value !== 'object' || !value || Array.isArray(value)) return
+  const entries = Object.entries(value)
+  if (entries.length > 24 || entries.some(([endpoint, key]) => judgeEndpoint(endpoint) !== endpoint || !judgeKeyMatches(endpoint, key))) return
+  return Object.fromEntries(entries)
+}
 
 export const judgmentPoints = [
   { id: 'collaboration.mode', label: '协作模式', description: '在允许的选项中选择临时 Worker 或持久 Team。' },
@@ -19,6 +50,8 @@ export type JevReason = typeof jevReasons[number]
 
 export interface JevSettings {
   enabled: boolean
+  provider: JudgeProviderId
+  endpoint: string
   model: string
   modes: Record<DecisionPoint, JudgmentMode>
 }
@@ -38,14 +71,21 @@ export interface JevStatus {
 }
 
 export function jevModel(value: unknown): value is string {
-  return typeof value === 'string' && /^jev(?:[-_.][a-zA-Z0-9]+){1,12}$/u.test(value) && value.length <= 100
+  return typeof value === 'string' && /^[a-zA-Z0-9_~][a-zA-Z0-9_./~:-]{0,99}$/u.test(value) &&
+    !value.includes('://') && !/^(?:oc_sk_|sk[_-]|gh[pousr]_|github_pat_)/u.test(value)
 }
 
-export function parseJevSettings(value: unknown): JevSettings | undefined {
-  if (typeof value !== 'object' || !value || Array.isArray(value) || Object.keys(value).length !== 3) return
-  const { enabled, model, modes } = value as Partial<JevSettings>
+export function parseJevSettings(value: unknown, legacy = false): JevSettings | undefined {
+  if (typeof value !== 'object' || !value || Array.isArray(value)) return
+  const old = legacy && Object.keys(value).length === 3
+  if (!old && Object.keys(value).length !== 5) return
+  const { enabled, model, modes, provider = old ? 'typesafe' : undefined, endpoint = old ? jevEndpoint : undefined } =
+    value as Partial<JevSettings>
   if (typeof enabled !== 'boolean' || !jevModel(model) || typeof modes !== 'object' || !modes || Array.isArray(modes) ||
     Object.keys(modes).length !== judgmentPoints.length ||
     judgmentPoints.some(({ id }) => !Object.hasOwn(modes, id) || !['off', 'shadow', 'active'].includes(modes[id]))) return
-  return { enabled, model, modes: { ...modes } }
+  const url = judgeEndpoint(endpoint)
+  if (typeof provider !== 'string' || !Object.hasOwn(judgeProviders, provider) || !url ||
+    (provider !== 'custom' && url !== judgeProviders[provider].endpoint)) return
+  return { enabled, provider, endpoint: url, model, modes: { ...modes } }
 }

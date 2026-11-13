@@ -2,6 +2,8 @@ import { join } from 'node:path'
 import { clipboard, dialog } from 'electron'
 import type { BrowserWindow } from 'electron'
 import type { ProviderId } from '../../../shared/contracts/management.ts'
+import { jevEndpoint, judgeKeyMatches, openCodeJudgeEndpoint, parseJudgeCredentials } from '../../../shared/contracts/jev.ts'
+import type { JudgeCredentials } from '../../../shared/contracts/jev.ts'
 import { readEncryptedJson, storageAvailable, writeEncryptedJson } from './encrypted-storage.ts'
 
 const providers: Readonly<Record<ProviderId, string>> = {
@@ -21,20 +23,33 @@ export class SecureJevCredentials {
 
   constructor(userData: string) { this.#path = join(userData, 'jev-credentials.bin') }
 
-  async load(): Promise<string | null> {
-    const document = await readEncryptedJson(this.#path) as { version?: number; key?: unknown } | undefined
-    if (document === undefined) return null
-    if (document.version !== 1 || (document.key !== null && !validKey(document.key))) {
-      throw new ProviderCredentialError('无法读取此系统账户的 Jev 凭证。')
+  async load(): Promise<JudgeCredentials> {
+    const document = await readEncryptedJson(this.#path) as { version?: number; key?: unknown; values?: unknown } | undefined
+    if (document === undefined) return {}
+    if (document?.version === 1 && (document.key === null || validKey(document.key))) {
+      if (document.key === null) return {}
+      const endpoint = document.key.startsWith('oc_sk_') ? openCodeJudgeEndpoint : jevEndpoint
+      return { [endpoint]: document.key }
     }
-    return document.key
+    const values = document?.version === 2 && parseJudgeCredentials(document.values)
+    if (!values) throw new ProviderCredentialError('无法读取此系统账户的判定模型凭证。')
+    return values
   }
 
-  async set(key: string | null): Promise<void> {
+  async set(endpoint: string, key: string | null): Promise<void> {
     if (!storageAvailable()) throw new ProviderCredentialError('系统安全凭证存储不可用。')
-    if (key !== null && !validKey(key)) throw new ProviderCredentialError('Jev 凭证格式无效。')
-    try { await writeEncryptedJson(this.#path, { version: 1, key }) }
-    catch { throw new ProviderCredentialError('无法更新系统安全凭证。') }
+    if (key !== null && !judgeKeyMatches(endpoint, key)) throw new ProviderCredentialError('这枚 API Key 与当前供应商不匹配。')
+    try {
+      const values = await this.load()
+      if (key === null) delete values[endpoint]
+      else values[endpoint] = key
+      if (!parseJudgeCredentials(values)) throw new ProviderCredentialError('判定模型凭证数量已达上限。')
+      await writeEncryptedJson(this.#path, { version: 2, values })
+    }
+    catch (error) {
+      if (error instanceof ProviderCredentialError) throw error
+      throw new ProviderCredentialError('无法更新系统安全凭证。')
+    }
   }
 }
 

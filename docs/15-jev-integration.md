@@ -1,8 +1,8 @@
 # Jev 接入
 
-在桌面「模型与账号 → 判定模型 (Jev)」复制 TypeSafe API Key，点击「添加 API Key」并在系统弹窗中确认。Electron Main 通过系统凭证加密保存密钥，Renderer 仅接收凭证状态。模型 ID 默认为 `jev-latest`，可以填入 [TypeSafe 模型目录](https://docs.typesafe.ai/api/list-models) 返回的 Jev 版本。保存模型后点击「测试连接」，观察状态及服务返回的实际版本。测试只发送合成样例，无需先打开运行开关。
+在桌面「模型与账号 → 判定模型 (Jev)」选择供应商。TypeSafe 预填 `jev-latest`，OpenCode 预填限时免费的 `jev-1.13-free`。也可以选择「自定义 System One」填写兼容服务的完整请求地址和模型 ID。推荐使用 HTTPS，本机服务可使用 HTTP 回环地址。保存设置后，复制对应地址的 Key，点击「添加 API Key」并在系统弹窗中确认。Electron Main 按完整地址加密保存各自的密钥，Renderer 仅接收凭证状态。点击「测试连接」会发送合成样例，可在全局关闭时验证。 [TypeSafe 模型目录](https://docs.typesafe.ai/api/list-models) · [OpenCode 模型目录](https://opencode.ai/docs/console/models#jev)
 
-运行设置默认全关。全局启用时确认外发范围，再逐个启用所需判定点。新启用的点使用 Shadow，可切换 Active。点击「保存 Jev 设置」后生效，修改设置或删除密钥会取消旧配置下的进行中判定。设置及最近状态保存在 Host SQLite，密钥位于独立的系统加密文件。Phase 1 固定使用 [TypeSafe 官方 HTTPS Endpoint](https://docs.typesafe.ai/api/system-one)，并拒绝重定向。
+运行设置默认全关。全局启用或在启用时切换请求地址，需要确认外发范围。新启用的点使用 Shadow，可切换 Active。点击「保存 Jev 设置」后生效，切换路由或删除密钥会取消旧配置下进行中的判定。设置及最近状态保存在 Host SQLite，密钥位于独立的系统加密文件。请求拒绝重定向。
 
 Host 复用 [Judge 接口](../host/src/judgment.ts)。调用方传入 schema 版本 1、决策 ID、决策输入、规则结果、允许选择集和证据引用。[Jev Adapter](../host/src/jev-judge.ts) 以白名单提取输入，由 System One 返回带概率的 `noul` 结果。二选一的布尔判定采用 ≥0.80 和 ≤0.20 的边界。候选题按 [MU 的 Judge 设计](https://usemu.dev/en/docs/judges/) 使用同一份状态批量提交，胜出候选须达到 0.80 且领先次名至少 0.15。
 
@@ -19,7 +19,7 @@ Host 复用 [Judge 接口](../host/src/judgment.ts)。调用方传入 schema 版
 - 每次 Jev 判定限时 3.5 秒，最多四个并发判定和一个连接测试。每任务最多 32 次请求，跨重启累计。Host 每分钟最多发起 60 次请求（含测试），429 后暂停 15 秒。请求体限制为 12 KiB，响应为 32 KiB。只有一个合法候选时直接使用规则。
 - Jev 可以收到经过裁剪和脱敏的任务或节点目标、交付摘要、成功工具类别和检查结果，以及已获准召回的记忆片段或模型元数据。请求不附会话历史、完整 Prompt、文件内容、工具输出、证据路径字段或认证信息。启用前确认任务内容允许发往 TypeSafe，任务文字中自行嵌入的敏感信息仍可能超出自动脱敏的识别范围。
 - `judgment.evaluated` 包含 `baseline`、实际选择 `output`、合法候选 `candidates`、`judgeOutput`、`disagreement`、`judgeModel`、`fallbackReason`、`requestSent`、`usage` 和 `resultLink`。`shadow` 保留给已有消费者。没有关联的结算事件时，评估结果保持未知。外发片段不写入事件。候选执行模型和证据引用以摘要记录，Jev 返回的版本 ID 单独记录。
-- Observatory 通过 TaskRun、Attempt、AgentRun 和关联回执展示判定。费用使用 [TypeSafe 公示单价](https://help.typesafe.ai/articles/5187202169-how-much-does-jev-cost) 估算，每百万输入 Token 0.042 美元，输出免费。缺少服务端用量时保留未知，费用与执行模型和 Evaluation 分开计量。
+- Observatory 通过 TaskRun、Attempt、AgentRun 和关联回执展示判定。TypeSafe 费用按 [公示单价](https://help.typesafe.ai/articles/5187202169-how-much-does-jev-cost) 估算，OpenCode 免费 Jev 估算为零，其它自定义定价保留未知。费用与执行模型和 Evaluation 分开计量。
 - 工具权限、未知副作用、预算、依赖和执行结果由 Host 的确定性检查约束。Shadow 的建议不会改变执行。Active 可调整合规计划、拒绝委派或交付等，在硬约束不满足时只有规则允许的候选。
 
 ## 真实 API 冒烟

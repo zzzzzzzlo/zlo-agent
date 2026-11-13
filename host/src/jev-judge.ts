@@ -1,5 +1,5 @@
-import { jevEndpoint, jevModel } from '../../shared/contracts/jev.ts'
-import type { DecisionPoint, JevReason } from '../../shared/contracts/jev.ts'
+import { jevModel, openCodeFreeJudgeModel } from '../../shared/contracts/jev.ts'
+import type { DecisionPoint, JevReason, JevSettings } from '../../shared/contracts/jev.ts'
 import type { Judge, JudgeRequest, JudgeResponse } from './judgment.ts'
 
 const instructions: Record<DecisionPoint, string> = {
@@ -27,7 +27,7 @@ function excerpt(value: unknown, limit: number, key: string): string | undefined
     .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-\r\n]*PRIVATE KEY-----|$)/gu, '[redacted]')
     .replace(/\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*:[^\r\n]*/giu, '[redacted]')
     .replace(/\b(?:bearer\s+|(?:api[-_ ]?key|password|token|secret)["']?\s*[:=]\s*["']?)[^\s"',;}]+/giu, '[redacted]')
-    .replace(/\b(?:sk[-_]|gh[pousr]_|github_pat_|AIza|AKIA|xox[baprs]-)[a-zA-Z0-9_.-]{8,}/gu, '[redacted]')
+    .replace(/\b(?:oc_sk_|sk[-_]|gh[pousr]_|github_pat_|AIza|AKIA|xox[baprs]-)[a-zA-Z0-9_.-]{8,}/gu, '[redacted]')
     .replace(/\bhttps?:\/\/[^\s"'<>]+/giu, '[url]')
     .slice(0, limit)
 }
@@ -110,12 +110,12 @@ async function readAnswer(response: Response): Promise<Record<string, unknown>> 
 
 export class JevJudge implements Judge {
   readonly #key: string
-  readonly #model: string
+  readonly #route: Pick<JevSettings, 'endpoint' | 'model' | 'provider'>
   readonly #request: typeof fetch
 
-  constructor(key: string, model: string, request: typeof fetch = fetch) {
+  constructor(key: string, route: Pick<JevSettings, 'endpoint' | 'model' | 'provider'>, request: typeof fetch = fetch) {
     this.#key = key
-    this.#model = model
+    this.#route = route
     this.#request = request
   }
 
@@ -148,11 +148,11 @@ export class JevJudge implements Judge {
   }
 
   async #ask(state: unknown, questions: Questions, signal: AbortSignal) {
-    const body = JSON.stringify({ model: this.#model, state, questions })
+    const body = JSON.stringify({ model: this.#route.model, state, questions })
     if (Buffer.byteLength(body) > wireLimit) throw new JevFailure('budget_exhausted')
     let response: Response
     try {
-      response = await this.#request(jevEndpoint, {
+      response = await this.#request(this.#route.endpoint, {
         method: 'POST', redirect: 'error', signal, body,
         headers: { Authorization: 'Bearer ' + this.#key, 'Content-Type': 'application/json' },
       })
@@ -181,8 +181,10 @@ export class JevJudge implements Judge {
     const tokens = record(result.usage)
     const input = smallNumber(tokens.input_tokens)
     const output = smallNumber(tokens.output_tokens)
+    const rate = this.#route.provider === 'typesafe' ? 0.042
+      : this.#route.provider === 'opencode' && this.#route.model === openCodeFreeJudgeModel ? 0 : undefined
     const usage = input !== undefined && output !== undefined && Number.isSafeInteger(input) && Number.isSafeInteger(output)
-      ? { input, output, estimatedCostUsd: input * 0.042 / 1_000_000 } : undefined
+      ? { input, output, ...(rate !== undefined ? { estimatedCostUsd: input * rate / 1_000_000 } : {}) } : undefined
     return { probabilities, metadata: { model, usage, requestSent: true } }
   }
 }

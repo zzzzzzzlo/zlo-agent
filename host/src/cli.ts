@@ -5,6 +5,8 @@ import { writeHostDiagnostic } from '../../shared/diagnostics.ts'
 import type { HostDiagnosticCode } from '../../shared/diagnostics.ts'
 import type { DesktopCommand, DesktopErrorCode, HostMode } from '../../shared/contracts/desktop.ts'
 import type { ManagementCommand, PrivateCredentialCommand } from '../../shared/contracts/management.ts'
+import { parseJudgeCredentials } from '../../shared/contracts/jev.ts'
+import type { JudgeCredentials } from '../../shared/contracts/jev.ts'
 import { localPort } from '../../shared/loopback-http.ts'
 import { ConversationError, parseRoute } from './conversation.ts'
 import { FakeExecution } from './fake.ts'
@@ -59,6 +61,7 @@ async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Pro
     const providerRuntime = mode === '--pi' ? new (await import('./pi.ts')).PiExecution() : undefined
     const execution = providerRuntime ?? (mode === '--faux' ? new (await import('./faux.ts')).FauxExecution() : new FakeExecution())
     let jevKey: string | null = null
+    let judgeKeys: JudgeCredentials | undefined
     if (bootstrap) {
       const first = await bootstrap.next()
       if (first.done || typeof first.value !== 'string' || first.value.length > 256 * 1024) throw new Error('Invalid desktop bootstrap')
@@ -77,10 +80,14 @@ async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Pro
         if (!validProviderKey(command.jevKey)) throw new Error('Invalid desktop credential')
         jevKey = command.jevKey
       }
+      if (command.judgeKeys !== undefined) {
+        judgeKeys = parseJudgeCredentials(command.judgeKeys)
+        if (!judgeKeys) throw new Error('Invalid judge credentials')
+      }
     }
     failure = 'host.startup_storage_failed'
     const host = new LocalAgentHost({
-      directory, execution, runtimeId, providerRuntime, defaultRoute, jevKey, defaultWorkspace: process.env.ZLO_AGENT_DEFAULT_WORKSPACE,
+      directory, execution, runtimeId, providerRuntime, defaultRoute, jevKey, judgeKeys, defaultWorkspace: process.env.ZLO_AGENT_DEFAULT_WORKSPACE,
       harnessMode, modelLimits: { ...(tokens === undefined ? {} : { tokens }), ...(requests === undefined ? {} : { requests }) },
     })
     return { host, runtimeId }

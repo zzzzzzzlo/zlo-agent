@@ -1,5 +1,5 @@
-import { jevDefaultModel, judgmentPoints, parseJevSettings } from '../../shared/contracts/jev.ts'
-import type { DecisionPoint, JevDecisionStatus, JevSettings, JevStatus } from '../../shared/contracts/jev.ts'
+import { jevDefaultModel, jevEndpoint, judgmentPoints, parseJevSettings } from '../../shared/contracts/jev.ts'
+import type { DecisionPoint, JevDecisionStatus, JevSettings, JevStatus, JudgeCredentials } from '../../shared/contracts/jev.ts'
 import { JevFailure, JevJudge } from './jev-judge.ts'
 import type { Judge, JudgmentOptions } from './judgment.ts'
 import type { LocalStore } from './store.ts'
@@ -15,28 +15,30 @@ export class JevConfiguration {
   readonly #store: LocalStore
   readonly #request: typeof fetch
   #settings: JevSettings
-  #key: string | null
+  readonly #keys: Map<string, string>
   #generation = new AbortController()
   readonly #pointControllers = new Map<DecisionPoint, AbortController>()
   #recent: number[] = []
   #cooldown = 0
   #probing = false
 
-  constructor(store: LocalStore, key: string | null = null, request: typeof fetch = fetch) {
+  constructor(store: LocalStore, key: string | null = null, request: typeof fetch = fetch, keys: JudgeCredentials = {}) {
     this.#store = store
     this.#request = request
-    this.#key = key
-    this.#settings = parseJevSettings(store.get(namespace, settingsId)) ?? {
-      enabled: false, model: jevDefaultModel,
+    this.#keys = new Map(Object.entries(keys))
+    if (key && !key.startsWith('oc_sk_') && !this.#keys.has(jevEndpoint)) this.#keys.set(jevEndpoint, key)
+    this.#settings = parseJevSettings(store.get(namespace, settingsId), true) ?? {
+      enabled: false, provider: 'typesafe', endpoint: jevEndpoint, model: jevDefaultModel,
       modes: Object.fromEntries(judgmentPoints.map(({ id }) => [id, 'off'])) as JevSettings['modes'],
     }
   }
 
   status(): JevStatus {
+    const key = this.#keys.get(this.#settings.endpoint)
     return {
       settings: structuredClone(this.#settings),
-      credential: this.#key ? 'stored' : 'missing',
-      connection: (this.#key && this.#store.get<JevStatus['connection']>(namespace, connectionId)) || { state: 'untested' },
+      credential: key ? 'stored' : 'missing',
+      connection: (key && this.#store.get<JevStatus['connection']>(namespace, connectionId)) || { state: 'untested' },
       decisions: Object.fromEntries(judgmentPoints.flatMap(({ id }) => {
         const status = this.#store.get<JevDecisionStatus>(namespace, id)
         return status ? [[id, status]] : []
@@ -45,13 +47,18 @@ export class JevConfiguration {
   }
 
   save(settings: JevSettings) {
-    const modelChanged = settings.model !== this.#settings.model
+    const routeChanged = settings.model !== this.#settings.model || settings.endpoint !== this.#settings.endpoint ||
+      settings.provider !== this.#settings.provider
     const globalChanged = settings.enabled !== this.#settings.enabled
     this.#store.transaction(() => {
       this.#store.put(namespace, settingsId, settings)
-      if (modelChanged) this.#store.put(namespace, connectionId, { state: 'untested' })
+      if (routeChanged) {
+        this.#store.put(namespace, connectionId, { state: 'untested' })
+        for (const { id } of judgmentPoints) this.#store.put(namespace, id, null)
+      }
     })
-    if (modelChanged || globalChanged) this.#invalidate()
+    if (routeChanged || globalChanged) this.#invalidate()
+    if (routeChanged) this.#cooldown = 0
     else for (const { id } of judgmentPoints) {
       if (settings.modes[id] === this.#settings.modes[id]) continue
       this.#pointControllers.get(id)?.abort()
@@ -61,8 +68,10 @@ export class JevConfiguration {
     return this.status()
   }
 
-  setKey(key: string | null) {
-    this.#key = key
+  setKey(key: string | null, endpoint = this.#settings.endpoint) {
+    if (key === null) this.#keys.delete(endpoint)
+    else this.#keys.set(endpoint, key)
+    if (endpoint !== this.#settings.endpoint) return this.status()
     this.#invalidate()
     this.#cooldown = 0
     this.#store.transaction(() => this.#store.put(namespace, connectionId, { state: 'untested' }))
@@ -85,10 +94,12 @@ export class JevConfiguration {
     const at = new Date().toISOString()
     let connection: JevStatus['connection']
     this.#probing = true
+    const route = this.#settings
+    const key = this.#keys.get(route.endpoint)
     try {
-      if (!this.#key) throw new JevFailure('missing_key')
+      if (!key) throw new JevFailure('missing_key')
       this.#reserve()
-      const model = await new JevJudge(this.#key, this.#settings.model, this.#request).test(signal)
+      const model = await new JevJudge(key, route, this.#request).test(signal)
       connection = { state: 'connected', at, model }
     } catch (error) {
       const reason = timeout.aborted ? 'timeout' : error instanceof JevFailure ? error.reason : 'unavailable'
@@ -97,7 +108,7 @@ export class JevConfiguration {
     } finally {
       this.#probing = false
     }
-    if (!configuration.aborted && this.#key) {
+    if (!configuration.aborted && key) {
       this.#store.transaction(() => this.#store.put(namespace, connectionId, connection))
     }
     return this.status()
@@ -126,8 +137,8 @@ export class JevConfiguration {
       policy: (point: DecisionPoint, taskId: string) => {
         const mode = this.#settings.enabled ? this.#settings.modes[point] : 'off'
         if (mode === 'off') return { mode }
-        const key = this.#key
-        const model = this.#settings.model
+        const route = this.#settings
+        const key = this.#keys.get(route.endpoint)
         let pointController = this.#pointControllers.get(point)
         if (!pointController) {
           pointController = new AbortController()
@@ -140,7 +151,7 @@ export class JevConfiguration {
               if (!key) throw new JevFailure('missing_key')
               if (input.allowed.length < 2) throw new JevFailure('no_choice')
               this.#reserve(taskId)
-              return await new JevJudge(key, model, this.#request).evaluate(input, signal)
+              return await new JevJudge(key, route, this.#request).evaluate(input, signal)
             } catch (error) {
               const reason = error instanceof JevFailure ? error.reason : 'unavailable'
               if (!signal.aborted) this.#backoff(reason)
@@ -151,6 +162,7 @@ export class JevConfiguration {
         return { mode, judge, signal: AbortSignal.any([this.#generation.signal, pointController.signal]), allowScopedEvidence: Boolean(key) }
       },
       observe: (point, status) => {
+        if (status.reason === 'configuration_changed') return
         this.#store.put(namespace, point, status)
         const { at, reason, model } = status
         if (model && (!reason || reason === 'uncertain')) {

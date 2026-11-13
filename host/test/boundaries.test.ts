@@ -3,7 +3,7 @@ import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 
 const dependencies: Record<string, string[]> = {
-  cli: ['contracts/desktop', 'conversation', 'execution', 'fake', 'faux', 'host', 'pi', 'shared/diagnostics', 'shared/loopback-http', 'shared/management', 'management', 'model-management', 'telemetry-http'],
+  cli: ['contracts/desktop', 'conversation', 'execution', 'fake', 'faux', 'host', 'pi', 'shared/diagnostics', 'shared/loopback-http', 'shared/management', 'shared/jev', 'management', 'model-management', 'telemetry-http'],
   host: ['contracts/domain', 'contracts/desktop', 'conversation', 'execution', 'orchestrator', 'policies', 'store', 'task-engine', 'workspace', 'diagnostics', 'shared/diagnostics', 'judgment', 'memory', 'model-scheduler', 'verification', 'tool-approval', 'shared/tool-approval', 'artifact-tools', 'browser-tools', 'preview-tools', 'file-tools', 'git-tools', 'process-tools', 'web-tools', 'management', 'reconciliation', 'shared/chatgpt', 'shared/management', 'telemetry-projection', 'shared/jev', 'jev-settings'],
   'telemetry-http': ['host', 'contracts/domain', 'shared/loopback-http', 'telemetry-evidence', 'telemetry-projection'],
   'telemetry-evidence': ['shared/observatory', 'task-engine', 'telemetry-projection', 'workspace', 'workspace-process'],

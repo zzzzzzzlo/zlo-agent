@@ -1,7 +1,7 @@
 import type { EndReason, ModelCatalogEntry, ModelRoute, TaskStatus, VerificationResult, WorkspaceAccess } from './domain.ts'
 import type { ConversationSummary, UsageTotals } from './desktop.ts'
 import type { ChatGptSession } from './chatgpt.ts'
-import type { JevSettings, JevStatus } from './jev.ts'
+import type { JevSettings, JevStatus, JudgeCredentials } from './jev.ts'
 
 export type ProviderId = 'deepseek' | 'openai' | 'anthropic' | 'google'
 export type ManagedModel = ModelCatalogEntry
@@ -140,8 +140,9 @@ export type ManagementCommand =
 
 /** Private transport between Electron Main and its own Host child. Never exposed in Preload. */
 export type PrivateCredentialCommand =
-  | ManagementRequest<'initializeProviderKeys', { credentials: Partial<Record<ProviderId, string | null>>; chatGpt?: ChatGptSession | null; jevKey?: string | null }>
-  | ManagementRequest<'applyJevKey', { key: string | null }>
+  | ManagementRequest<'initializeProviderKeys', { credentials: Partial<Record<ProviderId, string | null>>; chatGpt?: ChatGptSession | null;
+    jevKey?: string | null; judgeKeys?: JudgeCredentials }>
+  | ManagementRequest<'applyJevKey', { endpoint: string; key: string | null }>
   | ManagementRequest<'validateProviderKey', { provider: ProviderId; key: string }>
   | ManagementRequest<'applyProviderKey', { provider: ProviderId; key?: string | null }>
   | ManagementRequest<'applyChatGptSession', { session: ChatGptSession | null; quiesce: boolean }>

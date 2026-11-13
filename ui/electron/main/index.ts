@@ -42,7 +42,7 @@ const host = new HostProcessManager({
   async initialize() {
     return { schemaVersion: 1, type: 'initializeProviderKeys',
       credentials: hostMode === 'pi' ? await credentials.load() : {}, chatGpt: await chatGpt?.loadSession(),
-      jevKey: await jevCredentials.load().catch(() => null) }
+      judgeKeys: await jevCredentials.load().catch(() => ({})) }
   },
   spawnChild() {
     mkdirSync(defaultWorkspace, { recursive: true })

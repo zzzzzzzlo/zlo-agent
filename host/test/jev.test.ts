@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { jevEndpoint, judgmentPoints, parseJevSettings } from '../../shared/contracts/jev.ts'
+import { jevEndpoint, judgmentPoints, openCodeFreeJudgeModel, openCodeJudgeEndpoint, parseJevSettings, parseJudgeCredentials } from '../../shared/contracts/jev.ts'
 import type { JevStatus } from '../../shared/contracts/jev.ts'
 import { JevConfiguration } from '../src/jev-settings.ts'
 import { LocalJudgment } from '../src/judgment.ts'
@@ -16,6 +16,46 @@ const valid = (p = 0.01) => Response.json({
   usage: { input_tokens: 100, output_tokens: 5 },
 })
 const point = 'delegation.worth'
+
+test('System One routes keep credentials bound to the exact endpoint and preserve old TypeSafe settings', async () => {
+  const requests: { url: unknown; auth: string | null; model: string }[] = []
+  const { store, settings, decide, last } = fixture(async (url, init) => {
+    requests.push({ url, auth: new Headers(init?.headers).get('authorization'), model: JSON.parse(String(init?.body)).model })
+    return valid()
+  })
+  try {
+    const { settings: original } = settings.status()
+    const { provider, endpoint, ...legacy } = original
+    assert.deepEqual(parseJevSettings(legacy, true), original)
+    const openCode = { ...original, enabled: true, provider: 'opencode' as const, endpoint: openCodeJudgeEndpoint,
+      model: openCodeFreeJudgeModel, modes: { ...original.modes, [point]: 'shadow' as const } }
+    const custom = { ...openCode, provider: 'custom' as const, endpoint: 'https://example.com/v1/systemone', model: 'vendor/decision-2' }
+    assert.ok(!parseJevSettings({ ...openCode, endpoint: custom.endpoint }))
+    assert.ok(!parseJevSettings({ ...custom, endpoint: 'https://example.com/v1/systemone?token=secret' }))
+    assert.ok(!parseJevSettings({ ...custom, endpoint: 'http://example.com/v1/systemone' }))
+    assert.ok(parseJevSettings({ ...custom, endpoint: 'http://127.0.0.1:8700/v1/systemone' }))
+    assert.equal(parseJudgeCredentials({ [custom.endpoint]: 'oc_sk_synthetic' }), undefined)
+    settings.save(openCode)
+    assert.equal(await decide(), true)
+    assert.equal(last().fallbackReason, 'missing_key')
+    assert.deepEqual(requests, [])
+    settings.setKey('oc_sk_synthetic')
+    assert.equal(await decide(), true)
+    assert.equal((last().usage as Record<string, unknown>).estimatedCostUsd, 0)
+    settings.save(custom)
+    assert.equal(settings.status().credential, 'missing')
+    settings.setKey('custom-synthetic')
+    assert.equal(await decide(), true)
+    assert.equal((last().usage as Record<string, unknown>).estimatedCostUsd, undefined)
+    settings.save(original)
+    await settings.test()
+    assert.deepEqual(requests, [
+      { url: openCodeJudgeEndpoint, auth: 'Bearer oc_sk_synthetic', model: openCodeFreeJudgeModel },
+      { url: custom.endpoint, auth: 'Bearer custom-synthetic', model: custom.model },
+      { url: jevEndpoint, auth: 'Bearer ' + key, model: original.model },
+    ])
+  } finally { store.close() }
+})
 
 function fixture(request: typeof fetch, options: Partial<JudgmentOptions> = {}) {
   const store = new LocalStore(':memory:')
@@ -36,7 +76,7 @@ test('Jev defaults off, validates settings, records Shadow and applies only allo
     assert.equal(init?.redirect, 'error')
     assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer ' + key)
     const { state } = JSON.parse(String(init?.body))
-    for (const marker of [key, 'sk-testing-0123456789', 'secret-cookie', 'private-file']) {
+    for (const marker of [key, 'sk-testing-0123456789', 'oc_sk_other_redaction_test', 'secret-cookie', 'private-file']) {
       assert.ok(!JSON.stringify(state).includes(marker))
     }
     return valid()
@@ -55,7 +95,7 @@ test('Jev defaults off, validates settings, records Shadow and applies only allo
     assert.equal(calls, 0)
     current.modes[point] = 'shadow'
     settings.save(current)
-    const sensitive = { goal: 'Check ' + key + '\nAuthorization: Bearer sk-testing-0123456789\nCookie: secret-cookie\nfix SVG',
+    const sensitive = { goal: 'Check ' + key + ' oc_sk_other_redaction_test\nAuthorization: Bearer sk-testing-0123456789\nCookie: secret-cookie\nfix SVG',
       contents: 'private-file' }
     assert.equal(await decide(sensitive), true)
     assert.equal(last().shadow, false)
