@@ -61,6 +61,7 @@ test('exact multi-file patches preflight every file and preserve a concurrent ed
   ] }
   assert.deepEqual(await run('apply_patch', invalid), {
     ok: false, error: 'Patch edit 2: oldText not found. Read the current file and retry with exact text.',
+    edit: 2, code: 'text_not_found',
   })
   assert.equal(await readFile(one, 'utf8'), 'old one')
   const valid = { edits: invalid.edits.map(edit => ({ ...edit, oldText: 'old' })) }
@@ -98,6 +99,7 @@ test('one patch applies four disjoint edits in the same HTML file against the or
   const invalid = edits.map((edit, index) => index === 1 ? { ...edit, oldText: '    <!-- far arm -->\r\n' } : edit)
   assert.deepEqual(await run('apply_patch', { edits: invalid }), {
     ok: false, error: 'Patch edit 2: oldText not found. Read the current file and retry with exact text.',
+    edit: 2, code: 'text_not_found',
   })
   assert.equal(await readFile(file, 'utf8'), original)
   assert.deepEqual(tools.find(tool => tool.name === 'apply_patch')?.policy?.targets?.({ edits }), [path])
@@ -115,6 +117,7 @@ test('a patch rejects overlapping or ambiguous matches without writing earlier e
   const earlier = { path, oldText: 'last:done', newText: 'last:changed' }
   assert.deepEqual(await run('apply_patch', { edits: [earlier, { path, oldText: 'abc', newText: 'changed' }] }), {
     ok: false, error: 'Patch edit 2: oldText matches more than once. Include enough context to identify one occurrence.',
+    edit: 2, code: 'ambiguous_match', matchLines: [1, 2],
   })
   assert.equal(await readFile(file, 'utf8'), original)
   assert.deepEqual(await run('apply_patch', { edits: [earlier,
@@ -124,6 +127,7 @@ test('a patch rejects overlapping or ambiguous matches without writing earlier e
   assert.equal(await readFile(file, 'utf8'), original)
   assert.deepEqual(await run('apply_patch', { edits: [earlier, { path, oldText: 'last:changed', newText: 'last:again' }] }), {
     ok: false, error: 'Patch edit 2: oldText not found. Read the current file and retry with exact text.',
+    edit: 2, code: 'text_not_found',
   })
   assert.equal(await readFile(file, 'utf8'), original)
 })

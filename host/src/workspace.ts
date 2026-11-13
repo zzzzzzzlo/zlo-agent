@@ -61,6 +61,7 @@ export function workspaceTarget(input: unknown): string | undefined {
 }
 
 const maxBytes = 128 * 1024
+const maxReadLines = 200
 const maxPathLength = 512
 const maxEntries = 200
 const maxScannedEntries = 1000
@@ -75,6 +76,25 @@ const scriptExtensions = /\.(?:[cm]?[jt]s)$/iu
 const activeWrites = new Set<string>()
 
 class WorkspaceDenied extends Error {}
+
+function lineAt(text: string, offset: number): number {
+  return (text.slice(0, offset).match(/\r\n|\n|\r/gu)?.length ?? 0) + 1
+}
+
+/** Locate a line window for a retry without returning file contents from a write tool. */
+export function editRecovery(text: string, oldText: string, firstMatch: number) {
+  if (firstMatch >= 0) {
+    const secondMatch = text.indexOf(oldText, firstMatch + 1)
+    return { code: 'ambiguous_match' as const, matchLines: [lineAt(text, firstMatch), lineAt(text, secondMatch)] }
+  }
+  const lines = oldText.split(/\r\n|\n|\r/u).map(line => line.trim())
+  if (!lines.some(Boolean) || lines.length > maxReadLines) return { code: 'text_not_found' as const }
+  const normalized = '\n' + text.split(/\r\n|\n|\r/u).map(line => line.trim()).join('\n') + '\n'
+  const target = '\n' + lines.join('\n') + '\n'
+  const match = normalized.indexOf(target)
+  if (match < 0 || normalized.indexOf(target, match + 1) >= 0) return { code: 'text_not_found' as const }
+  return { code: 'text_not_found' as const, readRange: { startLine: lineAt(normalized, match), lineCount: lines.length } }
+}
 
 function allowedSegment(name: string): boolean {
   return name.length > 0 && !name.startsWith('.') && !/[ .]$/u.test(name) &&
@@ -190,18 +210,31 @@ export class CodingWorkspace implements Verifier {
     const readTools = [
       this.#tool('list_directory', 'List allowed entries in one directory. Use "." for the workspace root.',
         'read', { path: pathProperty }, (args, signal) => this.#list(args.path, signal)),
-      this.#tool('read_text_file', 'Read a workspace text file up to 128 KiB.',
-        'read', { path: pathProperty }, async (args, signal) => {
+      this.#tool('read_text_file', 'Read a workspace text file up to 128 KiB. Pass startLine and lineCount for a bounded excerpt with the original whitespace.',
+        'read', { path: pathProperty, startLine: { type: 'integer', minimum: 1, maximum: maxBytes + 1 },
+          lineCount: { type: 'integer', minimum: 1, maximum: maxReadLines } }, async (args, signal) => {
+          const startLine = args.startLine === undefined ? 1 : args.startLine
+          const lineCount = args.lineCount === undefined ? maxReadLines : args.lineCount
+          if (typeof startLine !== 'number' || !Number.isSafeInteger(startLine) || startLine < 1 || startLine > maxBytes + 1 ||
+            typeof lineCount !== 'number' || !Number.isSafeInteger(lineCount) || lineCount < 1 || lineCount > maxReadLines) {
+            return { ok: false, error: 'Invalid line range' }
+          }
           const { text } = await this.#read(segments(args.path), signal)
-          return { ok: true, text }
-        }),
+          if (args.startLine === undefined && args.lineCount === undefined) return { ok: true, text }
+          const starts = [0, ...Array.from(text.matchAll(/\r\n|\n|\r/gu), match => match.index + match[0].length)]
+          if (starts.at(-1) === text.length && text.length > 0) starts.pop()
+          const first = startLine - 1
+          if (first >= starts.length) return { ok: false, error: 'Start line is past the end of the file', totalLines: starts.length }
+          const endLine = Math.min(first + lineCount, starts.length)
+          return { ok: true, text: text.slice(starts[first], starts[endLine] ?? text.length), startLine, endLine, totalLines: starts.length }
+        }, ['startLine', 'lineCount']),
     ]
     if (access === 'read') return readTools
     const writeTools = [
       ...readTools,
       this.#tool('create_text_file', 'Create a new workspace text file in an existing directory.',
         'write', { path: pathProperty, content: textProperty }, (args, signal) => this.#create(args, signal)),
-      this.#tool('edit_text_file', 'Replace exactly one literal occurrence of oldText in a workspace text file.',
+      this.#tool('edit_text_file', 'Replace exactly one literal occurrence of oldText, including whitespace. On a mismatch, use the returned readRange to reread the current file when available.',
         'write', { path: pathProperty, oldText: textProperty, newText: textProperty },
         (args, signal) => this.#edit(args, signal)),
       this.#tool('create_directory', 'Create one new workspace directory under an existing directory.',
@@ -476,7 +509,8 @@ export class CodingWorkspace implements Verifier {
     const { path, text, stat } = await this.#read(parts, signal)
     const start = text.indexOf(oldText)
     if (start < 0 || text.indexOf(oldText, start + 1) >= 0) {
-      throw new WorkspaceDenied('oldText must match exactly once')
+      return { ok: false, error: start < 0 ? 'oldText not found. Read the current file and retry with exact text.'
+        : 'oldText matches more than once. Include enough context to identify one occurrence.', ...editRecovery(text, oldText, start) }
     }
     const content = textValue(text.slice(0, start) + newText + text.slice(start + oldText.length))
     if (content === text) return { ok: true, changed: false }

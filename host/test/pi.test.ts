@@ -8,6 +8,7 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from '@earendil-work
 import { ModelRuntime } from '@earendil-works/pi-coding-agent'
 import { PiExecution } from '../src/pi.ts'
 import { ModelUnavailableError, type ExecutionConfig, type RuntimeEvent } from '../src/execution.ts'
+import { LocalAgentHost } from '../src/host.ts'
 
 const firstRoute = { provider: 'faux', model: 'test-a' }
 const nextRoute = { provider: 'faux', model: 'test-b' }
@@ -114,6 +115,66 @@ test('Pi executes an allowlisted tool, streams output and restores its transcrip
   assert.ok(events.some(event => event.type === 'model.route_changed' && event.route.model === nextRoute.model))
   const restored = await execution.open({ ...config, session: session.ref, route: undefined })
   try { assert.deepEqual(restored.route, nextRoute) } finally { await restored.dispose() }
+})
+
+test('a failed patch guides Pi to reread the exact workspace lines and retry without partial writes', async t => {
+  const { execution, config, faux } = await fixture(t)
+  const cwd = join(config.cwd, 'workspace')
+  const path = 'bike.html'
+  const exact = '      <!-- far arm -->\r\n      <path/>\r\n'
+  const original = '<svg>\r\n' + exact + '</svg>\r\n'
+  await mkdir(cwd)
+  await writeFile(join(cwd, path), original)
+  const replacement = '      <path id="far-arm"/>\r\n'
+  const call = (name: string, args: Parameters<typeof fauxToolCall>[1], id: string) =>
+    fauxAssistantMessage(fauxToolCall(name, args, { id }), { stopReason: 'toolUse' })
+  const firstEdit = { path, oldText: '<svg>', newText: '<svg viewBox="0 0 640 360">' }
+  const failures: unknown[] = []
+  const recoverySteps: string[] = []
+  faux.setResponses([
+    call('apply_patch', { edits: [firstEdit, { path, oldText: '        <!-- far arm -->\n      <path/>', newText: replacement }] }, 'wrong-indent'),
+    async context => {
+      try {
+        const result = context.messages.findLast(message => message.role === 'toolResult')
+        assert.equal(result?.toolCallId, 'wrong-indent')
+        assert.equal(result?.isError, true)
+        const content = result?.content.find(block => block.type === 'text')?.text
+        assert.ok(content)
+        const failure = JSON.parse(content)
+        assert.equal(failure.edit, 2)
+        assert.deepEqual(failure.readRange, { startLine: 2, lineCount: 2 })
+        assert.equal(await readFile(join(cwd, path), 'utf8'), original)
+        recoverySteps.push('failed patch')
+        return call('read_text_file', { path, ...failure.readRange }, 'reread-lines')
+      } catch (error) { failures.push(error); return fauxAssistantMessage('Patch recovery failed.') }
+    },
+    context => {
+      try {
+        const result = context.messages.findLast(message => message.role === 'toolResult')
+        assert.equal(result?.toolCallId, 'reread-lines')
+        const content = result?.content.find(block => block.type === 'text')?.text
+        assert.ok(content)
+        const excerpt = JSON.parse(content)
+        assert.equal(excerpt.text, exact)
+        recoverySteps.push('exact reread')
+        return call('apply_patch', { edits: [firstEdit, { path, oldText: excerpt.text, newText: replacement }] }, 'correct-patch')
+      } catch (error) { failures.push(error); return fauxAssistantMessage('Patch recovery failed.') }
+    },
+    fauxAssistantMessage('Both SVG edits were applied.'),
+  ])
+  const host = new LocalAgentHost({ directory: join(config.cwd, 'state'), execution })
+  try {
+    const { taskId } = await host.createTask({ requestId: 'patch-recovery', goal: 'Update the SVG arm and viewBox.', cwd,
+      route: firstRoute, workspaceAccess: 'write', check: { path, contains: replacement } })
+    await host.idle()
+    assert.deepEqual(failures, [])
+    assert.deepEqual(recoverySteps, ['failed patch', 'exact reread'])
+    assert.equal(host.getTask(taskId).verification?.verdict, 'verified')
+    assert.equal(await readFile(join(cwd, path), 'utf8'), firstEdit.newText + '\r\n' + replacement + '</svg>\r\n')
+    assert.deepEqual(host.events(taskId).filter(event => event.type === 'tool.finished').map(event => [event.payload.tool, event.payload.status]), [
+      ['apply_patch', 'failed'], ['read_text_file', 'succeeded'], ['apply_patch', 'succeeded'],
+    ])
+  } finally { await host.close() }
 })
 
 test('Pi assembles trusted instructions and skill descriptions, then reads only an available skill', async t => {

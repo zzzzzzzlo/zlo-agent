@@ -50,13 +50,40 @@ test('write denial preserves existing files and concurrent writes are serialized
   const results = await Promise.all([create({ path, content: 'x x' }), create({ path, content: 'second' })])
   assert.deepEqual(results, [{ ok: true }, { ok: false, error: 'Another workspace write is active' }])
   assert.deepEqual(await create({ path, content: 'second' }), { ok: false, error: 'Workspace entry already exists' })
-  assert.deepEqual(await edit({ path, oldText: 'x', newText: 'changed' }), { ok: false, error: 'oldText must match exactly once' })
+  assert.deepEqual(await edit({ path, oldText: 'x', newText: 'changed' }), {
+    ok: false, error: 'oldText matches more than once. Include enough context to identify one occurrence.',
+    code: 'ambiguous_match', matchLines: [1, 1],
+  })
   const controller = new AbortController()
   controller.abort()
   assert.deepEqual(await edit({ path, oldText: 'x x', newText: '' }, controller.signal), {
     ok: false, error: 'Tool interrupted before execution',
   })
   assert.equal(await readFile(join(root, path), 'utf8'), 'x x')
+})
+
+test('edit recovery points to a unique line range and a scoped read preserves exact whitespace', async (t) => {
+  const { root, workspace } = await fixture(t)
+  const path = 'bike.html'
+  const exact = '      <!-- far arm -->\r\n      <path/>\r\n'
+  const original = '<svg>\r\n' + exact + '</svg>\r\n'
+  await writeFile(join(root, path), original)
+  const edit = tool(workspace, 'edit_text_file')
+  const read = tool(workspace, 'read_text_file', 'worker')
+  assert.deepEqual(await edit({ path, oldText: '        <!-- far arm -->\n      <path/>', newText: '<g/>' }), {
+    ok: false, error: 'oldText not found. Read the current file and retry with exact text.',
+    code: 'text_not_found', readRange: { startLine: 2, lineCount: 2 },
+  })
+  assert.equal(await readFile(join(root, path), 'utf8'), original)
+  assert.deepEqual(await read({ path, startLine: 2, lineCount: 2 }), {
+    ok: true, text: exact, startLine: 2, endLine: 3, totalLines: 4,
+  })
+  assert.deepEqual(await read({ path, startLine: 5 }), { ok: false, error: 'Start line is past the end of the file', totalLines: 4 })
+  assert.deepEqual(await read({ path, lineCount: 201 }), { ok: false, error: 'Invalid line range' })
+  await writeFile(join(root, path), original + exact)
+  assert.deepEqual(await edit({ path, oldText: '        <!-- far arm -->', newText: '<g/>' }), {
+    ok: false, error: 'oldText not found. Read the current file and retry with exact text.', code: 'text_not_found',
+  })
 })
 
 test('policy rejects traversal, Windows special paths, hidden metadata and credentials', async (t) => {

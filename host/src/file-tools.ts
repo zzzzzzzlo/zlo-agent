@@ -4,7 +4,7 @@ import { link, lstat, open, opendir, rename, unlink } from 'node:fs/promises'
 import { dirname, join, matchesGlob } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { redactProcessOutput } from './workspace-process.ts'
-import { workspaceTarget } from './workspace.ts'
+import { editRecovery, workspaceTarget } from './workspace.ts'
 import type { CodingWorkspace, WorkspaceTool } from './workspace.ts'
 
 const maxFiles = 100
@@ -171,9 +171,11 @@ async function patchFiles(workspace: CodingWorkspace, input: unknown, signal?: A
     const matched: { index: number; start: number; end: number; newText: string }[] = []
     for (const { index, oldText, newText } of edits) {
       const start = current.text.indexOf(oldText)
-      if (start < 0) return rejected(`Patch edit ${index}: oldText not found. Read the current file and retry with exact text.`)
+      if (start < 0) return { ...rejected(`Patch edit ${index}: oldText not found. Read the current file and retry with exact text.`),
+        edit: index, ...editRecovery(current.text, oldText, start) }
       if (current.text.indexOf(oldText, start + 1) >= 0) {
-        return rejected(`Patch edit ${index}: oldText matches more than once. Include enough context to identify one occurrence.`)
+        return { ...rejected(`Patch edit ${index}: oldText matches more than once. Include enough context to identify one occurrence.`),
+          edit: index, ...editRecovery(current.text, oldText, start) }
       }
       matched.push({ index, start, end: start + oldText.length, newText })
     }
@@ -322,7 +324,7 @@ export function createFileTools(workspace: CodingWorkspace): WorkspaceTool[] {
           ...match, path: redactProcessOutput(match.path), text: redactProcessOutput(match.text).slice(0, 512),
         })) }
       }, searchTargets),
-    tool('apply_patch', 'Replace exact text in one or more files. Repeat a path to edit several locations in the same file. Each oldText must match once in the original file, including whitespace, and edits must not overlap. All edits are checked before any target is changed.', 'write',
+    tool('apply_patch', 'Replace exact text in one or more files. Repeat a path to edit several locations in the same file. Each oldText must match once in the original file, including whitespace, and edits must not overlap. All edits are checked before any target is changed. On a mismatch, use the edit number and any readRange to reread the current file before retrying.', 'write',
       { edits: { type: 'array', minItems: 1, maxItems: maxPatchEdits, items: { type: 'object', additionalProperties: false,
         properties: { path: pathSchema, oldText: textSchema, newText: textSchema }, required: ['path', 'oldText', 'newText'] } } },
       ['edits'], (input, signal) => patchFiles(workspace, input.edits, signal),
