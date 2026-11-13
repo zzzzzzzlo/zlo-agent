@@ -59,7 +59,9 @@ test('exact multi-file patches preflight every file and preserve a concurrent ed
     { path: 'one.txt', oldText: 'old', newText: 'new' },
     { path: 'two.txt', oldText: 'absent', newText: 'new' },
   ] }
-  assert.deepEqual(await run('apply_patch', invalid), { ok: false, error: 'Patch text must match exactly once in every file' })
+  assert.deepEqual(await run('apply_patch', invalid), {
+    ok: false, error: 'Patch edit 2: oldText not found. Read the current file and retry with exact text.',
+  })
   assert.equal(await readFile(one, 'utf8'), 'old one')
   const valid = { edits: invalid.edits.map(edit => ({ ...edit, oldText: 'old' })) }
   assert.deepEqual(await run('apply_patch', valid), { ok: true, changed: ['one.txt', 'two.txt'] })
@@ -79,6 +81,51 @@ test('exact multi-file patches preflight every file and preserve a concurrent ed
   await assert.rejects(patch.execute('race', valid), /partially applied/u)
   assert.equal(await readFile(one, 'utf8'), 'new one')
   assert.equal(await readFile(two, 'utf8'), 'user edit')
+})
+
+test('one patch applies four disjoint edits in the same HTML file against the original snapshot', async context => {
+  const { root, run, tools } = await fixture(context)
+  const path = 'bike.html'
+  const file = join(root, path)
+  const original = '<svg>\r\n  <!-- far arm -->\r\n  <path id="near-arm"/>\r\n  <g id="mouth"/>\r\n  <g id="head"/>\r\n</svg>\r\n'
+  await writeFile(file, original)
+  const edits = [
+    { path, oldText: 'id="head"', newText: 'id="head" transform="translate(0 -28)"' },
+    { path, oldText: '  <!-- far arm -->\r\n', newText: '  <path id="far-arm"/>\r\n' },
+    { path, oldText: '<path id="near-arm"/>', newText: '<path id="near-arm" stroke="green"/>' },
+    { path, oldText: '<g id="mouth"/>', newText: '<g id="mouth" fill="red"/>' },
+  ]
+  const invalid = edits.map((edit, index) => index === 1 ? { ...edit, oldText: '    <!-- far arm -->\r\n' } : edit)
+  assert.deepEqual(await run('apply_patch', { edits: invalid }), {
+    ok: false, error: 'Patch edit 2: oldText not found. Read the current file and retry with exact text.',
+  })
+  assert.equal(await readFile(file, 'utf8'), original)
+  assert.deepEqual(tools.find(tool => tool.name === 'apply_patch')?.policy?.targets?.({ edits }), [path])
+  assert.deepEqual(await run('apply_patch', { edits }), { ok: true, changed: [path] })
+  assert.equal(await readFile(file, 'utf8'), '<svg>\r\n  <path id="far-arm"/>\r\n  <path id="near-arm" stroke="green"/>\r\n' +
+    '  <g id="mouth" fill="red"/>\r\n  <g id="head" transform="translate(0 -28)"/>\r\n</svg>\r\n')
+})
+
+test('a patch rejects overlapping or ambiguous matches without writing earlier edits', async context => {
+  const { root, run } = await fixture(context)
+  const path = 'segments.txt'
+  const original = 'first:abc\nsecond:abc\nlast:done'
+  const file = join(root, path)
+  await writeFile(file, original)
+  const earlier = { path, oldText: 'last:done', newText: 'last:changed' }
+  assert.deepEqual(await run('apply_patch', { edits: [earlier, { path, oldText: 'abc', newText: 'changed' }] }), {
+    ok: false, error: 'Patch edit 2: oldText matches more than once. Include enough context to identify one occurrence.',
+  })
+  assert.equal(await readFile(file, 'utf8'), original)
+  assert.deepEqual(await run('apply_patch', { edits: [earlier,
+    { path, oldText: 'first:abc', newText: 'first:changed' },
+    { path, oldText: ':abc\nsecond', newText: ':changed\nsecond' },
+  ] }), { ok: false, error: 'Patch edits 2 and 3 overlap. Merge them into one edit.' })
+  assert.equal(await readFile(file, 'utf8'), original)
+  assert.deepEqual(await run('apply_patch', { edits: [earlier, { path, oldText: 'last:changed', newText: 'last:again' }] }), {
+    ok: false, error: 'Patch edit 2: oldText not found. Read the current file and retry with exact text.',
+  })
+  assert.equal(await readFile(file, 'utf8'), original)
 })
 
 test('move, rename and delete affect only checked regular files and never overwrite', async context => {

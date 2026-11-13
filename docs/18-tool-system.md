@@ -51,7 +51,7 @@ Host 冷启动握手限时 45 秒，以容纳 Windows 初次加载 SDK 与工具
 | `process_output` | `processId`、可选 `after` 与 `limit` |
 | `search_files` | `path`、`glob` |
 | `search_content` | `path`、`glob`、`query`，可选 `regex` 与 `caseSensitive` |
-| `apply_patch` | `edits: [{path, oldText, newText}]`，最多 16 个现存文件 |
+| `apply_patch` | `edits: [{path, oldText, newText}]`，每次最多 16 段，可对同一个现存文件提交多个互不重叠的片段 |
 | `move_file / rename_file / delete_file` | `path`，移动另加 `destination`，改名另加 `newName` |
 | `git_branch / git_worktree / git_merge` | `branch` |
 | `git_commit` | `paths`、单行 `message`、可选当前 Task 的 `worktreeId` |
@@ -61,3 +61,5 @@ Host 冷启动握手限时 45 秒，以容纳 Windows 初次加载 SDK 与工具
 | `export_artifact` | 工作区相对 `path`。目的地通过原生保存授权单独绑定 |
 
 各参数的完整 JSON Schema 位于插件定义。返回值包含 `ok`，失败带固定错误摘要。进程输出携带有序 Cursor 与截断状态，进程状态保留实际退出码。网页、搜索和浏览器文本标明不可信来源。写操作的未知结果通过持久化回执及 Task 状态表示。
+
+`apply_patch` 在每个文件的原始快照上定位全部片段。`oldText` 须精确匹配一次，包括空白。找不到、匹配多次或片段重叠时，错误指出对应的输入序号，整批在写入前退出。通过预检后，每个文件只替换一次。如果跨文件提交时遇到文件被其他程序修改或 I/O 中断，已开始提交的操作仍按现有回执进入核对流程。批量匹配的设计参考 [Pi Edit](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/src/core/tools/edit.ts)，部分提交处理参考 [DSH Patch](https://github.com/deepseek-ai/deepseek-harness/blob/master/packages/fs/tool-fs/README.md#failures-and-recovery)。
