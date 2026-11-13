@@ -1,6 +1,10 @@
 # Jev 接入
 
-Host 在组装时接收 `judgment: { modes, judge, timeoutMs }`。默认各决策点执行本地规则并记事件。Jev 可以实现 [Judge 接口](../host/src/judgment.ts) 的 `evaluate(request, signal)`，返回 `{ output, usage? }`。调用方传入 schema 版本 1、决策 ID、最小化输入、规则结果、允许选择集和证据引用。Judge 的输出必须在允许集内。
+在桌面「模型与账号 → 判定模型 (Jev)」复制 TypeSafe API Key，点击「添加 API Key」并在系统弹窗中确认。Electron Main 通过系统凭证加密保存密钥，Renderer 仅接收凭证状态。模型 ID 默认为 `jev-latest`，可以填入 [TypeSafe 模型目录](https://docs.typesafe.ai/api/list-models) 返回的 Jev 版本。保存模型后点击「测试连接」，观察状态及服务返回的实际版本。测试只发送合成样例，无需先打开运行开关。
+
+运行设置默认全关。全局启用时确认外发范围，再逐个启用所需判定点。新启用的点使用 Shadow，可切换 Active。点击「保存 Jev 设置」后生效，修改设置或删除密钥会取消旧配置下的进行中判定。设置及最近状态保存在 Host SQLite，密钥位于独立的系统加密文件。Phase 1 固定使用 [TypeSafe 官方 HTTPS Endpoint](https://docs.typesafe.ai/api/system-one)，并拒绝重定向。
+
+Host 复用 [Judge 接口](../host/src/judgment.ts)。调用方传入 schema 版本 1、决策 ID、决策输入、规则结果、允许选择集和证据引用。[Jev Adapter](../host/src/jev-judge.ts) 以白名单提取输入，由 System One 返回带概率的 `noul` 结果。二选一的布尔判定采用 ≥0.80 和 ≤0.20 的边界。候选题按 [MU 的 Judge 设计](https://usemu.dev/en/docs/judges/) 使用同一份状态批量提交，胜出候选须达到 0.80 且领先次名至少 0.15。
 
 | 决策点 | 调用位置 | 规则和可选输出 | 离线特征与关联事件 |
 | --- | --- | --- | --- |
@@ -12,7 +16,12 @@ Host 在组装时接收 `judgment: { modes, judge, timeoutMs }`。默认各决�
 | `task.replan` | Root 的 `replan_task_node` | 针对尚未成功、仍有重规划额度、且从未记录写操作的节点，判断是否接受明确的重规划。输出布尔值。 | 节点状态、是否 Root 子节点、重规划次数、是否存在写入回执。用 `planRequestId` 关联 `task.plan_changed` 和后续节点结算。 |
 
 - `off` 只运行规则。 `shadow` 保留规则结果并记录合法候选输出。 `active` 可采用合法候选。超时、超载、异常和非法输出均使用规则结果。
-- 默认判定限时 1 秒，每个 Kernel 最多四个并发候选判定。适配器须响应 AbortSignal。超时后尚未退出的调用继续占用槽位。
-- `judgment.evaluated` 包含规则输出 `baseline`、实际选择 `output`、允许选择集 `candidates`、影子结果 `shadow`（如有）、结构化 `features` 和 `resultLink`。按 `id + featureSchemaVersion + mode` 分组，通过同一 Task Run 和 Attempt 关联到验收、时长和失败率。缺少对应计划、回执或结算事件时保留结果未知。
-- 事件保留白名单中的数值、布尔值和枚举。模型名称、Provider 和证据引用使用 `sha256:<hex>` 关联标识，离线匹配使用同一 UTF-8 字符串摘要。额外的自定义字符串选择只保留候选位置。目标、提示词、文件内容和认证字段留在所属边界。实验分配和外部模型部署由接入方负责。
-- 工具权限、未知副作用、预算、依赖、并发、跨 Provider 数据限制均由 Host 的确定性检查执行。适配器接收最小证据与候选元数据。外部数据传输应遵守所属部署的授权。
+- 每次 Jev 判定限时 3.5 秒，最多四个并发判定和一个连接测试。每任务最多 32 次请求，跨重启累计。Host 每分钟最多发起 60 次请求（含测试），429 后暂停 15 秒。请求体限制为 12 KiB，响应为 32 KiB。只有一个合法候选时直接使用规则。
+- Jev 可以收到经过裁剪和脱敏的任务或节点目标、交付摘要、成功工具类别和检查结果，以及已获准召回的记忆片段或模型元数据。请求不附会话历史、完整 Prompt、文件内容、工具输出、证据路径字段或认证信息。启用前确认任务内容允许发往 TypeSafe，任务文字中自行嵌入的敏感信息仍可能超出自动脱敏的识别范围。
+- `judgment.evaluated` 包含 `baseline`、实际选择 `output`、合法候选 `candidates`、`judgeOutput`、`disagreement`、`judgeModel`、`fallbackReason`、`requestSent`、`usage` 和 `resultLink`。`shadow` 保留给已有消费者。没有关联的结算事件时，评估结果保持未知。外发片段不写入事件。候选执行模型和证据引用以摘要记录，Jev 返回的版本 ID 单独记录。
+- Observatory 通过 TaskRun、Attempt、AgentRun 和关联回执展示判定。费用使用 [TypeSafe 公示单价](https://help.typesafe.ai/articles/5187202169-how-much-does-jev-cost) 估算，每百万输入 Token 0.042 美元，输出免费。缺少服务端用量时保留未知，费用与执行模型和 Evaluation 分开计量。
+- 工具权限、未知副作用、预算、依赖和执行结果由 Host 的确定性检查约束。Shadow 的建议不会改变执行。Active 可调整合规计划、拒绝委派或交付等，在硬约束不满足时只有规则允许的候选。
+
+## 真实 API 冒烟
+
+准备已有余额的 TypeSafe API Key。在桌面保存密钥后点击「测试连接」，核对状态和实际版本。打开 Shadow 并运行包含 Team 候选、委派、同 Provider 多模型、相关记忆、交付证据及可重规划节点的任务。打开对应 TaskRun 的 Judgment 决策表，核对规则、实际选择、Jev 建议、回退原因和用量。关闭全局后再次运行同类任务，确认只生成规则记录。自动化测试用模拟的 System One 响应验证协议与执行链。

@@ -130,6 +130,19 @@ test('metrics count provider usage and costs once, preserve coverage, and separa
   assert.equal(alternateMetrics.find(metric => metric.id === 'model.cost')?.quality, 'unknown')
 })
 
+test('Judgment usage includes attempted Jev requests and excludes local fallbacks', () => {
+  const { task, events, emit, run } = scenario()
+  emit(245, 'judgment.evaluated', { id: 'context.relevance', mode: 'active', output: 0, baseline: 0,
+    judgeStatus: 'failed', requestSent: false, fallbackReason: 'budget_exhausted' }, run('c'))
+  emit(250, 'judgment.evaluated', { id: 'context.relevance', mode: 'active', output: 0, baseline: 0,
+    judgeStatus: 'timed_out', requestSent: true, fallbackReason: 'timeout' }, run('c'))
+  const metrics = buildMetrics([task], events).domains.judgment
+  const tokens = metrics.find(metric => metric.id === 'judgment.tokens')
+  assert.equal(tokens?.value, 5)
+  assert.equal(tokens?.samples, 1)
+  assert.equal(tokens?.population, 2)
+})
+
 test('time, role and model filters retain span ends and do not attribute root requests to a worker', () => {
   const { task, events } = scenario()
   const metrics = buildMetrics([task], events, now + 250, { from: now + 51, to: now + 70, role: 'worker', provider: 'deepseek', model: 'flash' })

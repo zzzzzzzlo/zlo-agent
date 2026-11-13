@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { verificationVerdict } from '../../shared/contracts/domain.ts'
 import type { VerificationResult } from '../../shared/contracts/domain.ts'
+import { jevModel, jevReasons, judgmentPoints } from '../../shared/contracts/jev.ts'
 import type { TelemetryEvent, TelemetryTask, TelemetryVerification } from '../../shared/contracts/observatory.ts'
 import { approvalKinds } from '../../shared/contracts/tool-approval.ts'
 import type { AgentEvent } from './contracts/domain.ts'
@@ -12,7 +13,7 @@ const reasons = 'user_stop host_shutdown process_interrupted model_error model_i
 const roles = ['root', 'team', 'worker'] as const
 const accessLevels = ['read', 'write', 'trusted'] as const
 const verificationEvidence = 'workspace_text_file_exists workspace_file_contains_expected_text workspace_command_passed project_command_exit_zero project_command_not_authorized project_command_previous_result project_command_effect_unknown workspace_command_not_authorized workspace_write_active verification_interrupted workspace_command_unavailable workspace_command_failed workspace_file_unavailable workspace_file_missing_expected_text node_unknown_effect'.split(' ')
-const points = 'collaboration.mode delegation.worth model.task_fit context.relevance handoff.sufficiency task.replan'.split(' ')
+const points = judgmentPoints.map(({ id }) => id)
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu
 const hashPattern = /^sha256:[0-9a-f]{64}$/u
 
@@ -87,6 +88,8 @@ function judgment(p: Record<string, unknown>) {
     resultLink: { taskRunId: ref(link.taskRunId), taskNodeId: ref(link.taskNodeId), taskAttemptId: ref(link.taskAttemptId),
       agentRunId: ref(link.agentRunId), planRequestId: ref(link.planRequestId), delegationReceiptKey: ref(link.delegationReceiptKey) },
     elapsedMs: num(p.elapsedMs), judgeStatus: oneOf(p.judgeStatus, ['baseline', 'valid', 'invalid', 'failed', 'timed_out', 'busy']),
+    fallbackReason: oneOf(p.fallbackReason, jevReasons), judgeModel: jevModel(p.judgeModel) ? p.judgeModel : undefined,
+    judgeOutput: choice(p.judgeOutput), disagreement: bool(p.disagreement), requestSent: bool(p.requestSent),
     usage: p.usage === undefined ? undefined : { input: num(usage.input), output: num(usage.output), estimatedCostUsd: num(usage.estimatedCostUsd) } }
 }
 

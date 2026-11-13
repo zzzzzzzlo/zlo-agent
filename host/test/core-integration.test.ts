@@ -13,6 +13,8 @@ import { FakeExecution } from '../src/fake.ts'
 import { LocalAgentHost } from '../src/host.ts'
 import { PiExecution } from '../src/pi.ts'
 import { ExtensionRegistry } from '../src/policies.ts'
+import { jevEndpoint, judgmentPoints } from '../../shared/contracts/jev.ts'
+import type { JevStatus } from '../../shared/contracts/jev.ts'
 
 type Call = (name: string, input: unknown) => Promise<unknown>
 type Script = (config: ExecutionConfig, prompt: string, call: Call, signal: AbortSignal) => Promise<string>
@@ -215,6 +217,16 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
   const env = await fixture()
   await writeFile(join(env.workspace, 'private.txt'), 'outside scoped Team')
   let recalled = false
+  const requests: { state: Record<string, unknown>; questions: Record<string, { instructions: string }> }[] = []
+  const jevFetch: typeof fetch = async (url, init) => {
+    assert.equal(url, jevEndpoint)
+    assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer test-jev-secret')
+    const request = JSON.parse(String(init?.body)) as typeof requests[number]
+    requests.push(request)
+    return Response.json({ model: 'jev-1.14.0', usage: { input_tokens: 50, output_tokens: 3 },
+      answers: Object.fromEntries(Object.keys(request.questions).map((id, index) =>
+        [id, { type: 'noul', noul: index === 0 ? 0.98 : 0.02 }])) })
+  }
   const execution = new ScriptExecution(async (config, prompt, call) => {
     if (config.role === 'root') {
       if (prompt.startsWith('Recall report.txt')) {
@@ -222,7 +234,7 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
         return 'Recalled project evidence'
       }
       const result = await call('propose_task_plan', { nodes: [
-        { ref: 'create', role: 'team', teamKey: 'docs', scopePath: 'src', access: 'write',
+        { ref: 'create', teamKey: 'docs', scopePath: 'src', access: 'write',
           goal: 'Create report.txt', check: { path: 'src/report.txt', contains: 'first' } },
         { ref: 'edit', role: 'team', teamKey: 'docs', scopePath: 'src', access: 'write',
           goal: 'Edit report.txt', check: { path: 'src/report.txt', contains: 'second' }, dependencies: ['create'] },
@@ -247,8 +259,13 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
     if (!prompt.startsWith('Try without evidence')) assert.ok(ok(await call('read_text_file', { path: 'src/report.txt' })))
     return 'Worker report'
   })
-  let host = new LocalAgentHost({ ...env, execution })
+  let host = new LocalAgentHost({ ...env, execution, jevFetch, jevKey: 'test-jev-secret' })
   try {
+    const { settings } = await host.managementCommand({ schemaVersion: 1, type: 'getJevStatus' }) as JevStatus
+    assert.equal(settings.enabled, false)
+    assert.ok(Object.values(settings.modes).every(mode => mode === 'off'))
+    for (const { id } of judgmentPoints) settings.modes[id] = 'shadow'
+    await host.managementCommand({ schemaVersion: 1, type: 'saveJevSettings', settings: { ...settings, enabled: true } })
     const conversation = host.createConversation({ requestId: 'new-core', workspace: env.workspace })
     assert.equal(conversation.workspaceAccess, 'write')
     const { taskId } = await host.sendMessage({ requestId: 'core-plan', conversationId: conversation.id, text: 'Execute project plan' })
@@ -288,12 +305,22 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
     assert.equal(host.getConversationHistory({ conversationId: conversation.id }).turns[0].nodes?.length, 4)
     assert.ok(events.some(item => item.type === 'memory.captured'))
     await host.close()
-    host = new LocalAgentHost({ ...env, execution })
+    host = new LocalAgentHost({ ...env, execution, jevFetch, jevKey: 'test-jev-secret' })
     const next = await host.sendMessage({ requestId: 'recall', conversationId: conversation.id, text: 'Recall report.txt' })
     await host.idle()
     assert.equal(host.getTask(next.taskId).status, 'succeeded')
     assert.ok(recalled)
     assert.ok(host.events(next.taskId).some(item => item.type === 'memory.recalled' && Number(item.payload.count) > 0))
+    const realJudgments = [...events, ...host.events(next.taskId)]
+      .filter(item => item.type === 'judgment.evaluated' && item.payload.judgeModel === 'jev-1.14.0')
+    assert.deepEqual(new Set(realJudgments.map(item => item.payload.id)), new Set(judgmentPoints.map(({ id }) => id)))
+    assert.ok(realJudgments.every(({ payload }) => payload.baseline === payload.output))
+    assert.ok(realJudgments.some(({ payload }) => payload.disagreement === true))
+    assert.ok(requests.some(({ state }) => state.goal === 'Create report.txt' && state.parentGoal === 'Execute project plan'))
+    assert.ok(requests.some(({ state }) => Array.isArray(state.options) && state.options.some(option => option.memory?.includes('report.txt'))))
+    assert.ok(requests.some(({ state }) => state.summary === 'Verified Team artifact' && Array.isArray(state.successfulTools)))
+    assert.ok(requests.some(({ state }) => state.proposedGoal === 'Read verified report.txt'))
+    assert.ok(!JSON.stringify(realJudgments).includes('Create report.txt'))
   } finally {
     await host.close()
     await rm(env.path, { recursive: true, force: true })

@@ -189,11 +189,13 @@ function attempts(trace) {
 
 function judgmentTrail(trace) {
   const events = new Map(trace.events.map(event => [event.id, event]))
-  return table(['决策点', '模式', '规则基线', '实际选择', 'Shadow', '关联结果'], (trace.judgments ?? []).map(item => {
+  return table(['决策点', '模式', '规则基线', '实际选择', 'Judge 结果', '模型', '耗时', '回退原因', '关联结果'], (trace.judgments ?? []).map(item => {
     const payload = events.get(item.eventId)?.payload ?? {}
+    const judge = payload.judgeOutput ?? payload.shadow
     return [link(item.point ?? '未知决策点', 'traces', { task: trace.task.id, event: item.eventId }),
       payload.mode, payload.baseline == null ? null : JSON.stringify(payload.baseline),
-      payload.output == null ? null : JSON.stringify(payload.output), payload.shadow == null ? null : JSON.stringify(payload.shadow),
+      payload.output == null ? null : JSON.stringify(payload.output), judge == null ? null : JSON.stringify(judge),
+      payload.judgeModel, typeof payload.elapsedMs === 'number' ? payload.elapsedMs + ' ms' : null, payload.fallbackReason,
       el('div', { className: 'inline-actions' }, (item.linkedEventIds ?? []).map(id =>
         link(eventLabels[events.get(id)?.type] ?? shortId(id), 'traces', { task: trace.task.id, event: id }))),
     ]

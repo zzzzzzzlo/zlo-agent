@@ -1,15 +1,9 @@
 import { createHash } from 'node:crypto'
+import type { DecisionPoint, JevDecisionStatus, JevReason, JudgmentMode } from '../../shared/contracts/jev.ts'
 import type { EventDraft } from './contracts/domain.ts'
 import type { LocalStore } from './store.ts'
 
-export type DecisionPoint =
-  | 'collaboration.mode'
-  | 'delegation.worth'
-  | 'model.task_fit'
-  | 'context.relevance'
-  | 'handoff.sufficiency'
-  | 'task.replan'
-export type JudgmentMode = 'off' | 'shadow' | 'active'
+export type { DecisionPoint, JudgmentMode } from '../../shared/contracts/jev.ts'
 type Choice = string | number | boolean
 
 export interface JudgeRequest {
@@ -24,6 +18,9 @@ export interface JudgeRequest {
 export interface JudgeResponse {
   output: unknown
   usage?: { input: number; output: number; estimatedCostUsd?: number }
+  reason?: JevReason
+  model?: string
+  requestSent?: boolean
 }
 
 export interface Judge {
@@ -34,6 +31,13 @@ export interface JudgmentOptions {
   modes?: Partial<Record<DecisionPoint, JudgmentMode>>
   judge?: Judge
   timeoutMs?: number
+  policy?: (point: DecisionPoint, taskId: string) => {
+    mode: JudgmentMode
+    judge?: Judge
+    signal?: AbortSignal
+    allowScopedEvidence?: boolean
+  }
+  observe?: (point: DecisionPoint, status: JevDecisionStatus) => void
 }
 
 type JudgeStatus = 'baseline' | 'valid' | 'invalid' | 'failed' | 'timed_out' | 'busy'
@@ -41,6 +45,9 @@ interface Candidate {
   status: JudgeStatus
   output?: Choice
   usage?: JudgeResponse['usage']
+  reason?: JevReason
+  model?: string
+  requestSent?: boolean
 }
 
 const maxConcurrentJudgeCalls = 4
@@ -50,6 +57,8 @@ const commandReference = /^(?:team|plan|replan):[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[
 interface JudgmentLinks {
   planRequestId?: string
   delegationReceiptId?: string
+  signal?: AbortSignal
+  scopedEvidence?: () => Record<string, unknown>
 }
 
 function digest(value: string): string {
@@ -137,6 +146,8 @@ export class LocalJudgment {
   readonly #modes: JudgmentOptions['modes']
   readonly #judge: Judge | undefined
   readonly #timeoutMs: number
+  readonly #policy: JudgmentOptions['policy']
+  readonly #observe: JudgmentOptions['observe']
   #active = 0
 
   constructor(store: LocalStore, options: JudgmentOptions = {}) {
@@ -144,6 +155,8 @@ export class LocalJudgment {
     this.#modes = { ...options.modes }
     this.#judge = options.judge
     this.#timeoutMs = options.timeoutMs ?? 1000
+    this.#policy = options.policy
+    this.#observe = options.observe
     if (!Number.isSafeInteger(this.#timeoutMs) || this.#timeoutMs < 1 || this.#timeoutMs > 10000) {
       throw new RangeError('Invalid judge deadline')
     }
@@ -164,13 +177,21 @@ export class LocalJudgment {
       throw new Error('Judgment requires an allowed rule baseline and bounded choices')
     }
     const refs = Object.freeze([...new Set(evidenceRefs.filter((ref) => referencePattern.test(ref)))].slice(0, 16).map(digest))
-    const mode = this.#modes?.[point] ?? 'off'
+    const policy = this.#policy?.(point, event.taskId)
+    const mode = policy?.mode ?? this.#modes?.[point] ?? 'off'
+    const judge = policy ? policy.judge : this.#judge
     let candidate: Candidate = { status: 'baseline' }
-    if (mode !== 'off' && this.#judge) {
-      candidate = await this.#evaluate(this.#judge, { id: point, schemaVersion: 1, input, baseline, allowed: choices, evidenceRefs: refs })
+    if (mode !== 'off' && judge) {
+      const signals = [policy?.signal, links.signal].filter(signal => signal !== undefined)
+      const judgeInput = policy?.allowScopedEvidence && choices.length > 1 ? { ...input, ...links.scopedEvidence?.() } : input
+      candidate = await this.#evaluate(judge, { id: point, schemaVersion: 1, input: judgeInput, baseline, allowed: choices, evidenceRefs: refs }, signals)
     }
-    const output = mode === 'active' && candidate.status === 'valid' ? candidate.output as O : baseline
+    if (policy?.signal?.aborted) candidate = { ...candidate, status: 'failed', reason: 'configuration_changed' }
+    if (links.signal?.aborted) candidate = { ...candidate, status: 'failed', reason: 'cancelled' }
+    const chosen = candidate.status === 'valid' ? candidate.output as O : undefined
+    const output = mode === 'active' && chosen !== undefined ? chosen : baseline
     this.#store.transaction(() => {
+      if (mode !== 'off') this.#observe?.(point, { mode, at: new Date().toISOString(), reason: candidate.reason, model: candidate.model })
       this.#store.append({
         ...event,
         type: 'judgment.evaluated',
@@ -192,7 +213,11 @@ export class LocalJudgment {
           },
           elapsedMs: Math.round(performance.now() - started),
           judgeStatus: candidate.status,
-          ...(mode === 'shadow' && candidate.output !== undefined ? { shadow: publicChoice(point, candidate.output, choices) } : {}),
+          ...(chosen !== undefined ? { judgeOutput: publicChoice(point, chosen, choices), disagreement: chosen !== baseline } : {}),
+          ...(mode === 'shadow' && chosen !== undefined ? { shadow: publicChoice(point, chosen, choices) } : {}),
+          ...(candidate.reason ? { fallbackReason: candidate.reason } : {}),
+          ...(candidate.model ? { judgeModel: candidate.model } : {}),
+          ...(policy && mode !== 'off' ? { requestSent: candidate.requestSent ?? candidate.status === 'timed_out' } : {}),
           ...(candidate.usage ? { usage: candidate.usage } : {}),
         },
       })
@@ -200,18 +225,21 @@ export class LocalJudgment {
     return output
   }
 
-  async #evaluate(judge: Judge, request: JudgeRequest): Promise<Candidate> {
-    if (this.#active >= maxConcurrentJudgeCalls) return { status: 'busy' }
+  async #evaluate(judge: Judge, request: JudgeRequest, signals: AbortSignal[]): Promise<Candidate> {
+    if (this.#active >= maxConcurrentJudgeCalls) return { status: 'busy', reason: 'busy' }
     this.#active++
     const controller = new AbortController()
+    const signal = AbortSignal.any([controller.signal, ...signals])
     const evaluation = Promise.resolve().then(async (): Promise<Candidate> => {
       try {
-        const response = await judge.evaluate({ ...request, input: structuredClone(request.input) }, controller.signal)
+        const response = await judge.evaluate({ ...request, input: structuredClone(request.input) }, signal)
         const output = request.allowed.find((choice) => choice === response.output)
         const usage = usageFor(response)
-        return output === undefined ? { status: 'invalid', usage } : { status: 'valid', output, usage }
+        const metadata = { usage, model: response.model, requestSent: response.requestSent }
+        if (response.reason) return { ...metadata, status: response.reason === 'invalid_response' || response.reason === 'uncertain' ? 'invalid' : 'failed', reason: response.reason }
+        return output === undefined ? { ...metadata, status: 'invalid', reason: 'invalid_response' } : { ...metadata, status: 'valid', output }
       } catch {
-        return { status: 'failed' }
+        return { status: 'failed', reason: 'unavailable' }
       } finally {
         this.#active--
       }
@@ -219,7 +247,7 @@ export class LocalJudgment {
     let timer: ReturnType<typeof setTimeout> | undefined
     const timeout = new Promise<Candidate>((resolve) => {
       timer = setTimeout(() => {
-        resolve({ status: 'timed_out' })
+        resolve({ status: 'timed_out', reason: 'timeout' })
         controller.abort()
       }, this.#timeoutMs)
     })

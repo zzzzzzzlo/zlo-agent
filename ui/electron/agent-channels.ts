@@ -28,6 +28,11 @@ export const managementChannels = {
   setProviderKey: 'agent-management:set-provider-key',
   testProvider: 'agent-management:test-provider',
   removeProviderKey: 'agent-management:remove-provider-key',
+  getJevStatus: 'agent-management:get-jev-status',
+  saveJevSettings: 'agent-management:save-jev-settings',
+  setJevKey: 'agent-management:set-jev-key',
+  removeJevKey: 'agent-management:remove-jev-key',
+  testJevConnection: 'agent-management:test-jev-connection',
   deleteMemory: 'agent-management:delete-memory',
   reconcile: 'agent-management:reconcile',
 } as const

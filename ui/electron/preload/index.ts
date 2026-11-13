@@ -61,6 +61,11 @@ const agentManagement: DesktopManagementApi = {
   setProviderKey: input => ipcRenderer.invoke(managementChannels.setProviderKey, input),
   testProvider: input => ipcRenderer.invoke(managementChannels.testProvider, input),
   removeProviderKey: input => ipcRenderer.invoke(managementChannels.removeProviderKey, input),
+  getJevStatus: () => ipcRenderer.invoke(managementChannels.getJevStatus, undefined),
+  saveJevSettings: input => ipcRenderer.invoke(managementChannels.saveJevSettings, input),
+  setJevKey: () => ipcRenderer.invoke(managementChannels.setJevKey, undefined),
+  removeJevKey: () => ipcRenderer.invoke(managementChannels.removeJevKey, undefined),
+  testJevConnection: () => ipcRenderer.invoke(managementChannels.testJevConnection, undefined),
   deleteMemory: input => ipcRenderer.invoke(managementChannels.deleteMemory, input),
   reconcile: input => ipcRenderer.invoke(managementChannels.reconcile, input),
 }

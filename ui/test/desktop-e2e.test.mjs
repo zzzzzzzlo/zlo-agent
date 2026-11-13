@@ -548,3 +548,59 @@ test('Windows Electron sends credential capture through Main and omits invalid c
       await rm(data, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
     }
   })
+
+test('Windows Electron configures Jev through Main, persists all six point settings and protects the credential',
+  { skip: process.platform !== 'win32', timeout: 60000 }, async () => {
+    const data = await mkdtemp(join(tmpdir(), 'zlo-electron-jev-'))
+    const key = 'synthetic-jev-desktop-canary'
+    let app
+    try {
+      app = await launch(data)
+      const page = await ready(app, data)
+      await app.evaluate(({ clipboard, dialog }, text) => {
+        clipboard.readText = () => text
+        dialog.showMessageBox = async (_window, options) => {
+          if (options.defaultId !== 0 || JSON.stringify(options).includes(text)) throw new Error('Unsafe Jev dialog')
+          return { response: 1 }
+        }
+      }, key)
+      async function openJev(window) {
+        await window.getByRole('navigation', { name: '工作台' }).getByRole('button', { name: '模型与账号' }).click()
+        const models = window.getByRole('main', { name: '模型与账号' })
+        await models.getByRole('button', { name: '判定模型 (Jev)' }).click()
+        await models.getByText('task.replan', { exact: true }).waitFor()
+        return models
+      }
+      const models = await openJev(page)
+      const actual = () => page.evaluate(() => window.agentManagement.getJevStatus())
+      assert.equal(Object.keys((await actual()).settings.modes).length, 6)
+      assert.ok(Object.values((await actual()).settings.modes).every(mode => mode === 'off'))
+      await models.getByRole('button', { name: '添加 API Key' }).click()
+      await models.getByText('API Key 已加密保存，待测试').waitFor()
+      assert.ok(!(await readFile(join(data, 'jev-credentials.bin'))).includes(Buffer.from(key)))
+      await models.getByRole('checkbox', { name: '全局启用 Jev' }).check()
+      await models.getByRole('checkbox', { name: '启用协作模式' }).check()
+      await models.getByRole('checkbox', { name: '启用模型适配' }).check()
+      await models.getByRole('combobox', { name: '模型适配模式' }).selectOption('active')
+      await models.getByRole('button', { name: '保存 Jev 设置' }).click()
+      await eventually(async () => (await actual()).settings.enabled)
+      assert.equal((await actual()).settings.modes['collaboration.mode'], 'shadow')
+      assert.equal((await actual()).settings.modes['model.task_fit'], 'active')
+      assert.equal((await actual()).settings.modes['task.replan'], 'off')
+      assert.ok(!JSON.stringify(await actual()).includes(key))
+      assert.ok(!(await page.content()).includes(key))
+      await app.close()
+      app = await launch(data)
+      const restored = await ready(app, data)
+      const restoredModels = await openJev(restored)
+      assert.equal(await restoredModels.getByRole('checkbox', { name: '全局启用 Jev' }).isChecked(), true)
+      assert.equal(await restoredModels.getByRole('combobox', { name: '模型适配模式' }).inputValue(), 'active')
+      await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 1 }) })
+      await restoredModels.getByRole('button', { name: '删除 API Key' }).click()
+      await restoredModels.getByText('尚未配置 API Key', { exact: true }).waitFor()
+      assert.equal((await restored.evaluate(() => window.agentManagement.getJevStatus())).credential, 'missing')
+    } finally {
+      await app?.close()
+      await rm(data, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+    }
+  })

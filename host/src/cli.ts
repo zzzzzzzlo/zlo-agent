@@ -58,6 +58,7 @@ async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Pro
     failure = 'host.startup_runtime_failed'
     const providerRuntime = mode === '--pi' ? new (await import('./pi.ts')).PiExecution() : undefined
     const execution = providerRuntime ?? (mode === '--faux' ? new (await import('./faux.ts')).FauxExecution() : new FakeExecution())
+    let jevKey: string | null = null
     if (bootstrap) {
       const first = await bootstrap.next()
       if (first.done || typeof first.value !== 'string' || first.value.length > 256 * 1024) throw new Error('Invalid desktop bootstrap')
@@ -72,10 +73,14 @@ async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Pro
         if (!providerRuntime) throw new Error('Invalid desktop account')
         await providerRuntime.setChatGptSession(command.chatGpt)
       }
+      if (command.jevKey != null) {
+        if (!validProviderKey(command.jevKey)) throw new Error('Invalid desktop credential')
+        jevKey = command.jevKey
+      }
     }
     failure = 'host.startup_storage_failed'
     const host = new LocalAgentHost({
-      directory, execution, runtimeId, providerRuntime, defaultRoute, defaultWorkspace: process.env.ZLO_AGENT_DEFAULT_WORKSPACE,
+      directory, execution, runtimeId, providerRuntime, defaultRoute, jevKey, defaultWorkspace: process.env.ZLO_AGENT_DEFAULT_WORKSPACE,
       harnessMode, modelLimits: { ...(tokens === undefined ? {} : { tokens }), ...(requests === undefined ? {} : { requests }) },
     })
     return { host, runtimeId }
@@ -101,6 +106,7 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode, desktop: boo
   const managementTypes = new Set([
     'managementSnapshot', 'conversationObservatory', 'saveAgentPreferences', 'setWorkspaceAccess', 'deleteConversationMemory', 'reconcileOperation',
     'testProviderAccount', 'validateProviderKey', 'applyProviderKey', 'applyChatGptSession', 'initializeProviderKeys',
+    'getJevStatus', 'saveJevSettings', 'testJevConnection', 'applyJevKey',
   ])
   const stopOutput = host.subscribeOutput((event) => {
     if (subscriptions.has(event.taskId)) send({ schemaVersion: 1, kind: 'output', event })
@@ -167,7 +173,7 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode, desktop: boo
           result = true
         } else if (managementTypes.has(type)) {
           if (!desktop) throw new ConversationError('INVALID_INPUT', 'Desktop management requires the private desktop transport')
-          if (type === 'testProviderAccount' || type === 'validateProviderKey') {
+          if (type === 'testProviderAccount' || type === 'validateProviderKey' || type === 'testJevConnection') {
             if (pendingProbes >= 4) throw new ConversationError('CONFLICT', 'Too many provider tests in progress')
             pendingProbes++
             void host.managementCommand(command as ManagementCommand | PrivateCredentialCommand).then(value => {

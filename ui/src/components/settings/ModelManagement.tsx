@@ -4,6 +4,7 @@ import type { AgentPreferences, DesktopManagementApi, ManagedProvider, Managemen
 import { ModelCatalogSelect, modelGroups } from './ModelCatalogSelect'
 import { routeKey } from './managementData'
 import { ChatGptManagement, useChatGptAccount } from './ChatGptManagement'
+import { JevManagement } from './JevManagement'
 
 const connectionLabels: Record<ManagedProvider['connection'], string> = {
   untested: '待测试',
@@ -19,7 +20,7 @@ const credentialLabels: Record<ManagedProvider['credential'], string> = {
 
 export type PerformManagement = (operation: () => Promise<unknown>, success?: string) => void
 
-const sections = [['api', 'API 接入'], ['account', 'ChatGPT 账号'], ['policy', '默认模型']] as const
+const sections = [['api', 'API 接入'], ['account', 'ChatGPT 账号'], ['policy', '默认模型'], ['jev', '判定模型 (Jev)']] as const
 
 export function ModelManagement({ snapshot, api, busy, perform, save }: {
   snapshot: ManagementSnapshot
@@ -59,6 +60,7 @@ export function ModelManagement({ snapshot, api, busy, perform, save }: {
         {!snapshot.preferences.defaultRoute && <p className="management-note">选择默认模型后即可使用固定策略。</p>}
       </section>}
       {section === 'account' && <ChatGptManagement account={account} unavailable={snapshot.account.reason} busy={busy} perform={perform} />}
+      {section === 'jev' && <JevManagement api={api} busy={busy} perform={perform} />}
     </div>
   )
 }

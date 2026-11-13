@@ -163,6 +163,7 @@ export class LocalMemory {
 export interface ContextOptions {
   scope: string
   goal: string
+  judgmentGoal?: string
   constraints?: string[]
   artifactRefs?: string[]
   availableTools?: string[]
@@ -210,11 +211,17 @@ export class ScopedContext {
       .map((entry) => ({ entry, line: '\n- ' + entry.kind + ': ' + JSON.stringify(entry.text) }))
       .filter(({ line }) => Buffer.byteLength(recalledHeading + line) <= remaining)
     const choices = candidates.length ? candidates.map((_, index) => index) : [-1]
-    const first = await this.#judgment.decide(event, 'context.relevance', {
-      candidates: candidates.map(({ entry, line }, rank) => ({
-        kind: entry.kind, rank, evidenceCount: entry.sourceRefs.length, estimatedBytes: Buffer.byteLength(line),
-      })),
-    }, choices[0], choices, candidates.map(({ entry }) => entry.id))
+    const features = candidates.map(({ entry, line }, rank) => ({
+      kind: entry.kind, rank, evidenceCount: entry.sourceRefs.length, estimatedBytes: Buffer.byteLength(line),
+    }))
+    const first = await this.#judgment.decide(event, 'context.relevance', { candidates: features },
+      choices[0], choices, candidates.map(({ entry }) => entry.id), {
+        signal: options.signal,
+        scopedEvidence: () => ({
+          goal: options.judgmentGoal ?? options.goal,
+          candidates: features.map((feature, index) => ({ ...feature, excerpt: candidates[index].entry.text })),
+        }),
+      })
     options.signal?.throwIfAborted()
     const included: MemoryEntry[] = []
     const ordered = first < 0 ? [] : [candidates[first], ...candidates.filter((_, index) => index !== first)]

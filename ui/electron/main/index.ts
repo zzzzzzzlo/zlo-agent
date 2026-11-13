@@ -9,7 +9,7 @@ import { registerAgentIpc } from './agent-ipc.ts'
 import { createDiagnosticLog } from './diagnostic-log.ts'
 import { HostProcessManager, spawnAgentHost } from './host-process.ts'
 import { registerManagementIpc } from './management-ipc.ts'
-import { SecureProviderCredentials } from './provider-credentials.ts'
+import { SecureJevCredentials, SecureProviderCredentials } from './provider-credentials.ts'
 import { ChatGptAccount } from './chatgpt-account.ts'
 import { registerChatGptIpc } from './chatgpt-ipc.ts'
 import type { ManagedModel } from '../../../shared/contracts/management.ts'
@@ -26,6 +26,7 @@ const userData = app.getPath('userData')
 const defaultWorkspace = join(userData, 'workspace')
 const diagnostics = createDiagnosticLog(join(userData, 'logs'))
 const credentials = new SecureProviderCredentials(userData)
+const jevCredentials = new SecureJevCredentials(userData)
 const chatGpt = hostMode === 'pi' ? new ChatGptAccount(userData, {
   async applySession(session, quiesce): Promise<ManagedModel[]> {
     try { return await host.request({ schemaVersion: 1, type: 'applyChatGptSession', session, quiesce }) }
@@ -40,7 +41,8 @@ const host = new HostProcessManager({
   diagnostic: diagnostics.write,
   async initialize() {
     return { schemaVersion: 1, type: 'initializeProviderKeys',
-      credentials: hostMode === 'pi' ? await credentials.load() : {}, chatGpt: await chatGpt?.loadSession() }
+      credentials: hostMode === 'pi' ? await credentials.load() : {}, chatGpt: await chatGpt?.loadSession(),
+      jevKey: await jevCredentials.load().catch(() => null) }
   },
   spawnChild() {
     mkdirSync(defaultWorkspace, { recursive: true })
@@ -127,7 +129,7 @@ app.whenReady().then(() => {
     host, windowFor, rendererUrl: rendererUrl.href,
     protectedPaths,
   })
-  registerManagementIpc({ host, windowFor, credentials, protectedPaths, defaultWorkspace,
+  registerManagementIpc({ host, windowFor, credentials, jevCredentials, protectedPaths, defaultWorkspace,
     version: app.getVersion(), recentDiagnostics: diagnostics.recent })
   registerChatGptIpc(chatGpt, windowFor)
 

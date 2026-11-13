@@ -12,6 +12,7 @@ import { createProcessTools } from './process-tools.ts'
 import { BraveSearch, createWebTools, HackerNewsSearch, publicWeb } from './web-tools.ts'
 import type { ToolApprovalCommand } from '../../shared/contracts/tool-approval.ts'
 import type { ChatGptSession } from '../../shared/contracts/chatgpt.ts'
+import { parseJevSettings } from '../../shared/contracts/jev.ts'
 import type { AgentPreferences, ManagedMemory, ManagedModel, ManagedOperation, ManagedProvider, ManagementCommand, ManagementSnapshot, PrivateCredentialCommand, ProviderId } from '../../shared/contracts/management.ts'
 import type { AgentEvent, EventDraft, ModelRoute, TaskStatus, VerificationCheck, WorkspaceAccess } from './contracts/domain.ts'
 import type {
@@ -24,6 +25,7 @@ import {
 } from './conversation.ts'
 import { installTaskDiagnostics } from './diagnostics.ts'
 import { LocalJudgment } from './judgment.ts'
+import { JevConfiguration } from './jev-settings.ts'
 import type { JudgmentOptions } from './judgment.ts'
 import { LocalMemory, ScopedContext } from './memory.ts'
 import * as management from './management.ts'
@@ -83,6 +85,8 @@ interface HostOptions {
   modelLimits?: Partial<ModelLimits>
   harnessMode?: HarnessMode
   judgment?: JudgmentOptions
+  jevKey?: string | null
+  jevFetch?: typeof fetch
   defaultWorkspace?: string
   defaultRoute?: ModelRoute
   approveTool?: ToolApprover
@@ -116,6 +120,7 @@ export class LocalAgentHost {
   readonly #defaultWorkspace: string
   readonly #approval: ToolApprovalBroker
   readonly #providerRuntime?: ProviderRuntime
+  readonly #jev: JevConfiguration
   #agentPreferences: AgentPreferences
   #credentialMutation = false
   #active?: ActiveTask
@@ -152,6 +157,7 @@ export class LocalAgentHost {
     this.#approval = new ToolApprovalBroker(options.approveTool)
     this.#store = new LocalStore(join(this.#directory, 'tasks.sqlite'))
     try {
+      this.#jev = new JevConfiguration(this.#store, options.jevKey, options.jevFetch)
       const saved = this.#store.get<AgentPreferences>('desktop-preferences', 'v1')
       if (saved) this.#agentPreferences = management.preferences(saved)
       if (options.runtimeId) {
@@ -164,7 +170,7 @@ export class LocalAgentHost {
       this.#engine = new TaskEngine(this.#store)
       this.#conversations = new ConversationService(this.#store, () => this.#failStorage())
       installTaskDiagnostics(this.#store)
-      const judgment = new LocalJudgment(this.#store, options.judgment)
+      const judgment = new LocalJudgment(this.#store, options.judgment ?? this.#jev.judgmentOptions())
       this.#memory = new LocalMemory(this.#store)
       this.#scheduler = new LocalModelScheduler(options.execution, this.#store, judgment, options.modelLimits,
         () => this.#agentPreferences.modelSelection === 'automatic')
@@ -696,6 +702,19 @@ export class LocalAgentHost {
   async managementCommand(command: ManagementCommand | PrivateCredentialCommand): Promise<unknown> {
     this.#assertOpen()
     switch (command.type) {
+      case 'getJevStatus': return this.#jev.status()
+      case 'testJevConnection': return this.#jev.test()
+      case 'saveJevSettings': {
+        const settings = parseJevSettings(command.settings)
+        if (!settings) throw new ConversationError('INVALID_INPUT', 'Invalid Jev settings')
+        return this.#jev.save(settings)
+      }
+      case 'applyJevKey': {
+        if (command.key !== null && (typeof command.key !== 'string' || !/^[\x21-\x7e]{8,2048}$/u.test(command.key))) {
+          throw new ConversationError('INVALID_INPUT', 'Invalid Jev credential')
+        }
+        return this.#jev.setKey(command.key)
+      }
       case 'managementSnapshot': return this.managementSnapshot(command.conversationId)
       case 'conversationObservatory': {
         const { latestTaskId, ...activity } = this.#conversations.activity(management.id(command.conversationId))
@@ -881,6 +900,7 @@ export class LocalAgentHost {
   async close(): Promise<void> {
     if (this.#closed) return
     this.#closing = true
+    this.#jev.close()
     if (this.#active) {
       const active = this.#active
       if (!this.#storageFailure) {

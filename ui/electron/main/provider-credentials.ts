@@ -16,6 +16,28 @@ function validKey(value: unknown): value is string {
 
 export class ProviderCredentialError extends Error {}
 
+export class SecureJevCredentials {
+  readonly #path: string
+
+  constructor(userData: string) { this.#path = join(userData, 'jev-credentials.bin') }
+
+  async load(): Promise<string | null> {
+    const document = await readEncryptedJson(this.#path) as { version?: number; key?: unknown } | undefined
+    if (document === undefined) return null
+    if (document.version !== 1 || (document.key !== null && !validKey(document.key))) {
+      throw new ProviderCredentialError('无法读取此系统账户的 Jev 凭证。')
+    }
+    return document.key
+  }
+
+  async set(key: string | null): Promise<void> {
+    if (!storageAvailable()) throw new ProviderCredentialError('系统安全凭证存储不可用。')
+    if (key !== null && !validKey(key)) throw new ProviderCredentialError('Jev 凭证格式无效。')
+    try { await writeEncryptedJson(this.#path, { version: 1, key }) }
+    catch { throw new ProviderCredentialError('无法更新系统安全凭证。') }
+  }
+}
+
 export class SecureProviderCredentials {
   readonly #path: string
   #updates = Promise.resolve()
@@ -64,9 +86,13 @@ export class SecureProviderCredentials {
 
 export async function captureProviderKey(window: BrowserWindow, provider: ProviderId): Promise<string | null> {
   if (!Object.hasOwn(providers, provider)) throw new ProviderCredentialError('模型供应商无效。')
+  return captureKey(window, providers[provider])
+}
+
+export async function captureKey(window: BrowserWindow, label: string): Promise<string | null> {
   if (!storageAvailable()) throw new ProviderCredentialError('系统安全凭证存储不可用。')
   const { response } = await dialog.showMessageBox(window, {
-    type: 'question', title: '添加模型凭证', message: `从剪贴板添加 ${providers[provider]} API Key？`,
+    type: 'question', title: '添加模型凭证', message: `从剪贴板添加 ${label} API Key？`,
     detail: '请先在供应商控制台复制 API Key。确认后，应用主进程会读取剪贴板中的文本并加密保存。',
     buttons: ['取消', '读取剪贴板'], defaultId: 0, cancelId: 0, noLink: true,
   })

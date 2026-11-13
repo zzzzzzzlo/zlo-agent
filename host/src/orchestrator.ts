@@ -285,7 +285,7 @@ export class MultiAgentOrchestrator {
         teamLease = teamKey
         if (saved) event = { ...event, agentId: saved.id }
       }
-      const route = await this.#scheduler.allocate(event, parentRoute, node.route ?? saved?.route, Boolean(node.role))
+      const route = await this.#scheduler.allocate(event, parentRoute, node.route ?? saved?.route, Boolean(node.role), node.goal, signal)
       const tools = this.#extensions.tools(workspace, role, scope.access)
         .filter(tool => this.#capabilities.describe(scope, tool))
         .map(tool => {
@@ -319,8 +319,10 @@ export class MultiAgentOrchestrator {
           const goal = input.goal
           const nonEmptyGoal = goal.trim().length > 0
           const requestId = 'team:' + event.agentRunId + ':' + receiptId(id)
-          if (!await this.#judgment.decide(event, 'delegation.worth', { role, goalLength: goal.length, nonEmptyGoal }, nonEmptyGoal,
-            [true, false], [node.id], { planRequestId: requestId }) || !this.#capabilities.enabled('delegate_worker') ||
+          if (!await this.#judgment.decide(event, 'delegation.worth', {
+            role, goalLength: goal.length, nonEmptyGoal, goal, parentGoal: node.goal,
+          }, nonEmptyGoal,
+            nonEmptyGoal ? [true, false] : [false], [node.id], { planRequestId: requestId, signal }) || !this.#capabilities.enabled('delegate_worker') ||
             signal.aborted || toolSignal?.aborted || childActive || workspaceActive || blockingWrite()) {
             return { ok: false, error: 'Delegation declined' }
           }
@@ -396,10 +398,14 @@ export class MultiAgentOrchestrator {
           const completedChildren = this.#tasks.get(task.id).nodes?.filter(child =>
             child.parentNodeId === node.id && child.status === 'succeeded').length ?? 0
           const hardEvidence = node.check ? verification?.passed === true : evidence.size > 0 || completedChildren > 0
+          const successfulTools = new Set(this.#tasks.operations(task.id)
+            .filter(operation => evidence.has(operation.id)).map(operation => operation.tool))
           const accepted = await this.#judgment.decide(event, 'handoff.sufficiency', {
+            goal: node.goal, parentGoal: task.goal, summary: outcome.text.slice(0, 4000),
+            successfulTools: [...successfulTools].slice(0, 12),
             evidenceCount: evidence.size, artifactCount: artifacts.size, checked: Boolean(node.check),
             checkPassed: verification?.passed === true, role, access: scope.access, completedChildren,
-          }, hardEvidence, hardEvidence ? [true, false] : [false], [...evidence])
+          }, hardEvidence, hardEvidence ? [true, false] : [false], [...evidence], { signal })
           result = {
             resultStatus: hardEvidence && accepted ? 'succeeded' : 'failed',
             executionStatus: 'completed',
@@ -546,8 +552,8 @@ export class MultiAgentOrchestrator {
           const nonEmptyGoal = goal.trim().length > 0
           const operationId = event.agentRunId + ':' + id
           const shouldDelegate = await this.#judgment.decide(event, 'delegation.worth',
-            { role: 'root', goalLength: goal.length, nonEmptyGoal }, nonEmptyGoal, [true, false], [task.rootNodeId],
-            { delegationReceiptId: operationId })
+            { role: 'root', goalLength: goal.length, nonEmptyGoal, goal, parentGoal: task.goal },
+            nonEmptyGoal, nonEmptyGoal ? [true, false] : [false], [task.rootNodeId], { delegationReceiptId: operationId, signal })
           if (!shouldDelegate || !this.#capabilities.enabled('delegate_task') || !dispatchAllowed(toolSignal)) {
             return { ok: false, error: 'Delegation unavailable' }
           }
@@ -583,8 +589,9 @@ export class MultiAgentOrchestrator {
             const teamCandidate = Boolean(proposal.teamKey)
             const baseline = proposal.role ?? (teamCandidate ? 'team' : 'worker')
             const role = await this.#judgment.decide(event, 'collaboration.mode',
-              { nodeCount: proposals.length, nodeOrdinal: planned.length, teamCandidate, hasDependencies: Boolean(proposal.dependencies?.length) },
-              baseline, !proposal.role && teamCandidate ? ['worker', 'team'] : [baseline], [task.rootNodeId], { planRequestId: requestId })
+              { goal: proposal.goal, parentGoal: task.goal, nodeCount: proposals.length, nodeOrdinal: planned.length,
+                teamCandidate, hasDependencies: Boolean(proposal.dependencies?.length), dependencyCount: proposal.dependencies?.length },
+              baseline, !proposal.role && teamCandidate ? ['worker', 'team'] : [baseline], [task.rootNodeId], { planRequestId: requestId, signal })
             planned.push({ ...proposal, role, ...(role === 'worker' ? { teamKey: undefined } : {}) })
           }
           if (!this.#capabilities.enabled('propose_task_plan') || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Planning interrupted' }
@@ -609,8 +616,9 @@ export class MultiAgentOrchestrator {
         const safe = isRootChild && !replanCount && (node?.status === 'ready' || node?.status === 'failed') && !hasWrite
         const requestId = 'replan:' + event.agentRunId + ':' + receiptId(id)
         const revise = await this.#judgment.decide(event, 'task.replan',
-          { status: node?.status ?? 'missing', requested: true, isRootChild, hasWrite, replanCount },
-          safe, safe ? [true, false] : [false], node ? [node.id] : [], { planRequestId: requestId })
+          { status: node?.status ?? 'missing', requested: true, isRootChild, hasWrite, replanCount,
+            goal: node?.goal, proposedGoal: update.goal, parentGoal: task.goal, failure: node?.result?.remainingRisks[0] },
+          safe, safe ? [true, false] : [false], node ? [node.id] : [], { planRequestId: requestId, signal })
         if (!revise || !this.#capabilities.enabled('replan_task_node') || !dispatchAllowed(toolSignal)) {
           return { ok: false, error: 'Replan declined or unsafe' }
         }
@@ -707,7 +715,7 @@ export class MultiAgentOrchestrator {
       if (saved && initialRoute && !this.#scheduler.canSwitch(saved.route, initialRoute)) return { status: 'model_error' }
       if (initialRoute) {
         try {
-          await this.#scheduler.allocate(event, initialRoute, initialRoute)
+          await this.#scheduler.allocate(event, initialRoute, initialRoute, false, task.goal, signal)
         } catch {
           return { status: 'model_error' }
         }
@@ -782,7 +790,7 @@ export class MultiAgentOrchestrator {
           const instructions = latest.instructions.filter((item) => !item.delivered)
           prompted = new Set(instructions.map(({ id }) => id))
           const prompt = await this.#context.build(event, {
-            scope: memoryScope(task, session.route), goal: nextPrompt,
+            scope: memoryScope(task, session.route), goal: nextPrompt, judgmentGoal: task.goal,
             constraints: instructions.map(({ text }) => 'Additional user instruction: ' + text),
             signal,
           })

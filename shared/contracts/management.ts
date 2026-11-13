@@ -1,6 +1,7 @@
 import type { EndReason, ModelCatalogEntry, ModelRoute, TaskStatus, VerificationResult, WorkspaceAccess } from './domain.ts'
 import type { ConversationSummary, UsageTotals } from './desktop.ts'
 import type { ChatGptSession } from './chatgpt.ts'
+import type { JevSettings, JevStatus } from './jev.ts'
 
 export type ProviderId = 'deepseek' | 'openai' | 'anthropic' | 'google'
 export type ManagedModel = ModelCatalogEntry
@@ -116,12 +117,19 @@ export interface DesktopManagementApi {
   setProviderKey(input: { provider: ProviderId }): Promise<ManagedProvider>
   testProvider(input: { provider: ProviderId; model?: string }): Promise<ManagedProvider>
   removeProviderKey(input: { provider: ProviderId }): Promise<ManagedProvider>
+  getJevStatus(): Promise<JevStatus>
+  saveJevSettings(input: JevSettings): Promise<JevStatus>
+  setJevKey(): Promise<JevStatus>
+  removeJevKey(): Promise<JevStatus>
+  testJevConnection(): Promise<JevStatus>
   deleteMemory(input: { conversationId: string; ids: string[] }): Promise<number>
   reconcile(input: { conversationId: string; taskId: string; operationId: string }): Promise<ManagedOperation>
 }
 
 type ManagementRequest<T extends string, I = object> = { schemaVersion: 1; type: T } & I
 export type ManagementCommand =
+  | ManagementRequest<'getJevStatus' | 'testJevConnection'>
+  | ManagementRequest<'saveJevSettings', { settings: JevSettings }>
   | ManagementRequest<'managementSnapshot', { conversationId?: string }>
   | ManagementRequest<'conversationObservatory', { conversationId: string }>
   | ManagementRequest<'saveAgentPreferences', { preferences: AgentPreferences }>
@@ -132,7 +140,8 @@ export type ManagementCommand =
 
 /** Private transport between Electron Main and its own Host child. Never exposed in Preload. */
 export type PrivateCredentialCommand =
-  | ManagementRequest<'initializeProviderKeys', { credentials: Partial<Record<ProviderId, string | null>>; chatGpt?: ChatGptSession | null }>
+  | ManagementRequest<'initializeProviderKeys', { credentials: Partial<Record<ProviderId, string | null>>; chatGpt?: ChatGptSession | null; jevKey?: string | null }>
+  | ManagementRequest<'applyJevKey', { key: string | null }>
   | ManagementRequest<'validateProviderKey', { provider: ProviderId; key: string }>
   | ManagementRequest<'applyProviderKey', { provider: ProviderId; key?: string | null }>
   | ManagementRequest<'applyChatGptSession', { session: ChatGptSession | null; quiesce: boolean }>

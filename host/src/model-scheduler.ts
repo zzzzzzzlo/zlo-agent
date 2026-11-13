@@ -66,7 +66,8 @@ export class LocalModelScheduler {
     return this.#execution.discoverModels?.(provider) ?? []
   }
 
-  async allocate(event: EventDraft, parent: ModelRoute, requested?: ModelRoute, independent = false): Promise<ModelRoute> {
+  async allocate(event: EventDraft, parent: ModelRoute, requested?: ModelRoute, independent = false, goal?: string,
+    signal?: AbortSignal): Promise<ModelRoute> {
     if (!this.#automatic()) {
       independent = false
       requested = parent
@@ -84,15 +85,23 @@ export class LocalModelScheduler {
     const requestedMetadata = eligible.find(({ route }) => route.model === requestedRoute.model)
     const modelFeatures = (route: ModelRoute, metadata?: ModelCandidate) => ({
       ...route, contextWindow: metadata?.contextWindow, supportsText: metadata?.input.includes('text'),
-      estimatedCost: metadata?.estimatedCost,
+      supportsVision: metadata?.input.includes('image'), estimatedCost: metadata?.estimatedCost,
     })
-    const alternativesForDecision = alternatives.filter(({ route }) => route.model !== requestedRoute.model).slice(0, 7)
+    const alternativesForDecision: ModelCandidate[] = []
+    const seen = new Set([requestedRoute.model])
+    for (const model of alternatives.slice(0, 24)) {
+      if (alternativesForDecision.length === 7) break
+      if (seen.has(model.route.model)) continue
+      seen.add(model.route.model)
+      try { await this.validateRoute(model.route) } catch { continue }
+      alternativesForDecision.push(model)
+    }
     const candidates = [requestedRoute, ...alternativesForDecision.map(({ route }) => route)]
     const selected = await this.#judgment.decide(event, 'model.task_fit', {
       candidates: [modelFeatures(requestedRoute, requestedMetadata), ...alternativesForDecision.map(model => modelFeatures(model.route, model))],
-      independent, requested: Boolean(requested),
+      independent, requested: Boolean(requested), goal,
     },
-      independent && candidates.length > 1 ? 1 : 0, candidates.map((_, index) => index))
+      independent && candidates.length > 1 ? 1 : 0, candidates.map((_, index) => index), [], { signal })
     const route = candidates[selected]!
     await this.validateRoute(route)
     return route

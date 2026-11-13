@@ -221,7 +221,8 @@ const judgmentPoints = ['collaboration.mode', 'delegation.worth', 'model.task_fi
 function judgmentMetrics(events: TelemetryEvent[], complete: boolean): Metric[] {
   const shadow = events.filter(event => event.payload.mode === 'shadow' && event.payload.shadow !== undefined)
   const shadowDifferent = shadow.filter(event => event.payload.shadow !== event.payload.baseline).length
-  const external = events.filter(event => event.payload.mode !== 'off' && event.payload.judgeStatus !== 'baseline')
+  const external = events.filter(event => event.payload.requestSent ??
+    (event.payload.mode !== 'off' && event.payload.judgeStatus !== 'baseline'))
   return [
     count('judgment.decisions', 'Judgment decisions', events.length, 'Recorded evaluations across the six decision points.', complete),
     rate('judgment.shadow_disagreement', 'Shadow disagreement', shadowDifferent, shadow.length,

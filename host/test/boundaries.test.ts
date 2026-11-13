@@ -4,10 +4,10 @@ import { test } from 'node:test'
 
 const dependencies: Record<string, string[]> = {
   cli: ['contracts/desktop', 'conversation', 'execution', 'fake', 'faux', 'host', 'pi', 'shared/diagnostics', 'shared/loopback-http', 'shared/management', 'management', 'model-management', 'telemetry-http'],
-  host: ['contracts/domain', 'contracts/desktop', 'conversation', 'execution', 'orchestrator', 'policies', 'store', 'task-engine', 'workspace', 'diagnostics', 'shared/diagnostics', 'judgment', 'memory', 'model-scheduler', 'verification', 'tool-approval', 'shared/tool-approval', 'artifact-tools', 'browser-tools', 'preview-tools', 'file-tools', 'git-tools', 'process-tools', 'web-tools', 'management', 'reconciliation', 'shared/chatgpt', 'shared/management', 'telemetry-projection'],
+  host: ['contracts/domain', 'contracts/desktop', 'conversation', 'execution', 'orchestrator', 'policies', 'store', 'task-engine', 'workspace', 'diagnostics', 'shared/diagnostics', 'judgment', 'memory', 'model-scheduler', 'verification', 'tool-approval', 'shared/tool-approval', 'artifact-tools', 'browser-tools', 'preview-tools', 'file-tools', 'git-tools', 'process-tools', 'web-tools', 'management', 'reconciliation', 'shared/chatgpt', 'shared/management', 'telemetry-projection', 'shared/jev', 'jev-settings'],
   'telemetry-http': ['host', 'contracts/domain', 'shared/loopback-http', 'telemetry-evidence', 'telemetry-projection'],
   'telemetry-evidence': ['shared/observatory', 'task-engine', 'telemetry-projection', 'workspace', 'workspace-process'],
-  'telemetry-projection': ['shared/domain', 'shared/observatory', 'shared/tool-approval', 'contracts/domain', 'task-engine', 'workspace-process'],
+  'telemetry-projection': ['shared/domain', 'shared/observatory', 'shared/tool-approval', 'contracts/domain', 'task-engine', 'workspace-process', 'shared/jev'],
   diagnostics: ['store', 'shared/diagnostics'],
   conversation: ['contracts/domain', 'contracts/desktop', 'store', 'task-engine', 'workspace'],
   orchestrator: ['contracts/domain', 'execution', 'policies', 'store', 'task-engine', 'workspace', 'agent-plan', 'judgment', 'memory', 'model-scheduler', 'verification', 'tool-approval', 'tool-run', 'visual-workflow'],
@@ -25,7 +25,9 @@ const dependencies: Record<string, string[]> = {
   'process-tools': ['workspace', 'workspace-process'],
   'web-tools': ['workspace', 'workspace-process'],
   'agent-plan': ['execution', 'task-engine'],
-  judgment: ['contracts/domain', 'store'],
+  judgment: ['contracts/domain', 'store', 'shared/jev'],
+  'jev-settings': ['shared/jev', 'jev-judge', 'judgment', 'store'],
+  'jev-judge': ['shared/jev', 'judgment'],
   memory: ['contracts/domain', 'store', 'judgment'],
   'model-scheduler': ['contracts/domain', 'execution', 'store', 'judgment'],
   management: ['contracts/domain', 'contracts/desktop', 'shared/domain', 'shared/management', 'conversation', 'policies', 'task-engine', 'workspace', 'workspace-process'],
@@ -45,7 +47,7 @@ const dependencies: Record<string, string[]> = {
   faux: ['pi'],
   'contracts/desktop': ['shared/domain'],
   'contracts/domain': ['shared/domain'],
-  'shared/management': ['shared/domain', 'contracts/desktop', 'shared/chatgpt'],
+  'shared/management': ['shared/domain', 'contracts/desktop', 'shared/chatgpt', 'shared/jev'],
   'shared/chatgpt': ['shared/domain'],
   'shared/observatory': ['shared/domain'],
 }
