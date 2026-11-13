@@ -13,7 +13,7 @@ const maxDepth = 24
 const maxSearchBytes = 2 * 1024 * 1024
 const maxSearchMs = 3_000
 const maxTextBytes = 128 * 1024
-const maxPatchFiles = 16
+const maxPatchEdits = 16
 const pathSchema = { type: 'string', minLength: 1, maxLength: 512 }
 const globSchema = { type: 'string', minLength: 1, maxLength: 160 }
 const textSchema = { type: 'string', maxLength: maxTextBytes }
@@ -137,36 +137,60 @@ function boundedText(value: unknown): value is string {
     !/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u.test(value)
 }
 
-function editList(value: unknown) {
-  if (!Array.isArray(value) || value.length < 1 || value.length > maxPatchFiles) return undefined
-  const seen = new Set<string>()
-  const edits: { path: string; oldText: string; newText: string }[] = []
-  for (const item of value) {
+type PatchEdit = { index: number; oldText: string; newText: string }
+
+function editGroups(value: unknown) {
+  if (!Array.isArray(value) || value.length < 1 || value.length > maxPatchEdits) return undefined
+  const groups = new Map<string, { path: string; edits: PatchEdit[] }>()
+  for (const [index, item] of value.entries()) {
     const input = object(item)
     const path = pathValue(input?.path)
     if (!path || !input || Object.keys(input).some(key => !['path', 'oldText', 'newText'].includes(key)) ||
       !boundedText(input.oldText) || !input.oldText || !boundedText(input.newText)) return undefined
     const key = process.platform === 'win32' ? path.toLowerCase() : path
-    if (seen.has(key)) return undefined
-    seen.add(key)
-    edits.push({ path, oldText: input.oldText, newText: input.newText })
+    let group = groups.get(key)
+    // Keep case variants from targeting the wrong file in a case-sensitive Windows directory.
+    if (group && group.path !== path) return undefined
+    if (!group) {
+      group = { path, edits: [] }
+      groups.set(key, group)
+    }
+    group.edits.push({ index: index + 1, oldText: input.oldText, newText: input.newText })
   }
-  return edits
+  return [...groups.values()]
 }
 
 async function patchFiles(workspace: CodingWorkspace, input: unknown, signal?: AbortSignal) {
-  const edits = editList(input)
-  if (!edits) return rejected('Invalid patch entries')
+  const groups = editGroups(input)
+  if (!groups) return rejected('Invalid patch entries')
   const pending: { relative: string; path: string; original: string; stat: Stats; content: string }[] = []
-  for (const edit of edits) {
+  for (const { path, edits } of groups) {
     if (signal?.aborted) return rejected('Patch interrupted before mutation')
-    const current = await workspace.readTextSnapshot(edit.path, signal).catch(() => undefined)
+    const current = await workspace.readTextSnapshot(path, signal).catch(() => undefined)
     if (!current) return rejected('Patch file unavailable')
-    const match = current.text.indexOf(edit.oldText)
-    if (match < 0 || current.text.indexOf(edit.oldText, match + 1) >= 0) return rejected('Patch text must match exactly once in every file')
-    const content = current.text.slice(0, match) + edit.newText + current.text.slice(match + edit.oldText.length)
+    const matched: { index: number; start: number; end: number; newText: string }[] = []
+    for (const { index, oldText, newText } of edits) {
+      const start = current.text.indexOf(oldText)
+      if (start < 0) return rejected(`Patch edit ${index}: oldText not found. Read the current file and retry with exact text.`)
+      if (current.text.indexOf(oldText, start + 1) >= 0) {
+        return rejected(`Patch edit ${index}: oldText matches more than once. Include enough context to identify one occurrence.`)
+      }
+      matched.push({ index, start, end: start + oldText.length, newText })
+    }
+    matched.sort((a, b) => a.start - b.start)
+    const parts: string[] = []
+    let cursor = 0
+    for (const [i, edit] of matched.entries()) {
+      if (edit.start < cursor) {
+        return rejected(`Patch edits ${matched[i - 1]!.index} and ${edit.index} overlap. Merge them into one edit.`)
+      }
+      parts.push(current.text.slice(cursor, edit.start), edit.newText)
+      cursor = edit.end
+    }
+    parts.push(current.text.slice(cursor))
+    const content = parts.join('')
     if (!boundedText(content)) return rejected('Patched file exceeds the text limit')
-    if (content !== current.text) pending.push({ relative: edit.path, path: current.path, original: current.text, stat: current.stat, content })
+    if (content !== current.text) pending.push({ relative: path, path: current.path, original: current.text, stat: current.stat, content })
   }
   const staged = new Set<string>()
   const writes: { item: typeof pending[number]; temporary: string }[] = []
@@ -298,11 +322,11 @@ export function createFileTools(workspace: CodingWorkspace): WorkspaceTool[] {
           ...match, path: redactProcessOutput(match.path), text: redactProcessOutput(match.text).slice(0, 512),
         })) }
       }, searchTargets),
-    tool('apply_patch', 'Replace one exact text occurrence per file. All files are checked before any target is changed.', 'write',
-      { edits: { type: 'array', minItems: 1, maxItems: maxPatchFiles, items: { type: 'object', additionalProperties: false,
+    tool('apply_patch', 'Replace exact text in one or more files. Repeat a path to edit several locations in the same file. Each oldText must match once in the original file, including whitespace, and edits must not overlap. All edits are checked before any target is changed.', 'write',
+      { edits: { type: 'array', minItems: 1, maxItems: maxPatchEdits, items: { type: 'object', additionalProperties: false,
         properties: { path: pathSchema, oldText: textSchema, newText: textSchema }, required: ['path', 'oldText', 'newText'] } } },
       ['edits'], (input, signal) => patchFiles(workspace, input.edits, signal),
-      input => editList(object(input)?.edits)?.map(({ path }) => path) ?? ['']),
+      input => editGroups(object(input)?.edits)?.map(({ path }) => path) ?? ['']),
     tool('move_file', 'Move one regular file to an unused workspace path on the same volume.', 'write',
       { path: pathSchema, destination: pathSchema }, ['path', 'destination'],
       (input, signal) => moveFile(workspace, moveTargets(input, false), signal),
