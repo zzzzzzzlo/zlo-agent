@@ -34,6 +34,7 @@ Zlo Agent 是基于 Pi 的本地优先通用 Agent，首个场景为 Windows Cod
 | `docs/27-harness-alignment.md` | Pi Coding Harness、能力委派及运行策略 |
 | `docs/28-harness-verification.md` | Harness 回归和真实模型运行记录 |
 | `docs/29-frontend-backend-handoff.md` | 前端重构对接、桌面接口和后端能力清单 |
+| `docs/30-desktop-redesign-brief.md` | 全新桌面 UI 的设计任务书和验收标准 |
 | `diagrams/system.mmd` | 可渲染的 Mermaid 系统架构图 |
 | `diagrams/runtime-sequence.mmd` | 可渲染的运行与停止流程图 |
 

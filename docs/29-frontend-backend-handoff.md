@@ -8,7 +8,9 @@
 
 Renderer 通过 `window.agentHost`、`window.agentManagement`、`window.agentChatGpt` 调用业务接口。窗口最小化、最大化和关闭走 `window.desktopWindow`。Main 管 Host 进程、来源校验、原生授权和凭证。Host 管对话、任务状态、模型、工具权限、Pi Session 和 SQLite。前端可以缓存和投影数据，重连时以 Host 快照与事件为准。桌面接口均有固定的 Preload 方法，无需在组件中组装 IPC channel 或 JSONL 命令。 [Preload 实现](../ui/electron/preload/index.ts) · [现有聊天适配器](../ui/src/integrations/agent/HostAgentAdapter.ts)
 
-## 页面与功能对照
+全新界面设计请从 [桌面 UI 设计任务书](30-desktop-redesign-brief.md) 开始。以下对照用于查接口，页面和组件名对应当前代码。
+
+## 当前界面与接口索引
 
 | 页面或组件 | 已有后端能力 | 前端入口 |
 | --- | --- | --- |
