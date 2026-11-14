@@ -11,7 +11,7 @@ export function TitleBar({ destination }: { destination?: string }) {
     <header className="titlebar">
       <div className={`title-brand ${sidebar ? '' : 'is-collapsed'}`}>
         {sidebar && <div className="wordmark"><span className="brand-tile"><BrandMark size={24} /></span><strong>Zlo Agent</strong></div>}
-        <IconButton label={sidebar ? '收起侧栏' : '展开侧栏'} aria-expanded={sidebar} onClick={toggle}><PanelLeft size={17} /></IconButton>
+        {!destination && <IconButton label={sidebar ? '收起侧栏' : '展开侧栏'} aria-expanded={sidebar} onClick={toggle}><PanelLeft size={17} /></IconButton>}
       </div>
       <div className="title-main">
         <div className="title-location"><span>工作区</span><span aria-hidden="true">/</span><strong>{destination ?? session?.title ?? '新会话'}</strong></div>

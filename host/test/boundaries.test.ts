@@ -3,8 +3,8 @@ import { readFile } from 'node:fs/promises'
 import { test } from 'node:test'
 
 const dependencies: Record<string, string[]> = {
-  cli: ['contracts/desktop', 'conversation', 'execution', 'fake', 'faux', 'host', 'pi', 'shared/diagnostics', 'shared/loopback-http', 'shared/management', 'shared/jev', 'management', 'model-management', 'telemetry-http', 'jev-transport'],
-  host: ['contracts/domain', 'contracts/desktop', 'conversation', 'execution', 'orchestrator', 'policies', 'store', 'task-engine', 'workspace', 'diagnostics', 'shared/diagnostics', 'judgment', 'memory', 'model-scheduler', 'verification', 'tool-approval', 'shared/tool-approval', 'artifact-tools', 'browser-tools', 'preview-tools', 'file-tools', 'git-tools', 'process-tools', 'web-tools', 'management', 'reconciliation', 'shared/chatgpt', 'shared/management', 'telemetry-projection', 'shared/jev', 'jev-settings'],
+  cli: ['contracts/desktop', 'conversation', 'execution', 'fake', 'faux', 'host', 'pi', 'shared/diagnostics', 'shared/loopback-http', 'shared/management', 'shared/jev', 'management', 'model-management', 'telemetry-http', 'jev-transport', 'shared/provider-setup'],
+  host: ['contracts/domain', 'contracts/desktop', 'conversation', 'execution', 'orchestrator', 'policies', 'store', 'task-engine', 'workspace', 'diagnostics', 'shared/diagnostics', 'judgment', 'memory', 'model-scheduler', 'verification', 'tool-approval', 'shared/tool-approval', 'artifact-tools', 'browser-tools', 'preview-tools', 'file-tools', 'git-tools', 'process-tools', 'web-tools', 'management', 'reconciliation', 'shared/chatgpt', 'shared/management', 'telemetry-projection', 'shared/jev', 'jev-settings', 'shared/provider-setup'],
   'telemetry-http': ['host', 'contracts/domain', 'shared/loopback-http', 'telemetry-evidence', 'telemetry-projection'],
   'telemetry-evidence': ['shared/observatory', 'task-engine', 'telemetry-projection', 'workspace', 'workspace-process'],
   'telemetry-projection': ['shared/domain', 'shared/observatory', 'shared/tool-approval', 'contracts/domain', 'task-engine', 'workspace-process', 'shared/jev'],
@@ -45,13 +45,15 @@ const dependencies: Record<string, string[]> = {
   'workspace-process': ['contracts/domain'],
   store: ['contracts/domain'],
   execution: ['contracts/domain'],
-  pi: ['execution', 'shared/diagnostics', 'shared/management', 'shared/chatgpt', 'model-management', 'chatgpt-responses', 'coding-resources'],
+  pi: ['execution', 'shared/diagnostics', 'shared/management', 'shared/chatgpt', 'model-management', 'chatgpt-responses', 'coding-resources', 'provider-setup', 'shared/provider-setup'],
+  'provider-setup': ['shared/management', 'shared/provider-setup', 'model-management', 'execution'],
   'coding-resources': ['execution'],
   fake: ['execution'],
   faux: ['pi'],
   'contracts/desktop': ['shared/domain'],
   'contracts/domain': ['shared/domain'],
-  'shared/management': ['shared/domain', 'contracts/desktop', 'shared/chatgpt', 'shared/jev'],
+  'shared/management': ['shared/domain', 'contracts/desktop', 'shared/chatgpt', 'shared/jev', 'shared/provider-setup'],
+  'shared/provider-setup': ['shared/domain'],
   'shared/chatgpt': ['shared/domain'],
   'shared/observatory': ['shared/domain'],
 }
@@ -70,7 +72,11 @@ test('Host modules respect the dependency direction and keep Pi behind its adapt
           : path.split('/src/').at(-1)!.replace(/\.ts$/, '')
         assert.ok(allowed.includes(target), file + ' -> ' + specifier)
       }
-      if (specifier.startsWith('@earendil-works/')) assert.ok(file === 'pi' || file === 'faux' || file === 'coding-resources')
+      if (specifier.startsWith('@earendil-works/')) {
+        const statementStart = content.lastIndexOf('\n', match.index!) + 1
+        assert.ok(['pi', 'faux', 'coding-resources'].includes(file) ||
+          file === 'provider-setup' && content.startsWith('import type ', statementStart), file + ' -> ' + specifier)
+      }
     }
   }
 })

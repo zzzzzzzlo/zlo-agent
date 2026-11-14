@@ -58,7 +58,7 @@ export async function fetchProviderCatalog(provider: ProviderId, key: string, si
   }
 }
 
-async function boundedJson(response: Response) {
+export async function boundedJson(response: Response) {
   const reader = response.body?.getReader()
   if (!reader) return undefined
   const decoder = new TextDecoder()

@@ -2,7 +2,8 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type { IpcRendererEvent } from 'electron'
 import { windowChannels } from '../window-api'
 import type { WindowApi } from '../window-api'
-import { agentChannels, chatGptChannels, managementChannels } from '../agent-channels.ts'
+import { agentChannels, chatGptChannels, managementChannels, providerSetupChannels } from '../agent-channels.ts'
+import type { DesktopProviderSetupApi } from '../../../shared/contracts/provider-setup.ts'
 import type { DesktopChatGptApi } from '../../../shared/contracts/chatgpt.ts'
 import type { ConversationEvent, DesktopHostApi, DesktopHostStatus } from '../../../shared/contracts/desktop.ts'
 import type { DesktopManagementApi } from '../../../shared/contracts/management.ts'
@@ -78,3 +79,17 @@ const agentChatGpt: DesktopChatGptApi = {
   signOut: () => ipcRenderer.invoke(chatGptChannels.signOut),
 }
 contextBridge.exposeInMainWorld('agentChatGpt', agentChatGpt)
+
+const providerSetup: DesktopProviderSetupApi = {
+  listCustom: () => ipcRenderer.invoke(providerSetupChannels.listCustom),
+  saveCustom: input => ipcRenderer.invoke(providerSetupChannels.saveCustom, input),
+  setCustomKey: input => ipcRenderer.invoke(providerSetupChannels.setCustomKey, input),
+  removeCustomKey: input => ipcRenderer.invoke(providerSetupChannels.removeCustomKey, input),
+  deleteCustom: input => ipcRenderer.invoke(providerSetupChannels.deleteCustom, input),
+  testCustom: input => ipcRenderer.invoke(providerSetupChannels.testCustom, input),
+  grokStatus: () => ipcRenderer.invoke(providerSetupChannels.grokStatus),
+  grokSignIn: () => ipcRenderer.invoke(providerSetupChannels.grokSignIn),
+  grokCancel: () => ipcRenderer.invoke(providerSetupChannels.grokCancel),
+  grokSignOut: () => ipcRenderer.invoke(providerSetupChannels.grokSignOut),
+}
+contextBridge.exposeInMainWorld('agentProviderSetup', providerSetup)

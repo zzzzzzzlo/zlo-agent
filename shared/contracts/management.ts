@@ -2,11 +2,12 @@ import type { EndReason, ModelCatalogEntry, ModelRoute, TaskStatus, Verification
 import type { ConversationSummary, UsageTotals } from './desktop.ts'
 import type { ChatGptSession } from './chatgpt.ts'
 import type { JevSettings, JevStatus, JudgeCredentials } from './jev.ts'
+import type { CustomProviderCredential, GrokCredential } from './provider-setup.ts'
 
 export type ProviderId = 'deepseek' | 'openai' | 'anthropic' | 'google'
 export type ManagedModel = ModelCatalogEntry
-export interface ManagedProvider {
-  id: ProviderId
+export interface ManagedProvider<Id extends string = ProviderId> {
+  id: Id
   name: string
   credential: 'stored' | 'environment' | 'missing'
   connection: 'untested' | 'connected' | 'unauthorized' | 'unavailable'
@@ -87,7 +88,7 @@ export interface ManagementSnapshot {
   version: string
   preferences: AgentPreferences
   braveConfigured: boolean
-  providers: ManagedProvider[]
+  providers: ManagedProvider<string>[]
   account: { available: false; reason: string }
   tools: ManagedTool[]
   conversation?: ConversationSummary
@@ -141,8 +142,13 @@ export type ManagementCommand =
 /** Private transport between Electron Main and its own Host child. Never exposed in Preload. */
 export type PrivateCredentialCommand =
   | ManagementRequest<'initializeProviderKeys', { credentials: Partial<Record<ProviderId, string | null>>; chatGpt?: ChatGptSession | null;
-    jevKey?: string | null; judgeKeys?: JudgeCredentials }>
+    jevKey?: string | null; judgeKeys?: JudgeCredentials; customProviders?: CustomProviderCredential[]; grok?: GrokCredential }>
   | ManagementRequest<'applyJevKey', { endpoint: string; key: string | null }>
   | ManagementRequest<'validateProviderKey', { provider: ProviderId; key: string }>
   | ManagementRequest<'applyProviderKey', { provider: ProviderId; key?: string | null }>
   | ManagementRequest<'applyChatGptSession', { session: ChatGptSession | null; quiesce: boolean }>
+  | ManagementRequest<'applyCustomProvider', { id: string; config: CustomProviderCredential | null }>
+  | ManagementRequest<'testCustomProvider', { id: string }>
+  | ManagementRequest<'applyGrokSession', { session: GrokCredential | null; quiesce: boolean }>
+  | ManagementRequest<'startGrokLogin' | 'pollGrokLogin' | 'cancelGrokLogin'>
+  | ManagementRequest<'refreshGrokLogin', { credential: GrokCredential }>

@@ -15,6 +15,7 @@ import { registerChatGptIpc } from './chatgpt-ipc.ts'
 import type { ManagedModel } from '../../../shared/contracts/management.ts'
 import { openCodeJudgeEndpoint } from '../../../shared/contracts/jev.ts'
 import { judgeProxyUrl } from './judge-proxy.ts'
+import { ProviderSetup, registerProviderSetupIpc } from './provider-setup.ts'
 
 const developmentData = app.isPackaged ? undefined : process.env.ZLO_AGENT_DESKTOP_DATA
 if (developmentData && localDirectory(developmentData)) {
@@ -39,12 +40,15 @@ const chatGpt = hostMode === 'pi' ? new ChatGptAccount(userData, {
     }
   },
 }) : undefined
-const host = new HostProcessManager({
+const providerSetup = hostMode === 'pi' ? new ProviderSetup(userData, () => host) : undefined
+const host: HostProcessManager = new HostProcessManager({
   mode: hostMode,
   diagnostic: diagnostics.write,
   async initialize() {
     return { schemaVersion: 1, type: 'initializeProviderKeys',
       credentials: hostMode === 'pi' ? await credentials.load() : {}, chatGpt: await chatGpt?.loadSession(),
+      customProviders: await providerSetup?.loadCustom().catch(() => undefined),
+      grok: await providerSetup?.loadGrok().catch(() => undefined),
       judgeKeys: await jevCredentials.load().catch(() => ({})) }
   },
   spawnChild() {
@@ -77,6 +81,7 @@ function windowFor(event: IpcMainInvokeEvent) {
 }
 
 function createWindow() {
+  const hiddenTestWindow = !app.isPackaged && process.env.ZLO_AGENT_E2E_HIDDEN === '1'
   const window = new BrowserWindow({
     width: 1240, height: 800, minWidth: 680, minHeight: 520,
     title: 'Zlo Agent',
@@ -94,6 +99,7 @@ function createWindow() {
       sandbox: true,
       contextIsolation: true,
       nodeIntegration: false,
+      backgroundThrottling: !hiddenTestWindow,
     },
   })
 
@@ -102,7 +108,7 @@ function createWindow() {
   const notify = () => window.webContents.send(windowChannels.changed, window.isMaximized())
   window.on('maximize', notify)
   window.on('unmaximize', notify)
-  window.once('ready-to-show', () => window.show())
+  if (!hiddenTestWindow) window.once('ready-to-show', () => window.show())
   void (devUrl ? window.loadURL(rendererUrl.href) : window.loadFile(rendererFile))
 }
 
@@ -135,6 +141,7 @@ app.whenReady().then(() => {
   registerManagementIpc({ host, windowFor, credentials, jevCredentials, protectedPaths, defaultWorkspace,
     version: app.getVersion(), recentDiagnostics: diagnostics.recent })
   registerChatGptIpc(chatGpt, windowFor)
+  registerProviderSetupIpc(providerSetup, windowFor)
 
   const startHost = async () => {
     if (process.platform === 'win32' && hostMode === 'pi') {
@@ -173,6 +180,7 @@ app.on('before-quit', (event) => {
   if (quitting) return
   quitting = true
   chatGpt?.close()
+  providerSetup?.close()
   void host.shutdown().catch(() => {
     console.error('Agent Host did not exit within the shutdown deadline.')
   }).finally(async () => {

@@ -13,8 +13,8 @@ import { SessionDialog } from './components/sidebar/SessionDialog'
 import { NewConversationDialog } from './components/sidebar/NewConversationDialog'
 import { ChatSurface } from './components/chat/ChatSurface'
 import { Composer } from './components/chat/Composer'
-import { Settings } from './components/settings/Settings'
-import { managementLabels } from './components/settings/ManagementSections'
+import { settingsLabels } from './components/settings/Settings'
+import type { SettingsSection } from './components/settings/Settings'
 import type { ManagementSection } from './components/settings/ManagementSections'
 
 export function App() {
@@ -26,8 +26,8 @@ export function App() {
   const session = useWorkspace(activeSession)
   const toggleSidebar = useWorkspace(state => state.toggleSidebar)
   const [activity, setActivity] = useState(false)
-  const [page, setPage] = useState<ManagementSection>()
-  const [settings, setSettings] = useState(false)
+  const [page, setPage] = useState<SettingsSection>()
+  const [lastSetting, setLastSetting] = useState<SettingsSection>('models')
   const [sessionAction, setSessionAction] = useState<SessionAction>()
   const [newConversation, setNewConversation] = useState(false)
 
@@ -40,22 +40,23 @@ export function App() {
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
       if (event.isComposing || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return
-      if (event.key.toLowerCase() === 'n' && !settings && !sessionAction && !newConversation && hostState === 'ready') {
+      if (event.key.toLowerCase() === 'n' && !page && !sessionAction && !newConversation && hostState === 'ready') {
         event.preventDefault()
         setPage(undefined)
         setNewConversation(true)
       }
       if (event.key === ',' && !sessionAction && !newConversation) {
         event.preventDefault()
-        setSettings(true)
+        setPage(lastSetting)
       }
     }
     window.addEventListener('keydown', shortcut)
     return () => window.removeEventListener('keydown', shortcut)
-  }, [hostState, settings, sessionAction, newConversation])
+  }, [hostState, page, lastSetting, sessionAction, newConversation])
 
   function navigate(section?: ManagementSection) {
     setPage(section)
+    if (section) setLastSetting(section)
     if (sidebar && window.matchMedia('(max-width: 580px)').matches) toggleSidebar()
   }
 
@@ -63,20 +64,20 @@ export function App() {
     <LiquiThemeProvider injectTokens={false} theme={{ glass: optics[strength] }}>
       <div className="app-shell">
         <div className="window-backdrop" aria-hidden="true" />
-        <TitleBar destination={page && managementLabels[page]} />
+        <TitleBar destination={page && settingsLabels[page]} />
         <div className="workspace">
-          {sidebar && <Sidebar onCreate={() => { navigate(); setNewConversation(true) }} onSettings={() => setSettings(true)}
-            onSessionAction={setSessionAction} page={page} onNavigate={navigate} />}
+          {!page && sidebar && <Sidebar onCreate={() => { navigate(); setNewConversation(true) }}
+            onSettings={() => setPage(lastSetting)} onSessionAction={setSessionAction} onSession={() => navigate()} />}
           <main className="chat-surface" aria-label="对话" hidden={Boolean(page)}>
             <ConversationToolbar expanded={activity} onObservatory={() => setActivity(visible => !visible)} onManageModels={() => navigate('models')} />
             <ChatSurface />
             <Composer />
           </main>
-          {page && <ManagementPage section={page} onBack={() => setPage(undefined)} />}
+          {page && <ManagementPage section={page} onSelect={(section) => { setLastSetting(section); setPage(section) }}
+            onBack={() => setPage(undefined)} />}
           {!page && activity && session && <ActivityPanel key={session.id} session={session} onClose={() => setActivity(false)} onManage={navigate} />}
         </div>
         <WorkspaceStatusBar onReconcile={() => navigate('diagnostics')} />
-        {settings && <Settings onClose={() => setSettings(false)} />}
         {sessionAction && <SessionDialog action={sessionAction} onClose={() => setSessionAction(undefined)} />}
         {newConversation && <NewConversationDialog onClose={() => setNewConversation(false)} />}
       </div>

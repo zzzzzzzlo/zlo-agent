@@ -1,10 +1,14 @@
 import { useState } from 'react'
+import { Box, CircleUserRound, Plus } from 'lucide-react'
 import type { ModelRoute } from '../../../../shared/contracts/desktop.ts'
 import type { AgentPreferences, DesktopManagementApi, ManagedProvider, ManagementSnapshot } from '../../../../shared/contracts/management.ts'
 import { ModelCatalogSelect, modelGroups } from './ModelCatalogSelect'
 import { routeKey } from './managementData'
 import { ChatGptManagement, useChatGptAccount } from './ChatGptManagement'
 import { JevManagement } from './JevManagement'
+import { CustomProviderForm, emptyProvider, GrokManagement, useProviderSetup } from './ProviderSetup'
+import { customProviderLimit } from '../../../../shared/contracts/provider-setup.ts'
+import type { CustomProviderConfig } from '../../../../shared/contracts/provider-setup.ts'
 
 const connectionLabels: Record<ManagedProvider['connection'], string> = {
   untested: '待测试',
@@ -20,7 +24,7 @@ const credentialLabels: Record<ManagedProvider['credential'], string> = {
 
 export type PerformManagement = (operation: () => Promise<unknown>, success?: string) => void
 
-const sections = [['api', 'API 接入'], ['account', 'ChatGPT 账号'], ['policy', '默认模型'], ['jev', '判定模型 (Jev)']] as const
+const sections = [['providers', '提供商'], ['policy', '默认模型'], ['jev', '判定模型 (Jev)']] as const
 
 export function ModelManagement({ snapshot, api, busy, perform, save }: {
   snapshot: ManagementSnapshot
@@ -30,19 +34,14 @@ export function ModelManagement({ snapshot, api, busy, perform, save }: {
   save(patch: Partial<AgentPreferences>): void
 }) {
   const account = useChatGptAccount(true)
-  const [section, setSection] = useState<typeof sections[number][0]>('api')
+  const [section, setSection] = useState<typeof sections[number][0]>('providers')
   return (
     <div className="management-stack">
       <nav className="model-sections" aria-label="模型与账号分类">
         {sections.map(([id, label]) => <button type="button" key={id} aria-current={section === id ? 'page' : undefined}
           onClick={() => setSection(id)}>{label}</button>)}
       </nav>
-      {section === 'api' && <section className="management-group provider-page">
-        <h4>API 供应商</h4>
-        {snapshot.providers.length ? <div className="provider-grid">{snapshot.providers.map((provider) => (
-          <ProviderControls key={provider.id} provider={provider} api={api} busy={busy} perform={perform} />
-        ))}</div> : <p className="management-note">当前 Host 未提供可配置的供应商。</p>}
-      </section>}
+      {section === 'providers' && <Providers snapshot={snapshot} api={api} account={account} perform={perform} busy={busy} />}
       {section === 'policy' && <section className="management-group">
         <h4>模型策略</h4>
         <ModelCatalogSelect label="默认模型" providers={modelGroups(snapshot.providers, account.status)} value={snapshot.preferences.defaultRoute}
@@ -59,9 +58,67 @@ export function ModelManagement({ snapshot, api, busy, perform, save }: {
         </label>
         {!snapshot.preferences.defaultRoute && <p className="management-note">选择默认模型后即可使用固定策略。</p>}
       </section>}
-      {section === 'account' && <ChatGptManagement account={account} unavailable={snapshot.account.reason} busy={busy} perform={perform} />}
       {section === 'jev' && <JevManagement api={api} busy={busy} perform={perform} />}
     </div>
+  )
+}
+
+function Providers({ snapshot, api, account, busy, perform }: {
+  snapshot: ManagementSnapshot
+  api: DesktopManagementApi
+  account: ReturnType<typeof useChatGptAccount>
+  busy: boolean
+  perform: PerformManagement
+}) {
+  const setup = useProviderSetup()
+  const [selected, setSelected] = useState('chatgpt')
+  const [adding, setAdding] = useState<CustomProviderConfig>()
+  const saved = setup.providers.find(provider => selected === 'custom-' + provider.id)
+  const builtin = snapshot.providers.find((provider): provider is ManagedProvider =>
+    provider.id === selected && ['deepseek', 'openai', 'anthropic', 'google'].includes(provider.id))
+
+  function entry(id: string, name: string, ready: boolean, account?: boolean) {
+    const Icon = account ? CircleUserRound : Box
+    return <button key={id} type="button" aria-current={selected === id ? 'true' : undefined}
+      onClick={() => { if (id !== 'new') setAdding(undefined); setSelected(id) }}>
+      <Icon size={15} aria-hidden="true" /><span>{name}</span>
+      <i className={ready ? 'is-ready' : ''} title={ready ? '已配置' : '未配置'} aria-hidden="true" />
+    </button>
+  }
+
+  return (
+    <section className="provider-page" aria-label="提供商">
+      <div className="provider-page-actions">
+        <button className="button-primary" type="button" disabled={!setup.api || busy || setup.providers.length >= customProviderLimit} onClick={() => {
+          setAdding(emptyProvider(setup.providers))
+          setSelected('new')
+        }}><Plus size={15} />添加提供商</button>
+      </div>
+      {setup.error && <p className="dialog-error" role="alert">{setup.error}</p>}
+      <div className="provider-workspace">
+        <nav className="provider-directory" aria-label="提供商列表">
+          <div><p>订阅登录</p>
+            {entry('chatgpt', 'ChatGPT', account.status?.state === 'connected', true)}
+            {entry('grok', 'Grok', setup.grok?.state === 'connected', true)}
+          </div>
+          <div><p>API 提供商</p>
+            {snapshot.providers.filter(provider => ['deepseek', 'openai', 'anthropic', 'google'].includes(provider.id))
+              .map(provider => entry(provider.id, provider.name, provider.credential !== 'missing'))}
+            {setup.providers.map(provider => entry('custom-' + provider.id, provider.name, provider.hasKey))}
+            {adding && entry('new', '新提供商', false)}
+          </div>
+        </nav>
+        <div className="provider-detail">
+          {selected === 'chatgpt' && <ChatGptManagement account={account} unavailable={snapshot.account.reason} busy={busy} perform={perform} />}
+          {selected === 'grok' && <GrokManagement setup={setup} busy={busy} perform={perform} />}
+          {builtin && <ProviderControls key={builtin.id} provider={builtin} api={api} busy={busy} perform={perform} />}
+          {setup.api && ((selected === 'new' && adding) || saved) && <CustomProviderForm key={selected}
+            initial={(saved ?? adding)!} hasKey={saved?.hasKey ?? false} isNew={!saved} busy={busy} api={setup.api} perform={perform}
+            onDiscard={() => { setAdding(undefined); setSelected('chatgpt') }}
+            onChange={(providers, id) => { setup.setProviders(providers); setAdding(undefined); setSelected(id ? 'custom-' + id : 'chatgpt') }} />}
+        </div>
+      </div>
+    </section>
   )
 }
 
@@ -75,12 +132,12 @@ function ProviderControls({ provider, api, busy, perform }: {
   const selected = provider.models.some((model) => routeKey(model.route) === routeKey(testRoute)) ? testRoute : undefined
   const credential = provider.credential !== 'missing'
   return (
-    <details className="management-detail">
-      <summary>
-        <strong>{provider.name}</strong>
+    <section className="provider-builtin">
+      <div className="provider-detail-title">
+        <h4>{provider.name}</h4>
         <span>{credential ? connectionLabels[provider.connection] : credentialLabels.missing}</span>
-      </summary>
-      <div className="management-detail-content">
+      </div>
+      <div className="provider-form">
         <p className="management-note">{credentialLabels[provider.credential]}</p>
         {credential && provider.connection === 'untested' && (
           <p className="management-note">当前显示 Pi 支持的模型。测试连接后会核对供应商目录。</p>
@@ -107,6 +164,6 @@ function ProviderControls({ provider, api, busy, perform }: {
           )}
         </div>
       </div>
-    </details>
+    </section>
   )
 }

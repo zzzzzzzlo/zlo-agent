@@ -12,6 +12,8 @@ import { createProcessTools } from './process-tools.ts'
 import { BraveSearch, createWebTools, HackerNewsSearch, publicWeb } from './web-tools.ts'
 import type { ToolApprovalCommand } from '../../shared/contracts/tool-approval.ts'
 import type { ChatGptSession } from '../../shared/contracts/chatgpt.ts'
+import type { CustomProviderCredential, CustomProviderTest, GrokCredential, GrokLoginProgress } from '../../shared/contracts/provider-setup.ts'
+import { customRoute, grokProviderId, isCustomRoute, parseCustomCredential, validCustomId } from '../../shared/contracts/provider-setup.ts'
 import { judgeEndpoint, judgeKeyMatches, parseJevSettings } from '../../shared/contracts/jev.ts'
 import type { JudgeCredentials } from '../../shared/contracts/jev.ts'
 import type { AgentPreferences, ManagedMemory, ManagedModel, ManagedOperation, ManagedProvider, ManagementCommand, ManagementSnapshot, PrivateCredentialCommand, ProviderId } from '../../shared/contracts/management.ts'
@@ -47,11 +49,20 @@ import { verifyWorkspace } from './verification.ts'
 import { CodingWorkspace } from './workspace.ts'
 
 interface ProviderRuntime {
-  listProviderAccounts(): Promise<ManagedProvider[]>
+  listProviderAccounts(): Promise<ManagedProvider<string>[]>
   testProviderAccount(provider: ProviderId, model?: string): Promise<ManagedProvider>
   validateProviderKey(provider: ProviderId, key: string): Promise<ManagedProvider>
   setProviderKey(provider: ProviderId, key: string | null | undefined): Promise<void>
   setChatGptSession(session: ChatGptSession | null): Promise<ManagedModel[]>
+  applyCustomProvider?(id: string, config: CustomProviderCredential | null): Promise<void>
+  testCustomProvider?(id: string): Promise<CustomProviderTest>
+  setGrokSession?(session: GrokCredential | null): Promise<ManagedModel[]>
+  grokLogin?: {
+    start(): void
+    poll(): GrokLoginProgress
+    cancel(): void
+    refresh(credential: GrokCredential): Promise<GrokCredential>
+  }
 }
 
 export type HostCommand =
@@ -385,8 +396,9 @@ export class LocalAgentHost {
     let route = requestedRoute
     if (!route && this.#providerRuntime) {
       const available = await this.#scheduler.discoverModels()
-      // Keep ambient and stored API models eligible. ChatGPT account routes must be selected explicitly.
-      route = available.find(model => management.providers.some(provider => provider === model.route.provider))?.route
+      // Subscription routes require an explicit conversation or default model selection.
+      route = available.find(({ route }) => isCustomRoute(route.provider) ||
+        management.providers.some(provider => provider === route.provider))?.route
       if (!route) throw new ConversationError('MODEL_UNAVAILABLE', 'Configure a model provider or select an authorized model')
     }
     if (route) {
@@ -750,6 +762,34 @@ export class LocalAgentHost {
         const change = () => this.#requireProviderRuntime().setChatGptSession(command.session)
         return command.quiesce ? this.applyProviderChange(provider => provider.startsWith('chatgpt-'), change) : change()
       }
+      case 'applyCustomProvider': {
+        const runtime = this.#requireProviderRuntime()
+        if (!validCustomId(command.id) || !runtime.applyCustomProvider) throw new ConversationError('INVALID_INPUT', 'Invalid provider update')
+        const config = command.config === null ? null : parseCustomCredential(command.config)
+        if (config === undefined || (config && config.id !== command.id)) throw new ConversationError('INVALID_INPUT', 'Invalid provider configuration')
+        await this.applyProviderChange(provider => provider === customRoute(command.id),
+          () => runtime.applyCustomProvider!(command.id, config))
+        return true
+      }
+      case 'testCustomProvider': {
+        const runtime = this.#requireProviderRuntime()
+        if (!validCustomId(command.id) || !runtime.testCustomProvider) throw new ConversationError('INVALID_INPUT', 'Invalid provider')
+        return runtime.testCustomProvider(command.id)
+      }
+      case 'applyGrokSession': {
+        const runtime = this.#requireProviderRuntime()
+        if (typeof command.quiesce !== 'boolean' || !runtime.setGrokSession) throw new ConversationError('INVALID_INPUT', 'Invalid account update')
+        const change = () => runtime.setGrokSession!(command.session)
+        return command.quiesce ? this.applyProviderChange(provider => provider === grokProviderId, change) : change()
+      }
+      case 'startGrokLogin':
+        this.#requireProviderRuntime().grokLogin?.start()
+        return true
+      case 'pollGrokLogin': return this.#requireProviderRuntime().grokLogin?.poll()
+      case 'cancelGrokLogin':
+        this.#requireProviderRuntime().grokLogin?.cancel()
+        return true
+      case 'refreshGrokLogin': return this.#requireProviderRuntime().grokLogin?.refresh(command.credential)
       case 'initializeProviderKeys':
         throw new ConversationError('INVALID_INPUT', 'Credentials are initialized before the desktop Host starts')
     }

@@ -43,3 +43,16 @@ export const chatGptChannels = {
   cancelSignIn: 'agent-chatgpt:cancel',
   signOut: 'agent-chatgpt:sign-out',
 } as const
+
+export const providerSetupChannels = {
+  listCustom: 'agent-provider-setup:list',
+  saveCustom: 'agent-provider-setup:save',
+  setCustomKey: 'agent-provider-setup:set-key',
+  removeCustomKey: 'agent-provider-setup:remove-key',
+  deleteCustom: 'agent-provider-setup:delete',
+  testCustom: 'agent-provider-setup:test',
+  grokStatus: 'agent-provider-setup:grok-status',
+  grokSignIn: 'agent-provider-setup:grok-sign-in',
+  grokCancel: 'agent-provider-setup:grok-cancel',
+  grokSignOut: 'agent-provider-setup:grok-sign-out',
+} as const

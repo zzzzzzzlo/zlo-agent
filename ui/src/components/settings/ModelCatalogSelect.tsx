@@ -5,7 +5,7 @@ import { routeDisplayLabel, routeKey } from './managementData'
 
 type ModelGroup = Omit<Pick<ManagedProvider, 'id' | 'name' | 'connection' | 'models'>, 'id'> & { id: string }
 
-export function modelGroups(providers: ManagedProvider[], account?: ChatGptStatus): ModelGroup[] {
+export function modelGroups(providers: ManagedProvider<string>[], account?: ChatGptStatus): ModelGroup[] {
   const id = account?.models[0]?.route.provider
   return account?.state === 'connected' && id
     ? [...providers, { id, name: 'ChatGPT 账号', connection: 'connected', models: account.models }]

@@ -48,13 +48,15 @@ export function ChatGptManagement({ account, unavailable, busy, perform }: {
   const [cancelError, setCancelError] = useState<string>()
   const active = status?.profiles.find((profile) => profile.id === status.activeProfileId)
   return (
-    <section className="management-group">
-      <h4>ChatGPT / Codex 账号</h4>
+    <section className="provider-form">
+      <div className="provider-detail-title"><h4>ChatGPT / Codex 账号</h4>
+        {status && <span>{accountLabels[status.state]}</span>}
+      </div>
       {!api ? <p className="management-note">{unavailable}</p>
         : error ? <p className="dialog-error" role="alert">{error}</p>
           : !status ? <p className="management-note" role="status">正在读取授权状态…</p>
             : <>
-              <p className="management-note">{accountLabels[status.state]}{active && ' · ' + active.label}</p>
+              {active && <p className="management-note">{active.label}</p>}
               <p className="management-note">通过浏览器授权 ChatGPT 账号。OpenAI API Key 使用独立的 API 额度。</p>
               {status.state === 'connected' && <p className="management-note">{status.models.length} 个可用模型</p>}
               {status.profiles.length > 0 && (

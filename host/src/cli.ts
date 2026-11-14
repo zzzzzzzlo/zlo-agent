@@ -17,6 +17,7 @@ import { inputRecord, providerId } from './management.ts'
 import { validProviderKey } from './model-management.ts'
 import { startTelemetryHttp } from './telemetry-http.ts'
 import { openCodeJudgeFetch } from './jev-transport.ts'
+import { customProviderLimit, parseCustomCredential, parseGrokCredential } from '../../shared/contracts/provider-setup.ts'
 
 const args = process.argv.slice(2)
 if (args.includes('--help')) {
@@ -77,6 +78,21 @@ async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Pro
         if (!providerRuntime) throw new Error('Invalid desktop account')
         await providerRuntime.setChatGptSession(command.chatGpt)
       }
+      if (command.customProviders !== undefined) {
+        if (!providerRuntime || !Array.isArray(command.customProviders) || command.customProviders.length > customProviderLimit) {
+          throw new Error('Invalid custom providers')
+        }
+        for (const value of command.customProviders) {
+          const config = parseCustomCredential(value)
+          if (!config) throw new Error('Invalid custom provider')
+          await providerRuntime.applyCustomProvider(config.id, config)
+        }
+      }
+      if (command.grok !== undefined) {
+        const credential = parseGrokCredential(command.grok)
+        if (!providerRuntime || !credential) throw new Error('Invalid Grok authorization')
+        if (credential.expires > Date.now()) await providerRuntime.setGrokSession(credential)
+      }
       if (command.jevKey != null) {
         if (!validProviderKey(command.jevKey)) throw new Error('Invalid desktop credential')
         jevKey = command.jevKey
@@ -116,6 +132,7 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode, desktop: boo
     'managementSnapshot', 'conversationObservatory', 'saveAgentPreferences', 'setWorkspaceAccess', 'deleteConversationMemory', 'reconcileOperation',
     'testProviderAccount', 'validateProviderKey', 'applyProviderKey', 'applyChatGptSession', 'initializeProviderKeys',
     'getJevStatus', 'saveJevSettings', 'testJevConnection', 'applyJevKey',
+    'applyCustomProvider', 'testCustomProvider', 'applyGrokSession', 'startGrokLogin', 'pollGrokLogin', 'cancelGrokLogin', 'refreshGrokLogin',
   ])
   const stopOutput = host.subscribeOutput((event) => {
     if (subscriptions.has(event.taskId)) send({ schemaVersion: 1, kind: 'output', event })
@@ -182,7 +199,8 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode, desktop: boo
           result = true
         } else if (managementTypes.has(type)) {
           if (!desktop) throw new ConversationError('INVALID_INPUT', 'Desktop management requires the private desktop transport')
-          if (type === 'testProviderAccount' || type === 'validateProviderKey' || type === 'testJevConnection') {
+          if (type === 'testProviderAccount' || type === 'validateProviderKey' || type === 'testJevConnection' ||
+            type === 'testCustomProvider' || type === 'refreshGrokLogin') {
             if (pendingProbes >= 4) throw new ConversationError('CONFLICT', 'Too many provider tests in progress')
             pendingProbes++
             void host.managementCommand(command as ManagementCommand | PrivateCredentialCommand).then(value => {
@@ -218,6 +236,9 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode, desktop: boo
     }
   } finally {
     try {
+      if (desktop && runtimeId === 'pi') {
+        await host.managementCommand({ schemaVersion: 1, type: 'cancelGrokLogin' })
+      }
       const listener = await telemetry
       await listener?.close()
       await host.close()

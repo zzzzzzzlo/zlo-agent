@@ -3,6 +3,7 @@ import { writeHostDiagnostic } from '../../shared/diagnostics.ts'
 import { mkdir, open, readFile, realpath } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
 import { InMemoryCredentialStore, type AssistantMessage, type ImageContent } from '@earendil-works/pi-ai'
+import { xaiProvider } from '@earendil-works/pi-ai/providers/xai'
 import {
   createAgentSession,
   estimateTokens,
@@ -19,6 +20,9 @@ import type { ManagedModel, ManagedProvider, ProviderId } from '../../shared/con
 import type { ChatGptSession } from '../../shared/contracts/chatgpt.ts'
 import { chatGptResponsesFetch, chatGptResponsesPayload } from './chatgpt-responses.ts'
 import { codingResources } from './coding-resources.ts'
+import { CustomProviderRegistry, GrokLogin } from './provider-setup.ts'
+import { grokProviderId, isCustomRoute, parseGrokCredential } from '../../shared/contracts/provider-setup.ts'
+import type { CustomProviderCredential, GrokCredential } from '../../shared/contracts/provider-setup.ts'
 
 function fingerprint(key: string): string { return createHash('sha256').update(key).digest('hex') }
 
@@ -40,6 +44,9 @@ export class PiExecution implements AgentExecution {
   private readonly request: typeof fetch
   private chatGptRuntime?: Promise<ModelRuntime>
   private chatGptSession?: ChatGptSession
+  private readonly customProviders = new CustomProviderRegistry()
+  readonly grokLogin = new GrokLogin(xaiProvider().auth.oauth!)
+  private grokExpires?: number
 
   constructor(createRuntime?: () => Promise<ModelRuntime>, request: typeof fetch = fetch) {
     this.environmentOnly = createRuntime === undefined
@@ -64,12 +71,13 @@ export class PiExecution implements AgentExecution {
     if (provider && isChatGptProvider(provider)) return chatGpt.filter(({ route }) => route.provider === provider)
     const runtime = await this.getRuntime()
     const candidates = runtime.getModels(provider).filter(model =>
-      (!this.environmentOnly || isProviderId(model.provider)) && this.providerAllows(model.provider, model.id) && model.input.includes('text'))
+      this.routeEnabled(model.provider) && this.providerAllows(model.provider, model.id) && model.input.includes('text'))
     const authorized = new Set((await Promise.all([...new Set(candidates.map(model => model.provider))].map(async id =>
       await runtime.checkAuth(id).catch(() => undefined) ? id : undefined))).filter(Boolean))
     return [...candidates.filter(model => authorized.has(model.provider)).map(model => ({
       route: { provider: model.provider, model: model.id }, contextWindow: model.contextWindow,
-      input: model.input, reasoning: model.reasoning, estimatedCost: model.cost.input + model.cost.output,
+      input: model.input, reasoning: model.reasoning,
+      estimatedCost: model.provider === grokProviderId || isCustomRoute(model.provider) ? undefined : model.cost.input + model.cost.output,
     })), ...chatGpt]
   }
 
@@ -123,13 +131,40 @@ export class PiExecution implements AgentExecution {
     return this.chatGptRuntime
   }
 
-  async listProviderAccounts(): Promise<ManagedProvider[]> {
+  async applyCustomProvider(id: string, config: CustomProviderCredential | null) {
+    await this.customProviders.apply(await this.getRuntime(), id, config)
+  }
+
+  testCustomProvider(id: string) { return this.customProviders.test(id, this.request) }
+
+  async setGrokSession(session: GrokCredential | null): Promise<ManagedModel[]> {
     const runtime = await this.getRuntime()
-    return Promise.all(managedProviderIds.map(async provider => {
+    if (session === null) {
+      this.grokExpires = undefined
+      await runtime.removeRuntimeApiKey(grokProviderId)
+      return []
+    }
+    const credential = parseGrokCredential(session)
+    if (!credential || credential.expires <= Date.now()) throw modelUnavailable('Invalid or expired Grok authorization')
+    await runtime.setRuntimeApiKey(grokProviderId, credential.access)
+    this.grokExpires = credential.expires
+    return runtime.getModels(grokProviderId).filter(model => model.input.includes('text'))
+      .map(model => ({ route: { provider: grokProviderId, model: model.id }, name: model.name }))
+  }
+
+  async listProviderAccounts(): Promise<ManagedProvider<string>[]> {
+    const runtime = await this.getRuntime()
+    const builtIn = await Promise.all(managedProviderIds.map(async provider => {
       const credential = this.credentials.get(provider) ??
         (await runtime.checkAuth(provider).catch(() => undefined) ? 'environment' : 'missing')
       return this.providerAccount(runtime, provider, credential, this.catalogs.get(provider))
     }))
+    const grok: ManagedProvider<string>[] = (this.grokExpires ?? 0) > Date.now() ? [{
+      id: grokProviderId, name: 'Grok 订阅', credential: 'stored', connection: 'connected',
+      models: runtime.getModels(grokProviderId).filter(model => model.input.includes('text'))
+        .map(model => ({ route: { provider: grokProviderId, model: model.id }, name: model.name })),
+    }] : []
+    return [...builtIn, ...this.customProviders.summaries(), ...grok]
   }
 
   private providerAccount(runtime: ModelRuntime, provider: ProviderId, credential: ManagedProvider['credential'],
@@ -162,7 +197,7 @@ export class PiExecution implements AgentExecution {
     if (!validProviderKey(key)) return this.providerAccount(runtime, provider, configured ?? 'missing')
     const catalog = await this.probeProvider(runtime, provider, key, model)
     if (revision === this.revisions.get(provider)) this.catalogs.set(provider, catalog)
-    return (await this.listProviderAccounts()).find(account => account.id === provider)!
+    return this.providerAccount(runtime, provider, configured ?? 'environment', this.catalogs.get(provider))
   }
 
   async setProviderKey(provider: ProviderId, key: string | null | undefined): Promise<void> {
@@ -205,10 +240,16 @@ export class PiExecution implements AgentExecution {
   }
 
   private providerAllows(provider: string, model: string): boolean {
+    if (provider === grokProviderId && (this.environmentOnly || this.grokExpires !== undefined)) return (this.grokExpires ?? 0) > Date.now()
+    if (isCustomRoute(provider)) return this.customProviders.has(provider)
     if (!isProviderId(provider)) return true
     const catalog = this.catalogs.get(provider)
     return this.credentials.get(provider) !== 'missing' && catalog?.connection !== 'unauthorized' &&
       (!catalog?.ids || catalog.ids.has(model))
+  }
+
+  private routeEnabled(provider: string): boolean {
+    return !this.environmentOnly || isProviderId(provider) || provider === grokProviderId || this.customProviders.has(provider)
   }
 
   private async resolveModel(runtime: ModelRuntime, route?: ModelRoute) {
@@ -220,7 +261,7 @@ export class PiExecution implements AgentExecution {
     }
     // These built-ins use direct environment credentials. Bedrock and Vertex can
     // also discover file/profile credentials even with an empty credential store.
-    if (this.environmentOnly && !isProviderId(route.provider)) {
+    if (!this.routeEnabled(route.provider)) {
       throw modelUnavailable('This Pi provider is not enabled for environment authentication')
     }
     const model = runtime.getModel(route.provider, route.model)
@@ -313,6 +354,9 @@ export class PiExecution implements AgentExecution {
     const canUseProvider = (provider: string, id: string, maxTokens: number) => chatGpt
       ? this.isChatGptModel(route.provider, id, maxTokens) : this.providerAllows(provider, id)
     const chatGptFetch = chatGpt ? chatGptResponsesFetch(this.request) : undefined
+    const customFetch = this.customProviders.has(route.provider) ? this.customProviders.request(route.provider, this.request) : undefined
+    const grokFetch: typeof fetch | undefined = route.provider === grokProviderId ? (input, init) =>
+      this.request(input, { ...init, redirect: 'error' }) : undefined
     session.agent.streamFunction = async (model, context, options) => {
       options?.signal?.throwIfAborted()
       if (model.provider !== (chatGpt ? 'openai' : route.provider) || model.id !== route.model) {
@@ -355,7 +399,8 @@ export class PiExecution implements AgentExecution {
         const response = await stream(model, requestContext, { ...options, maxTokens,
           ...(deepSeekThinking && recoveringOutput ? { reasoning: undefined } : {}),
           ...(chatGpt ? { apiKey: this.chatGptSession?.accessToken, cacheRetention: 'none' as const,
-            onPayload: chatGptResponsesPayload, fetch: chatGptFetch } : {}) })
+            onPayload: chatGptResponsesPayload, fetch: chatGptFetch }
+            : { fetch: customFetch ?? grokFetch }) })
         // Inspect only the completion category. Provider errors may contain request data.
         void response.result().then((message) => {
           providerMessages.add(message)
@@ -363,7 +408,7 @@ export class PiExecution implements AgentExecution {
           // Keep pixels through a Pi request retry. A completed request consumes its images.
           if (message.stopReason !== 'error') for (const id of attached) pendingImages.delete(id)
           if (input || output || cacheRead || cacheWrite || !['aborted', 'error'].includes(message.stopReason)) {
-            const estimate = chatGpt ? undefined : cost?.total
+            const estimate = chatGpt || route.provider === grokProviderId || customFetch ? undefined : cost?.total
             emit({ type: 'model.usage', input, output, cacheRead, cacheWrite,
               ...(estimate !== undefined && Number.isFinite(estimate) && estimate > 0 ? { estimatedCostUsd: estimate } : {}) })
           } else emit({ type: 'model.request_unaccounted' })

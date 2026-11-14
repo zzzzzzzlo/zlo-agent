@@ -1,4 +1,5 @@
 import { useState } from 'react'
+import { ChevronDown, FolderOpen } from 'lucide-react'
 import type { ModelRoute, VerificationCheck, WorkspaceAccess } from '../../../../shared/contracts/desktop.ts'
 import { workspaceAccessLabels } from '../../features/sessions/model'
 import { useWorkspace } from '../../stores/workspace'
@@ -90,9 +91,15 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
                 <label className="field-label">模型 ID<input maxLength={200} placeholder="使用默认模型" value={model} onChange={(event) => setModel(event.target.value)} /></label>
               </div>
             )}
-            <div className="workspace-choice">
-              <button type="button" className="button-neutral" onClick={() => void selectWorkspace()} disabled={pending}>选择工作区</button>
-              <span title={workspace}>{workspace ?? ('默认本地工作区' + (implicitAccess ? ' · ' + workspaceAccessLabels[implicitAccess] : ''))}</span>
+            <div className="field-label workspace-choice">
+              <span>工作区</span>
+              <button type="button" aria-label="选择工作区" aria-describedby="workspace-choice-current"
+                onClick={() => void selectWorkspace()} disabled={pending}>
+                <FolderOpen size={16} aria-hidden="true" />
+                <span id="workspace-choice-current" title={workspace}>{workspace ?? '默认本地工作区'}</span>
+                {!workspace && implicitAccess && <small>{workspaceAccessLabels[implicitAccess]}</small>}
+                <ChevronDown size={15} aria-hidden="true" />
+              </button>
             </div>
             {workspace && (
               <>

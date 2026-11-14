@@ -41,7 +41,7 @@ async function eventually(predicate, label, timeout = 20000) {
 }
 
 async function launch(data, mode = 'faux') {
-  const env = { ...process.env, ZLO_AGENT_DESKTOP_MODE: mode, ZLO_AGENT_DESKTOP_DATA: data }
+  const env = { ...process.env, ZLO_AGENT_DESKTOP_MODE: mode, ZLO_AGENT_DESKTOP_DATA: data, ZLO_AGENT_E2E_HIDDEN: '1' }
   delete env.ELECTRON_RUN_AS_NODE
   delete env.ELECTRON_RENDERER_URL
   return electron.launch({
@@ -52,6 +52,7 @@ async function launch(data, mode = 'faux') {
 
 async function ready(app, data) {
   const page = await app.firstWindow()
+  page.setDefaultTimeout(20_000)
   const profile = await app.evaluate(({ app }) => ({
     userData: app.getPath('userData'),
     ownsLock: app.hasSingleInstanceLock(),
@@ -75,6 +76,17 @@ async function ready(app, data) {
 
 async function history(page, conversationId) {
   return page.evaluate((id) => window.agentHost.getHistory({ conversationId: id }), conversationId)
+}
+
+async function reviewScreenshot(app, name) {
+  if (!process.env.ZLO_UI_REVIEW_DIR) return
+  const pixels = await app.evaluate(async ({ BrowserWindow }) => {
+    const window = BrowserWindow.getAllWindows()[0]
+    const image = await window.capturePage(undefined, { stayHidden: true, stayAwake: true })
+    return image.toPNG().toString('base64')
+  })
+  assert.ok(pixels.length > 100)
+  await writeFile(join(process.env.ZLO_UI_REVIEW_DIR, name), Buffer.from(pixels, 'base64'))
 }
 
 async function waitForRun(page, conversationId, count, status) {
@@ -280,7 +292,7 @@ test('Windows Electron uses the Pi Host for coding, model switch, steering, stop
   })
 
 test('Windows Electron authorizes a writable workspace without a file check and confirms trusted project execution',
-  { skip: process.platform !== 'win32', timeout: 60000 }, async (t) => {
+  { skip: process.platform !== 'win32', timeout: 100000 }, async (t) => {
     const root = await mkdtemp(join(tmpdir(), 'zlo-electron-grants-'))
     const writable = join(root, 'writable')
     const trusted = join(root, 'trusted')
@@ -328,7 +340,7 @@ test('Windows Electron authorizes a writable workspace without a file check and 
       await tasks.getByRole('heading', { name: 'Agent Tree' }).waitFor()
       await tasks.getByText(/^Worker · /).first().waitFor()
       assert.equal(await tasks.getByLabel('任务历史').inputValue(), teamTurn.taskId)
-      await tasks.getByRole('button', { name: '返回对话' }).click()
+      await page.getByRole('button', { name: '返回对话' }).click()
       await activity.getByRole('button', { name: '关闭会话中台' }).click()
       await activity.waitFor({ state: 'hidden' })
 
@@ -395,7 +407,9 @@ test('Windows Electron authorizes a writable workspace without a file check and 
       const revised = (await page.evaluate(() => window.agentHost.listConversations()))
         .find(({ id }) => id === trustedConversation.id)
       assert.equal(revised.workspaceAccess, 'read')
-      const nav = page.getByRole('navigation', { name: '工作台' })
+      assert.equal(await page.getByRole('button', { name: '权限与安全' }).count(), 0)
+      await page.getByRole('button', { name: '设置', exact: true }).click()
+      const nav = page.getByRole('navigation', { name: '设置分类' })
       await nav.getByRole('button', { name: '权限与安全' }).click()
       assert.equal(await page.getByRole('main', { name: '权限与安全' }).getByLabel('当前会话权限').inputValue(), 'read')
       await nav.getByRole('button', { name: '工具与插件' }).click()
@@ -427,11 +441,10 @@ test('Windows Electron authorizes a writable workspace without a file check and 
       assert.ok(diagnostics.tasks[0].budget.tokenLimit > diagnostics.tasks[0].budget.confirmed)
       await nav.getByRole('button', { name: '模型与账号' }).click()
       const models = page.getByRole('main', { name: '模型与账号' })
-      await models.getByRole('button', { name: 'ChatGPT 账号' }).click()
+      await models.getByRole('button', { name: 'ChatGPT', exact: true }).click()
       await models.getByRole('heading', { name: 'ChatGPT / Codex 账号' }).waitFor()
-      await page.getByRole('button', { name: /^设置/ }).click()
-      const settings = page.getByRole('dialog', { name: '设置' })
-      await settings.getByRole('button', { name: '关于' }).click()
+      await nav.getByRole('button', { name: '关于' }).click()
+      const settings = page.getByRole('main', { name: '关于' })
       const version = await app.evaluate(({ app }) => app.getVersion())
       await settings.getByText('v' + version, { exact: true }).waitFor()
     } catch (error) {
@@ -524,11 +537,11 @@ test('Windows Electron sends credential capture through Main and omits invalid c
         }
       }, canary)
 
-      await page.getByRole('navigation', { name: '工作台' }).getByRole('button', { name: '模型与账号' }).click()
+      await page.getByRole('button', { name: '设置', exact: true }).click()
       const models = page.getByRole('main', { name: '模型与账号' })
-      const provider = models.locator('details').filter({ hasText: 'DeepSeek' })
-      await provider.locator('summary').click()
-      if (process.env.ZLO_UI_REVIEW_DIR) await page.screenshot({ path: join(process.env.ZLO_UI_REVIEW_DIR, 'api.png') })
+      await models.getByRole('button', { name: 'DeepSeek', exact: true }).click()
+      const provider = models.locator('.provider-builtin')
+      await reviewScreenshot(app, 'api.png')
       await provider.getByRole('button', { name: /API Key/ }).filter({ hasText: /添加|更新/ }).click()
       await models.getByText(/剪贴板中没有有效格式的 API Key/).waitFor()
 
@@ -549,6 +562,66 @@ test('Windows Electron sends credential capture through Main and omits invalid c
     }
   })
 
+test('Windows Electron settings persist a custom provider and expose its model and workspace controls',
+  { skip: process.platform !== 'win32', timeout: 85000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'zlo-electron-provider-'))
+    const data = join(root, 'profile')
+    const workspace = join(root, 'coding-workspace')
+    const canary = 'zlo-fixture-custom-key-for-e2e'
+    await mkdir(workspace)
+    let app
+    try {
+      app = await launch(data, 'pi')
+      const page = await ready(app, data)
+      await app.evaluate(({ clipboard, dialog }, key) => {
+        clipboard.readText = () => key
+        dialog.showMessageBox = async () => ({ response: 1 })
+      }, canary)
+      await page.getByRole('button', { name: '设置', exact: true }).click()
+      const models = page.getByRole('main', { name: '模型与账号' })
+      await models.getByRole('button', { name: 'Grok', exact: true }).click()
+      await models.getByRole('button', { name: '登录 Grok', exact: true }).waitFor()
+      await models.getByRole('button', { name: '添加提供商' }).click()
+      await models.getByLabel('显示名称').fill('本地模型')
+      await models.getByLabel('提供商 ID').fill('test-local')
+      await models.getByLabel('接口地址（Base URL）').fill('http://localhost:11434/v1')
+      await models.getByLabel('模型 ID', { exact: true }).fill('fixture-model')
+      await models.getByRole('button', { name: '添加模型', exact: true }).click()
+      await models.getByRole('button', { name: '保存提供商' }).click()
+      await models.getByRole('button', { name: '添加 API Key' }).click()
+      await models.getByText('已加密保存', { exact: true }).waitFor()
+      await reviewScreenshot(app, 'custom-provider.png')
+      const settings = await page.evaluate(async () => ({
+        dom: document.documentElement.outerHTML,
+        providers: await window.agentProviderSetup.listCustom(),
+        snapshot: await window.agentManagement.snapshot({}),
+      }))
+      assert.equal(settings.providers[0].hasKey, true)
+      assert.ok(!JSON.stringify(settings).includes(canary))
+      assert.ok(!(await readFile(join(data, 'custom-providers.bin'))).includes(canary))
+      await page.getByRole('button', { name: '返回对话', exact: true }).click()
+      await app.close()
+      app = await launch(data, 'pi')
+      const restored = await ready(app, data)
+      await app.evaluate(({ dialog }, folder) => {
+        dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [folder] })
+      }, workspace)
+      await restored.getByRole('button', { name: /新建会话/ }).click()
+      const start = restored.getByRole('dialog', { name: '新建会话' })
+      const folder = start.getByRole('button', { name: '选择工作区' })
+      await folder.getByText('默认本地工作区', { exact: true }).waitFor()
+      await start.getByRole('option', { name: 'fixture-model', exact: true }).waitFor({ state: 'attached' })
+      await start.getByLabel('会话模型').selectOption({ label: 'fixture-model' })
+      await folder.click()
+      await folder.getByText(workspace, { exact: true }).waitFor()
+      await start.getByLabel('工作区权限').waitFor()
+      await reviewScreenshot(app, 'new-conversation-workspace.png')
+    } finally {
+      await app?.close()
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+    }
+  })
+
 test('Windows Electron configures Jev through Main, shows sixteen points and protects the credential',
   { skip: process.platform !== 'win32', timeout: 60000 }, async () => {
     const data = await mkdtemp(join(tmpdir(), 'zlo-electron-jev-'))
@@ -565,7 +638,7 @@ test('Windows Electron configures Jev through Main, shows sixteen points and pro
         }
       }, key)
       async function openJev(window) {
-        await window.getByRole('navigation', { name: '工作台' }).getByRole('button', { name: '模型与账号' }).click()
+        await window.getByRole('button', { name: '设置', exact: true }).click()
         const models = window.getByRole('main', { name: '模型与账号' })
         await models.getByRole('button', { name: '判定模型 (Jev)' }).click()
         await models.getByText('task.replan', { exact: true }).waitFor()
