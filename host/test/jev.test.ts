@@ -9,6 +9,7 @@ import { LocalJudgment } from '../src/judgment.ts'
 import type { JudgmentOptions } from '../src/judgment.ts'
 import { LocalStore } from '../src/store.ts'
 import { telemetryEvent } from '../src/telemetry-projection.ts'
+import { openCodeJudgeFetch } from '../src/jev-transport.ts'
 
 const key = 'synthetic-jev-test-key'
 const valid = (p = 0.01) => Response.json({
@@ -16,6 +17,21 @@ const valid = (p = 0.01) => Response.json({
   usage: { input_tokens: 100, output_tokens: 5 },
 })
 const point = 'delegation.worth'
+
+test('desktop proxy dispatch is scoped to the OpenCode System One URL', async () => {
+  const calls: RequestInit[] = []
+  const routeFetch = openCodeJudgeFetch('http://127.0.0.1:8080', async (_input, options) => {
+    calls.push(options ?? {})
+    return valid()
+  })
+  assert.ok(routeFetch)
+  assert.equal(openCodeJudgeFetch('http://user@proxy:8080'), undefined)
+  await routeFetch(openCodeJudgeEndpoint, { method: 'POST' })
+  await routeFetch(jevEndpoint, { method: 'POST' })
+  assert.ok('dispatcher' in calls[0])
+  assert.equal(calls[0].redirect, 'error')
+  assert.ok(!('dispatcher' in calls[1]))
+})
 
 test('System One routes keep credentials bound to the exact endpoint and preserve old TypeSafe settings', async () => {
   const requests: { url: unknown; auth: string | null; model: string }[] = []

@@ -390,13 +390,15 @@ export function spawnAgentHost(options: {
   data: string
   defaultWorkspace: string
   mode: 'pi' | 'faux'
+  openCodeJudgeProxy?: string
 }): ChildProcessWithoutNullStreams {
   const env: NodeJS.ProcessEnv = {
     ...process.env, ELECTRON_RUN_AS_NODE: '1', ZLO_AGENT_DEFAULT_WORKSPACE: options.defaultWorkspace,
   }
-  for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'ELECTRON_RENDERER_URL', 'ELECTRON_ENABLE_LOGGING']) {
+  for (const name of ['NODE_OPTIONS', 'NODE_PATH', 'ELECTRON_RENDERER_URL', 'ELECTRON_ENABLE_LOGGING', 'ZLO_OPENCODE_JUDGE_PROXY']) {
     delete env[name]
   }
+  if (options.openCodeJudgeProxy) env.ZLO_OPENCODE_JUDGE_PROXY = options.openCodeJudgeProxy
   if (options.mode === 'faux') {
     for (const name of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'GEMINI_API_KEY',
       'DEEPSEEK_API_KEY', 'ZLO_AGENT_MODEL_PROVIDER', 'ZLO_AGENT_MODEL_ID']) delete env[name]

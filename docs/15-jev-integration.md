@@ -21,6 +21,7 @@ Host 复用 [Judge 接口](../host/src/judgment.ts)。调用方传入 schema 版
 - `judgment.evaluated` 包含 `baseline`、实际选择 `output`、合法候选 `candidates`、`judgeOutput`、`disagreement`、`judgeModel`、`fallbackReason`、`requestSent`、`usage` 和 `resultLink`。`shadow` 保留给已有消费者。没有关联的结算事件时，评估结果保持未知。外发片段不写入事件。候选执行模型和证据引用以摘要记录，Jev 返回的版本 ID 单独记录。
 - Observatory 通过 TaskRun、Attempt、AgentRun 和关联回执展示判定。TypeSafe 费用按 [公示单价](https://help.typesafe.ai/articles/5187202169-how-much-does-jev-cost) 估算，OpenCode 免费 Jev 估算为零，其它自定义定价保留未知。费用与执行模型和 Evaluation 分开计量。
 - 工具权限、未知副作用、预算、依赖和执行结果由 Host 的确定性检查约束。Shadow 的建议不会改变执行。Active 可调整合规计划、拒绝委派或交付等，在硬约束不满足时只有规则允许的候选。
+- Windows 桌面端启动时为 OpenCode 官方判定地址读取系统 HTTP/HTTPS 代理。这个代理仅供 OpenCode System One 请求使用。
 
 ## 真实 API 冒烟
 

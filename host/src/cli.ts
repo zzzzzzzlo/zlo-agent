@@ -16,6 +16,7 @@ import type { HostCommand } from './host.ts'
 import { inputRecord, providerId } from './management.ts'
 import { validProviderKey } from './model-management.ts'
 import { startTelemetryHttp } from './telemetry-http.ts'
+import { openCodeJudgeFetch } from './jev-transport.ts'
 
 const args = process.argv.slice(2)
 if (args.includes('--help')) {
@@ -88,6 +89,7 @@ async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Pro
     failure = 'host.startup_storage_failed'
     const host = new LocalAgentHost({
       directory, execution, runtimeId, providerRuntime, defaultRoute, jevKey, judgeKeys, defaultWorkspace: process.env.ZLO_AGENT_DEFAULT_WORKSPACE,
+      jevFetch: bootstrap ? openCodeJudgeFetch(process.env.ZLO_OPENCODE_JUDGE_PROXY) : undefined,
       harnessMode, modelLimits: { ...(tokens === undefined ? {} : { tokens }), ...(requests === undefined ? {} : { requests }) },
     })
     return { host, runtimeId }

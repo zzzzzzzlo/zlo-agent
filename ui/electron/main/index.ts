@@ -13,6 +13,8 @@ import { SecureJevCredentials, SecureProviderCredentials } from './provider-cred
 import { ChatGptAccount } from './chatgpt-account.ts'
 import { registerChatGptIpc } from './chatgpt-ipc.ts'
 import type { ManagedModel } from '../../../shared/contracts/management.ts'
+import { openCodeJudgeEndpoint } from '../../../shared/contracts/jev.ts'
+import { judgeProxyUrl } from './judge-proxy.ts'
 
 const developmentData = app.isPackaged ? undefined : process.env.ZLO_AGENT_DESKTOP_DATA
 if (developmentData && localDirectory(developmentData)) {
@@ -27,6 +29,7 @@ const defaultWorkspace = join(userData, 'workspace')
 const diagnostics = createDiagnosticLog(join(userData, 'logs'))
 const credentials = new SecureProviderCredentials(userData)
 const jevCredentials = new SecureJevCredentials(userData)
+let openCodeJudgeProxy: string | undefined
 const chatGpt = hostMode === 'pi' ? new ChatGptAccount(userData, {
   async applySession(session, quiesce): Promise<ManagedModel[]> {
     try { return await host.request({ schemaVersion: 1, type: 'applyChatGptSession', session, quiesce }) }
@@ -48,7 +51,7 @@ const host = new HostProcessManager({
     mkdirSync(defaultWorkspace, { recursive: true })
     return spawnAgentHost({
       executable: process.execPath, root: hostRoot,
-      data: join(userData, 'agent-data', hostMode), defaultWorkspace, mode: hostMode,
+      data: join(userData, 'agent-data', hostMode), defaultWorkspace, mode: hostMode, openCodeJudgeProxy,
     })
   },
 })
@@ -133,7 +136,21 @@ app.whenReady().then(() => {
     version: app.getVersion(), recentDiagnostics: diagnostics.recent })
   registerChatGptIpc(chatGpt, windowFor)
 
-  void host.start()
+  const startHost = async () => {
+    if (process.platform === 'win32' && hostMode === 'pi') {
+      let deadline: ReturnType<typeof setTimeout> | undefined
+      try {
+        const route = await Promise.race([
+          session.defaultSession.resolveProxy(openCodeJudgeEndpoint),
+          new Promise<string>(resolve => { deadline = setTimeout(() => resolve('DIRECT'), 1000) }),
+        ])
+        openCodeJudgeProxy = judgeProxyUrl(route)
+      } catch { openCodeJudgeProxy = undefined }
+      finally { clearTimeout(deadline) }
+    }
+    if (!quitting) await host.start()
+  }
+  void startHost()
   createWindow()
   app.on('second-instance', () => {
     const window = BrowserWindow.getAllWindows()[0]
