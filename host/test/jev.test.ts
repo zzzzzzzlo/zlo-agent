@@ -48,6 +48,14 @@ test('System One routes keep credentials bound to the exact endpoint and preserv
     const { settings: original } = settings.status()
     const { provider, endpoint, ...legacy } = original
     assert.deepEqual(parseJevSettings(legacy, true), original)
+    const oldModes = Object.fromEntries(judgmentPoints.slice(0, 6).map(({ id }) => [id, 'shadow']))
+    const oldSettings = { ...original, enabled: true, modes: oldModes }
+    assert.equal(parseJevSettings(oldSettings), undefined)
+    const migrated = parseJevSettings(oldSettings, true)
+    assert.equal(migrated?.enabled, true)
+    assert.equal(migrated?.modes['collaboration.mode'], 'shadow')
+    assert.equal(migrated?.modes['tool.admission'], 'off')
+    assert.equal(Object.keys(migrated?.modes ?? {}).length, 16)
     const openCode = { ...original, enabled: true, provider: 'opencode' as const, endpoint: openCodeJudgeEndpoint,
       model: openCodeFreeJudgeModel, modes: { ...original.modes, [point]: 'shadow' as const } }
     const custom = { ...openCode, provider: 'custom' as const, endpoint: 'https://example.com/v1/systemone', model: 'vendor/decision-2' }

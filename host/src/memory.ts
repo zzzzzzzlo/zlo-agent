@@ -33,7 +33,7 @@ const maxSourceRefs = 8
 const maxSeenSources = 64
 const maxMemoryBytes = 768
 const referencePattern = /^[a-zA-Z0-9_.:-]{1,128}$/
-const sensitiveText = /(?:\b(?:api[-_ ]?key|password|authorization|credential|access[-_ ]?token)\s*[:=]|\bbearer\s+\S+|\b(?:sk[-_]|github_pat_|gh[pousr]_|xox[baprs]-)[a-z\d_-]{10,}|\b(?:AIza[\w-]{28,}|AKIA[A-Z\d]{16})\b|\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/iu
+const sensitiveText = /(?:\b(?:api[-_ ]?key|password|authorization|credential|access[-_ ]?token)\s*[:=]|\bbearer\s+\S+|\b(?:oc_sk_|sk[-_]|github_pat_|gh[pousr]_|xox[baprs]-)[a-z\d_-]{10,}|\b(?:AIza[\w-]{28,}|AKIA[A-Z\d]{16})\b|\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/iu
 
 function hash(...fields: string[]): string {
   return createHash('sha256').update(JSON.stringify(fields)).digest('hex')
@@ -78,6 +78,22 @@ export class LocalMemory {
   readonly #store: LocalStore
 
   constructor(store: LocalStore) { this.#store = store }
+
+  async captureReviewed(event: EventDraft, scope: string, entries: readonly MemoryCandidate[], goal: string,
+    judgment: LocalJudgment, signal: AbortSignal): Promise<void> {
+    const eligible = entries.slice(-(maxCaptureEntries + 1)).map(normalizedCandidate)
+      .filter((candidate): candidate is MemoryCandidate => candidate !== undefined)
+    const selected = await Promise.all([eligible.slice(0, 8), eligible.slice(8)].filter(batch => batch.length).map(async batch => {
+      const retain = await judgment.decideBatch(event, 'memory.capture', { goal, evidenceCount: batch.length },
+        batch.map(entry => ({ baseline: true, label: entry.kind, excerpt: entry.text })), batch.flatMap(entry => entry.sourceRefs), { signal })
+      return batch.filter((_, index) => retain[index])
+    }))
+    if (signal.aborted) return
+    const retained = selected.flat()
+    this.capture(event, scope, retained.filter(entry => entry.kind === 'fact'))
+    const experiences = retained.filter(entry => entry.kind === 'experience')
+    if (experiences.length) this.capture(event, scope, experiences)
+  }
 
   capture(event: EventDraft, scope: string, entries: readonly MemoryCandidate[]): void {
     const start = performance.now()

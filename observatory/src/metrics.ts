@@ -1,5 +1,6 @@
 import type { ModelRoute } from '../../shared/contracts/domain.ts'
 import type { TelemetryEvent, TelemetryTask } from '../../shared/contracts/observatory.ts'
+import { judgmentPoints } from '../../shared/contracts/jev.ts'
 import { buildTrace, object, peakConfirmedAgents, providerUsage, quantity, text, unionDuration } from './trace.ts'
 import type { TaskTrace, TraceSpan } from './trace.ts'
 
@@ -216,19 +217,21 @@ function toolMetrics(spans: TraceSpan[], complete: boolean): Metric[] {
   ]
 }
 
-const judgmentPoints = ['collaboration.mode', 'delegation.worth', 'model.task_fit', 'context.relevance', 'handoff.sufficiency', 'task.replan']
-
 function judgmentMetrics(events: TelemetryEvent[], complete: boolean): Metric[] {
-  const shadow = events.filter(event => event.payload.mode === 'shadow' && event.payload.shadow !== undefined)
-  const shadowDifferent = shadow.filter(event => event.payload.shadow !== event.payload.baseline).length
+  const shadow = events.filter(({ payload }) => {
+    const outcomes = object(payload.batch)?.judgeOutput
+    return payload.mode === 'shadow' && (payload.shadow !== undefined ||
+      (Array.isArray(outcomes) && outcomes.some(item => typeof item === 'boolean')))
+  })
+  const shadowDifferent = shadow.filter(({ payload }) => payload.disagreement ?? payload.shadow !== payload.baseline).length
   const external = events.filter(event => event.payload.requestSent ??
     (event.payload.mode !== 'off' && event.payload.judgeStatus !== 'baseline'))
   return [
-    count('judgment.decisions', 'Judgment decisions', events.length, 'Recorded evaluations across the six decision points.', complete),
+    count('judgment.decisions', 'Judgment decisions', events.length, 'Recorded evaluations across all registered judgment points.', complete),
     rate('judgment.shadow_disagreement', 'Shadow disagreement', shadowDifferent, shadow.length,
       'Shadow results different from the rule baseline, divided by evaluations with a recorded shadow result.', complete),
     count('judgment.active_changes', 'Active selection changes', events.filter(event => event.payload.mode === 'active' &&
-      event.payload.output !== event.payload.baseline).length, 'Active selections different from the rule baseline.', complete),
+      (event.payload.disagreement ?? event.payload.output !== event.payload.baseline)).length, 'Active selections different from the rule baseline.', complete),
     values('judgment.mean_latency', 'Mean judgment latency', 'ms', events.map(event => quantity(event.payload.elapsedMs)),
       'Mean elapsed time recorded by the Judgment Kernel, including local rules.', { complete, aggregate: 'mean' }),
     values('judgment.cost', 'Estimated judgment cost', 'USD', external.map(event => quantity(object(event.payload.usage)?.estimatedCostUsd)),
@@ -475,7 +478,7 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
     return { key, label: point ?? 'Unknown decision point', point, mode,
       featureSchemaVersion: quantity(group[0].payload.featureSchemaVersion), metrics: judgmentMetrics(group, complete), references: eventReferences(group) }
   })
-  for (const point of judgmentPoints) {
+  for (const { id: point } of judgmentPoints) {
     if (!judgments.some(group => group.point === point)) {
       judgments.push({ key: point, label: point, point, metrics: judgmentMetrics([], complete), references: [] })
     }

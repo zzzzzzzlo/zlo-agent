@@ -13,7 +13,8 @@ import { FakeExecution } from '../src/fake.ts'
 import { LocalAgentHost } from '../src/host.ts'
 import { PiExecution } from '../src/pi.ts'
 import { ExtensionRegistry } from '../src/policies.ts'
-import { jevEndpoint, judgmentPoints } from '../../shared/contracts/jev.ts'
+import { jevEndpoint, judgmentPoints, phaseTwoJudgmentPoints } from '../../shared/contracts/jev.ts'
+import { createFileTools } from '../src/file-tools.ts'
 import type { JevStatus } from '../../shared/contracts/jev.ts'
 
 type Call = (name: string, input: unknown) => Promise<unknown>
@@ -22,11 +23,16 @@ const route = { provider: 'fake', model: 'coding' }
 
 class ScriptExecution extends FakeExecution {
   readonly #script: Script
+  readonly #fixtureSkills: boolean
 
-  constructor(script: Script) { super(); this.#script = script }
+  constructor(script: Script, fixtureSkills = false) { super(); this.#script = script; this.#fixtureSkills = fixtureSkills }
 
   override async open(config: ExecutionConfig) {
     const session = await super.open(config)
+    if (this.#fixtureSkills && config.role === 'root') await config.selectSkills?.([
+      { name: 'local-docs', description: 'How to write project documentation' },
+      { name: 'backend-test', description: 'How to verify local API code' },
+    ])
     const abort = new AbortController()
     let active: Promise<ExecutionResult> | undefined
     return {
@@ -120,6 +126,79 @@ test('Host journals an approved shell command while it runs and accepts only its
     assert.ok(operations.some(({ tool, status, managed }) => tool === 'shell_exec' && status === 'succeeded' && managed))
     assert.ok(operations.some(({ tool, status }) => tool === 'process_output' && status === 'succeeded'))
     assert.ok(!operations.some(({ tool }) => tool === 'create_text_file'))
+  } finally {
+    await host.close()
+    await rm(env.path, { recursive: true, force: true })
+  }
+})
+
+test('Phase 2 judges run at real tool, worker, and turn boundaries with bounded Active follow-up', async () => {
+  const env = await fixture()
+  const publicText = 'Example public documentation. '.repeat(110)
+  const extensions = new ExtensionRegistry([
+    { id: 'files', tools: createFileTools },
+    { id: 'test-web', tools: () => [{
+      name: 'web_fetch', description: 'Fixture that returns a public document', effect: 'read',
+      parameters: { type: 'object' },
+      async execute() { return { ok: true, untrusted: true, title: 'Example', text: publicText } },
+    }] },
+  ])
+  let rootPasses = 0
+  let scriptError: unknown
+  const execution = new ScriptExecution(async (config, prompt, call) => {
+    try {
+      if (config.role === 'worker') {
+        assert.ok(ok(await call('create_text_file', { path: 'src/child.txt', content: 'worker artifact' })))
+        await call('read_text_file', { path: 'src/child.txt' })
+        return 'Worker delivered and checked child.txt'
+      }
+      rootPasses++
+      if (rootPasses === 1) {
+        assert.ok(ok(await call('create_text_file', { path: 'src/root.txt', content: 'root artifact' })))
+        const child = await call('delegate_task', { goal: 'Write and read child.txt', access: 'write', scopePath: 'src' })
+        assert.ok(ok(child), JSON.stringify(child))
+        assert.ok(JSON.stringify(child).includes('patch_scope_review'))
+        assert.ok(ok(await call('search_files', { glob: '**/*.txt' })))
+        const web = await call('web_fetch', {}) as { ok: boolean; text: string; evidenceId?: string }
+        assert.ok(web.ok)
+        assert.ok(web.evidenceId)
+        assert.ok(web.text.includes('[Excerpt omitted.]'))
+        const evidence = await call('read_tool_evidence', { evidenceId: web.evidenceId })
+        assert.ok(JSON.stringify(evidence).includes(publicText))
+        return 'The files were written. I still need a local verification pass.'
+      }
+      assert.match(prompt, rootPasses === 2 ? /Before closing/ : /Continue any unfinished work/)
+      assert.equal(ok(await call('web_fetch', {})), false)
+      assert.ok(ok(await call('read_text_file', { path: 'src/root.txt' })))
+      return 'Verified the current root file.'
+    } catch (error) { scriptError = error; throw error }
+  }, true)
+  const jevFetch: typeof fetch = async (_url, init) => {
+    const { questions } = JSON.parse(String(init?.body)) as { questions: Record<string, { instructions: string }> }
+    return Response.json({ model: 'jev-1.14.0', usage: { input_tokens: 38, output_tokens: 8 },
+      answers: Object.fromEntries(Object.entries(questions).map(([id, question]) => {
+        const supportsFollowUp = /At this completion boundary|Did the agent stop before/i.test(question.instructions)
+        const workerDone = /Worker delivered/i.test(String(init?.body))
+        const flagPatch = /reported changes appear unrelated/i.test(question.instructions)
+        return [id, { type: 'noul', noul: (supportsFollowUp && !workerDone) || flagPatch ? 0.99 : 0.01 }]
+      })) })
+  }
+  const host = new LocalAgentHost({ ...env, execution, extensions, jevFetch, jevKey: 'synthetic-test-key' })
+  try {
+    const { settings } = await host.managementCommand({ schemaVersion: 1, type: 'getJevStatus' }) as JevStatus
+    for (const { id } of phaseTwoJudgmentPoints) settings.modes[id] = 'active'
+    await host.managementCommand({ schemaVersion: 1, type: 'saveJevSettings', settings: { ...settings, enabled: true } })
+    const { taskId } = await host.createTask({ requestId: 'phase-2', cwd: env.workspace, goal: 'Write scoped artifacts', workspaceAccess: 'write' })
+    await host.idle()
+    assert.ifError(scriptError)
+    assert.equal(rootPasses, 3)
+    assert.equal(host.getTask(taskId).verification?.verdict, 'unverified')
+    const evaluated = host.events(taskId).filter(event => event.type === 'judgment.evaluated' && event.payload.requestSent)
+    const actual = new Set(evaluated.map(event => event.payload.id))
+    assert.deepEqual(actual, new Set(phaseTwoJudgmentPoints.map(({ id }) => id)))
+    assert.equal(evaluated.filter(event => event.payload.id === 'turn.completion').length, 1)
+    assert.equal(evaluated.filter(event => event.payload.id === 'turn.continue' && event.payload.output === true).length, 1)
+    assert.ok(!JSON.stringify(evaluated).includes(publicText.slice(0, 100)))
   } finally {
     await host.close()
     await rm(env.path, { recursive: true, force: true })
@@ -264,7 +343,8 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
     const { settings } = await host.managementCommand({ schemaVersion: 1, type: 'getJevStatus' }) as JevStatus
     assert.equal(settings.enabled, false)
     assert.ok(Object.values(settings.modes).every(mode => mode === 'off'))
-    for (const { id } of judgmentPoints) settings.modes[id] = 'shadow'
+    const phaseOne = judgmentPoints.slice(0, 6)
+    for (const { id } of phaseOne) settings.modes[id] = 'shadow'
     await host.managementCommand({ schemaVersion: 1, type: 'saveJevSettings', settings: { ...settings, enabled: true } })
     const conversation = host.createConversation({ requestId: 'new-core', workspace: env.workspace })
     assert.equal(conversation.workspaceAccess, 'write')
@@ -278,10 +358,12 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
     assert.ok(task.nodes?.every(node => node.verification?.verdict === (node.check ? 'verified' : 'unverified')))
     assert.equal(await readFile(join(env.workspace, 'src', 'report.txt'), 'utf8'), 'second')
     const events = host.events(taskId)
-    const decisions = new Set(events.filter(item => item.type === 'judgment.evaluated').map(item => item.payload.id))
+    const phaseOneIds = new Set<string>(phaseOne.map(({ id }) => id))
+    const phaseOneDecisions = events.filter(item => item.type === 'judgment.evaluated' && phaseOneIds.has(String(item.payload.id)))
+    const decisions = new Set(phaseOneDecisions.map(item => item.payload.id))
     assert.deepEqual([...decisions].sort(), ['collaboration.mode', 'context.relevance', 'delegation.worth',
       'handoff.sufficiency', 'model.task_fit', 'task.replan'])
-    for (const decision of events.filter(item => item.type === 'judgment.evaluated')) {
+    for (const decision of phaseOneDecisions) {
       const { baseline, output, candidates, features, resultLink } = decision.payload
       assert.ok(Array.isArray(candidates) && candidates.includes(baseline) && candidates.includes(output))
       assert.ok(features && typeof features === 'object')
@@ -313,7 +395,7 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
     assert.ok(host.events(next.taskId).some(item => item.type === 'memory.recalled' && Number(item.payload.count) > 0))
     const realJudgments = [...events, ...host.events(next.taskId)]
       .filter(item => item.type === 'judgment.evaluated' && item.payload.judgeModel === 'jev-1.14.0')
-    assert.deepEqual(new Set(realJudgments.map(item => item.payload.id)), new Set(judgmentPoints.map(({ id }) => id)))
+    assert.deepEqual(new Set(realJudgments.map(item => item.payload.id)), phaseOneIds)
     assert.ok(realJudgments.every(({ payload }) => payload.baseline === payload.output))
     assert.ok(realJudgments.some(({ payload }) => payload.disagreement === true))
     assert.ok(requests.some(({ state }) => state.goal === 'Create report.txt' && state.parentGoal === 'Execute project plan'))

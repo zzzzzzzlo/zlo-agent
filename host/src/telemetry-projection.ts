@@ -82,6 +82,7 @@ function judgment(p: Record<string, unknown>) {
       rank: num(c.rank), evidenceCount: num(c.evidenceCount), estimatedBytes: num(c.estimatedBytes) }
   })
   const link = obj(p.resultLink), usage = obj(p.usage)
+  const batch = obj(p.batch)
   return { id: oneOf(p.id, points), schemaVersion: 1, featureSchemaVersion: num(p.featureSchemaVersion),
     mode: oneOf(p.mode, ['off', 'shadow', 'active']), baseline: choice(p.baseline), output: choice(p.output), shadow: choice(p.shadow),
     candidates: list(p.candidates, 16).map(choice).filter(value => value !== undefined), features, evidenceRefs: refs(p.evidenceRefs),
@@ -90,6 +91,12 @@ function judgment(p: Record<string, unknown>) {
     elapsedMs: num(p.elapsedMs), judgeStatus: oneOf(p.judgeStatus, ['baseline', 'valid', 'invalid', 'failed', 'timed_out', 'busy']),
     fallbackReason: oneOf(p.fallbackReason, jevReasons), judgeModel: jevModel(p.judgeModel) ? p.judgeModel : undefined,
     judgeOutput: choice(p.judgeOutput), disagreement: bool(p.disagreement), requestSent: bool(p.requestSent),
+    batch: p.batch === undefined ? undefined : {
+      baseline: list(batch.baseline, 8).map(value => bool(value) ?? null),
+      output: list(batch.output, 8).map(value => bool(value) ?? null),
+      judgeOutput: list(batch.judgeOutput, 8).map(value => bool(value) ?? null),
+      fallbackReasons: list(batch.fallbackReasons, 8).map(value => oneOf(value, jevReasons) ?? null),
+    },
     usage: p.usage === undefined ? undefined : { input: num(usage.input), output: num(usage.output), estimatedCostUsd: num(usage.estimatedCostUsd) } }
 }
 

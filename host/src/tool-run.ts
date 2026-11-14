@@ -3,17 +3,20 @@ import { setTimeout as delay } from 'node:timers/promises'
 import type { EventDraft } from './contracts/domain.ts'
 import type { ExecutionTool } from './execution.ts'
 import { toolImages } from './execution.ts'
+import type { LocalJudgment } from './judgment.ts'
 import type { TaskEngine, ToolFailureReason } from './task-engine.ts'
 import type { ToolApprovalBroker } from './tool-approval.ts'
 import { workspaceTarget } from './workspace.ts'
 import type { CodingWorkspace, DeferredToolOperation, WorkspaceTool } from './workspace.ts'
 import { redactProcessOutput } from './workspace-process.ts'
 import { prepareFilePostcondition } from './reconciliation.ts'
+import { judgeToolResult } from './tool-judgment.ts'
+import type { ToolEvidenceArchive } from './tool-judgment.ts'
 
 const unavailable = { ok: false, error: 'Tool work is unavailable' }
 
 function redactResult(value: unknown, depth = 0): unknown {
-  if (typeof value === 'string') return redactProcessOutput(value)
+  if (typeof value === 'string') return redactProcessOutput(value).replace(/\boc_sk_[\w-]{16,}/gu, '[redacted]')
   if (!value || typeof value !== 'object') return value
   if (depth > 12) return undefined
   if (Array.isArray(value)) return value.map(item => redactResult(item, depth + 1))
@@ -27,15 +30,21 @@ export class ToolRun {
   readonly #cleanup = new Set<() => Promise<void>>()
   readonly #tasks: TaskEngine
   readonly #approval: ToolApprovalBroker
+  #evidenceReplayAvailable = false
+  readonly #judgment?: LocalJudgment
+  readonly #archive?: ToolEvidenceArchive
+  readonly #evidenceAccess = new Map<string, () => boolean>()
   #closed = false
 
-  constructor(tasks: TaskEngine, approval: ToolApprovalBroker) {
+  constructor(tasks: TaskEngine, approval: ToolApprovalBroker, judgment?: LocalJudgment, archive?: ToolEvidenceArchive) {
     this.#tasks = tasks
     this.#approval = approval
+    this.#judgment = judgment
+    this.#archive = archive
   }
 
   wrap(tool: WorkspaceTool, workspace: CodingWorkspace, event: () => EventDraft, signal: AbortSignal,
-    authorize: (input: unknown) => boolean, evidence?: Set<string>, artifacts?: Set<string>): ExecutionTool {
+    authorize: (input: unknown) => boolean, evidence?: Set<string>, artifacts?: Set<string>, goal = ''): ExecutionTool {
     return {
       name: tool.name, description: tool.description, parameters: tool.parameters,
       execute: async (callId, raw, toolSignal) => {
@@ -108,20 +117,54 @@ export class ToolRun {
           const reason = successful ? undefined : combined.aborted ? 'tool_cancelled'
             : result && typeof result === 'object' && 'exitCode' in result && typeof result.exitCode === 'number' && result.exitCode !== 0
               ? 'nonzero_exit' : 'tool_result_failed'
-          this.#finish(ref, operationId, successful ? 'succeeded' : 'failed', reason)
+          const changedPaths = successful && tool.name === 'apply_patch' && result && typeof result === 'object' &&
+            'changed' in result && Array.isArray(result.changed)
+            ? result.changed.slice(0, 12).flatMap(path => workspaceTarget({ path }) ?? []) : undefined
+          this.#finish(ref, operationId, successful ? 'succeeded' : 'failed', reason, changedPaths)
         }
         if (!deferred && successful) {
           evidence?.add(operationId)
           if (target && (tool.name === 'read_text_file' || tool.name === 'view_image' || effect === 'write')) artifacts?.add(target)
         }
-        return redactResult(result)
+        const safeResult = redactResult(result)
+        if (!this.#archive || !this.#judgment || !successful || deferred || effect !== 'read') return safeResult
+        const judged = await judgeToolResult(this.#judgment, this.#archive, ref, operationId, tool.name, goal, safeResult, combined,
+          this.#evidenceReplayAvailable)
+        if (this.#closed || combined.aborted || !authorize(input)) return unavailable
+        if (judged.archiveId) {
+          this.#evidenceAccess.set(judged.archiveId, () => authorize(input))
+          if (this.#evidenceAccess.size > 64) this.#evidenceAccess.delete(this.#evidenceAccess.keys().next().value!)
+        }
+        return judged.value
       },
     }
   }
 
-  #finish(event: EventDraft, id: string, status: 'succeeded' | 'failed' | 'unknown_effect', reason?: ToolFailureReason) {
+  replayTool(event: () => EventDraft, signal: AbortSignal, sourceAllowed: (tool: string) => boolean): ExecutionTool | undefined {
+    const archive = this.#archive
+    if (!archive) return
+    this.#evidenceReplayAvailable = true
+    return {
+      name: 'read_tool_evidence',
+      description: 'Read retained, redacted output for an evidenceId from one of your current run’s authorized tools. Quarantined content stays withheld.',
+      parameters: { type: 'object', additionalProperties: false, required: ['evidenceId'],
+        properties: { evidenceId: { type: 'string', minLength: 36, maxLength: 36 } } },
+      execute: async (_id, input, toolSignal) => {
+        if (this.#closed || signal.aborted || toolSignal?.aborted || !input || typeof input !== 'object' ||
+          !('evidenceId' in input) || typeof input.evidenceId !== 'string') return unavailable
+        const authorized = this.#evidenceAccess.get(input.evidenceId)
+        if (!authorized) return unavailable
+        try {
+          return archive.replay(event(), input.evidenceId, tool => sourceAllowed(tool) && authorized()) ?? unavailable
+        } catch { return unavailable }
+      },
+    }
+  }
+
+  #finish(event: EventDraft, id: string, status: 'succeeded' | 'failed' | 'unknown_effect', reason?: ToolFailureReason,
+    changedPaths?: readonly string[]) {
     if (this.#tasks.operations(event.taskId).some(operation => operation.id === id && operation.status === 'started')) {
-      this.#tasks.finishTool(event, id, status, reason)
+      this.#tasks.finishTool(event, id, status, reason, changedPaths)
     }
   }
 
@@ -134,6 +177,7 @@ export class ToolRun {
 
   async close(): Promise<void> {
     this.#closed = true
+    this.#evidenceAccess.clear()
     const work = [...this.#deferred.values()].map(async resource => {
       await resource.stop()
       await resource.settled

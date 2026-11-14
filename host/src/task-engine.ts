@@ -121,6 +121,7 @@ export interface Operation {
   tool: string
   effect: 'read' | 'write'
   target?: string
+  changedPaths?: string[]
   managed?: boolean
   processId?: number
   worktreeId?: string
@@ -890,13 +891,16 @@ export class TaskEngine {
     })
   }
 
-  finishTool(event: EventDraft, id: string, status: Exclude<Operation['status'], 'started'>, reason?: ToolFailureReason): void {
+  finishTool(event: EventDraft, id: string, status: Exclude<Operation['status'], 'started'>, reason?: ToolFailureReason,
+    changedPaths?: readonly string[]): void {
     this.#db.transaction(() => {
       const operation = this.#db.get<Operation>('operations', id)
       if (!operation || operation.taskId !== event.taskId || operation.status !== 'started' ||
         (event.taskAttemptId !== undefined && event.taskAttemptId !== operation.attemptId) ||
         (event.agentRunId !== undefined && event.agentRunId !== operation.agentRunId)) throw new Error('Tool receipt is not open')
-      this.#db.put('operations', id, { ...operation, status })
+      const paths = status === 'succeeded' && operation.effect === 'write'
+        ? changedPaths?.slice(0, 12).filter(path => typeof path === 'string' && path.length <= 256) : undefined
+      this.#db.put('operations', id, { ...operation, status, ...(paths?.length ? { changedPaths: paths } : {}) })
       this.#db.append({ ...event, taskRunId: operation.taskRunId, taskAttemptId: operation.attemptId, taskNodeId: operation.taskNodeId,
         type: 'tool.finished', payload: { id, tool: operation.tool, status, reason } })
     })

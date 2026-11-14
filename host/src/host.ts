@@ -119,6 +119,7 @@ export class LocalAgentHost {
   readonly #extensions: ReturnType<ExtensionRegistry['resolve']>
   readonly #capabilities: CodingCapabilities
   readonly #memory: LocalMemory
+  readonly #judgment: LocalJudgment
   readonly #defaultWorkspace: string
   readonly #approval: ToolApprovalBroker
   readonly #providerRuntime?: ProviderRuntime
@@ -172,7 +173,7 @@ export class LocalAgentHost {
       this.#engine = new TaskEngine(this.#store)
       this.#conversations = new ConversationService(this.#store, () => this.#failStorage())
       installTaskDiagnostics(this.#store)
-      const judgment = new LocalJudgment(this.#store, options.judgment ?? this.#jev.judgmentOptions())
+      const judgment = this.#judgment = new LocalJudgment(this.#store, options.judgment ?? this.#jev.judgmentOptions())
       this.#memory = new LocalMemory(this.#store)
       this.#scheduler = new LocalModelScheduler(options.execution, this.#store, judgment, options.modelLimits,
         () => this.#agentPreferences.modelSelection === 'automatic')
@@ -872,13 +873,13 @@ export class LocalAgentHost {
         continue
       }
       const settled = this.#engine.verify(task.id, verification)
-      if (settled.status === 'succeeded') this.#captureMemory(settled, result.route, result.event)
+      if (settled.status === 'succeeded') await this.#captureMemory(settled, result.route, result.event, signal)
       return
     }
     this.#engine.end(task.id, 'budget_exhausted')
   }
 
-  #captureMemory(task: TaskSnapshot, route: ModelRoute, event: EventDraft): void {
+  async #captureMemory(task: TaskSnapshot, route: ModelRoute, event: EventDraft, signal: AbortSignal): Promise<void> {
     const writes = this.#engine.operations(task.id).filter(item => item.effect === 'write' && item.status === 'succeeded')
     const entries = writes.filter(item => item.target).slice(-12).map(item => ({
       kind: 'fact' as const,
@@ -886,13 +887,18 @@ export class LocalAgentHost {
       sourceRefs: [item.id],
     }))
     const scope = memoryScope(task, route)
-    this.#memory.capture(event, scope, entries)
-    if (task.check && task.verification?.passed) this.#memory.capture(event, scope, [{
-      kind: 'experience',
+    const experiences = task.check && task.verification?.passed ? [{
+      kind: 'experience' as const,
       text: task.check.command ? 'Project verification passed using ' + task.check.command.command
         : 'A workspace check passed for ' + task.check.path,
       sourceRefs: [task.id],
-    }])
+    }] : []
+    if (this.#judgment.mode('memory.capture', task.id) === 'off') {
+      this.#memory.capture(event, scope, entries)
+      if (experiences.length) this.#memory.capture(event, scope, experiences)
+      return
+    }
+    await this.#memory.captureReviewed(event, scope, [...entries, ...experiences], task.goal, this.#judgment, signal)
   }
 
   async idle(): Promise<void> {

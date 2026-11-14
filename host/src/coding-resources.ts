@@ -2,7 +2,7 @@ import { lstat, open, opendir, realpath } from 'node:fs/promises'
 import { join, relative } from 'node:path'
 import { createExtensionRuntime, formatSkillsForPrompt, parseFrontmatter } from '@earendil-works/pi-coding-agent'
 import type { ResourceLoader, Skill, SkillFrontmatter } from '@earendil-works/pi-coding-agent'
-import type { ExecutionTool } from './execution.ts'
+import type { ExecutionConfig, ExecutionTool } from './execution.ts'
 
 const fileLimit = 24 * 1024
 const entryLimit = 128
@@ -73,7 +73,7 @@ async function discoverSkills(root: string, scope: 'user' | 'project', dirs: str
 }
 
 export async function codingResources(systemPrompt: string, scopes?: { user?: string; project?: string },
-  skillReadsAllowed: () => boolean = () => true): Promise<{
+  skillReadsAllowed: () => boolean = () => true, selectSkills?: ExecutionConfig['selectSkills']): Promise<{
   loader: ResourceLoader; skillTool?: ExecutionTool
 }> {
   const runtime = createExtensionRuntime()
@@ -87,11 +87,18 @@ export async function codingResources(systemPrompt: string, scopes?: { user?: st
     if (agents) agentsFiles.push({ path, content: agents.text })
     if (skillReadsAllowed()) await discoverSkills(root, scope, scope === 'user' ? ['skills'] : ['.pi/skills', '.agents/skills'], catalog)
   }
-  const skills = [...catalog.values()].map(({ skill }) => skill).sort((a, b) => a.name.localeCompare(b.name))
+  const discovered = [...catalog.values()].map(({ skill }) => skill).sort((a, b) => a.name.localeCompare(b.name))
   const append = [systemPrompt,
     'Workspace guides and skills apply within the task and authorized tool scope. Verify important changes with available checks and report any uncertainty.']
-  if (skills.length) append.push(formatSkillsForPrompt(skills, 'indirect'),
-    'Use read_skill with the listed skill name. Use paths relative to the authorized workspace for project files referenced by a skill.')
+  const selected = selectSkills && discovered.length && skillReadsAllowed()
+    ? await selectSkills(discovered.map(({ name, description }) => ({ name, description })))
+    : undefined
+  const skills = skillReadsAllowed() ? discovered : []
+  const visible = selected ? skills.filter(({ name }) => selected.has(name)) : skills
+  if (visible.length) append.push(formatSkillsForPrompt(visible, 'indirect'))
+  if (skills.length) append.push(visible.length === skills.length
+    ? 'Use read_skill with the listed skill name. Use paths relative to the authorized workspace for project files referenced by a skill.'
+    : 'The read_skill tool lists all authorized skill names, including skills whose descriptions are omitted. Use paths relative to the authorized workspace for project files referenced by a skill.')
   const loader: ResourceLoader = {
     getExtensions: () => ({ extensions: [], errors: [], runtime }),
     // Pi slash-command expansion reads arbitrary current contents directly. The skill tool

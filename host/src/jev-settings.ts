@@ -144,20 +144,23 @@ export class JevConfiguration {
           pointController = new AbortController()
           this.#pointControllers.set(point, pointController)
         }
+        const request = async <T>(signal: AbortSignal, operation: (judge: JevJudge) => Promise<T>) => {
+          try {
+            signal.throwIfAborted()
+            if (!key) throw new JevFailure('missing_key')
+            this.#reserve(taskId)
+            return await operation(new JevJudge(key, route, this.#request))
+          } catch (error) {
+            const reason = error instanceof JevFailure ? error.reason : 'unavailable'
+            if (!signal.aborted) this.#backoff(reason)
+            return { output: undefined, reason, requestSent: error instanceof JevFailure && error.requestSent }
+          }
+        }
         const judge: Judge = {
-          evaluate: async (input, signal) => {
-            try {
-              signal.throwIfAborted()
-              if (!key) throw new JevFailure('missing_key')
-              if (input.allowed.length < 2) throw new JevFailure('no_choice')
-              this.#reserve(taskId)
-              return await new JevJudge(key, route, this.#request).evaluate(input, signal)
-            } catch (error) {
-              const reason = error instanceof JevFailure ? error.reason : 'unavailable'
-              if (!signal.aborted) this.#backoff(reason)
-              return { output: undefined, reason, requestSent: error instanceof JevFailure && error.requestSent }
-            }
-          },
+          evaluate: (input, signal) => input.allowed.length >= 2
+            ? request(signal, adapter => adapter.evaluate(input, signal))
+            : Promise.resolve({ output: undefined, reason: 'no_choice', requestSent: false }),
+          evaluateBatch: (input, signal) => request(signal, adapter => adapter.evaluateBatch(input, signal)),
         }
         return { mode, judge, signal: AbortSignal.any([this.#generation.signal, pointController.signal]), allowScopedEvidence: Boolean(key) }
       },

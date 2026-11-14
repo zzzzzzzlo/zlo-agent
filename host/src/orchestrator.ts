@@ -5,6 +5,7 @@ import { ModelUnavailableError } from './execution.ts'
 import type { AgentExecution, ExecutionConfig, ExecutionSession, ExecutionTool, RuntimeEvent } from './execution.ts'
 import type { EndReason, EventDraft, ModelRoute, SessionRef } from './contracts/domain.ts'
 import type { LocalJudgment } from './judgment.ts'
+import { frameInstruction, preflight, skillDisclosure } from './input-judgment.ts'
 import type { ScopedContext } from './memory.ts'
 import { ModelBudgetError } from './model-scheduler.ts'
 import type { LocalModelScheduler } from './model-scheduler.ts'
@@ -13,6 +14,9 @@ import type { LocalStore } from './store.ts'
 import type { NodeProposal, TaskEngine, TaskSnapshot, WorkerNode, WorkerResult } from './task-engine.ts'
 import type { ToolApprovalBroker } from './tool-approval.ts'
 import { ToolRun } from './tool-run.ts'
+import { ToolEvidenceArchive } from './tool-judgment.ts'
+import { followUpAllows, reviewTurn } from './turn-judgment.ts'
+import type { TurnFollowUp } from './turn-judgment.ts'
 import { verifyWorkspace } from './verification.ts'
 import { VisualTelemetry } from './visual-workflow.ts'
 import { workspaceTarget } from './workspace.ts'
@@ -70,6 +74,7 @@ export class MultiAgentOrchestrator {
   readonly #judgment: LocalJudgment
   readonly #extensions: ProfileRuntime
   readonly #approval: ToolApprovalBroker
+  readonly #toolEvidence: ToolEvidenceArchive
   readonly #resolveWorkspace?: (workspace: CodingWorkspace, taskId: string, id: string, signal: AbortSignal) => Promise<CodingWorkspace | undefined>
   readonly #sessions: string
   readonly #mode: HarnessMode
@@ -100,6 +105,7 @@ export class MultiAgentOrchestrator {
     this.#judgment = ports.judgment
     this.#extensions = ports.extensions
     this.#approval = ports.approval
+    this.#toolEvidence = new ToolEvidenceArchive(this.#db)
     this.#resolveWorkspace = ports.resolveWorkspace
     this.#sessions = ports.sessions
     this.#mode = ports.mode ?? 'quality'
@@ -245,7 +251,8 @@ export class MultiAgentOrchestrator {
     }
     const evidence = new Set<string>()
     const artifacts = new Set<string>()
-    const toolRun = new ToolRun(this.#tasks, this.#approval)
+    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence)
+    let followUp: TurnFollowUp | undefined
     let session: ExecutionSession | undefined
     let unwatch: (() => Promise<void>) | undefined
     let lease: ReturnType<LocalModelScheduler['reserve']> | undefined
@@ -286,12 +293,13 @@ export class MultiAgentOrchestrator {
         if (saved) event = { ...event, agentId: saved.id }
       }
       const route = await this.#scheduler.allocate(event, parentRoute, node.route ?? saved?.route, Boolean(node.role), node.goal, signal)
-      const tools = this.#extensions.tools(workspace, role, scope.access)
+      const availableTools = this.#extensions.tools(workspace, role, scope.access)
         .filter(tool => this.#capabilities.describe(scope, tool))
+      const tools = availableTools
         .map(tool => {
           const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input =>
             !childActive && !blockingWrite(tool.policy?.whileActive ? event.agentRunId : undefined) &&
-            this.#capabilities.authorize(scope, tool, input), evidence, artifacts)
+            followUpAllows(followUp, tool.name) && this.#capabilities.authorize(scope, tool, input), evidence, artifacts, node.goal)
           return {
             ...wrapped,
             execute: async (id: string, input: unknown, toolSignal?: AbortSignal) => {
@@ -301,8 +309,11 @@ export class MultiAgentOrchestrator {
             },
           } as ExecutionTool
         })
+      const replay = this.#canArchiveToolEvidence(task.id) && toolRun.replayTool(() => event, signal, name => availableTools.some(tool => tool.name === name &&
+        this.#capabilities.describe(scope, tool)) && !followUp)
+      if (replay) tools.push(replay)
       const runChild = async (child: WorkerNode) => {
-        if (childActive || workspaceActive || signal.aborted || !session) return undefined
+        if (followUp || childActive || workspaceActive || signal.aborted || !session) return undefined
         childActive = true
         try {
           return await this.#worker(task, child, event, workspace, session.route, scope, signal, true)
@@ -313,7 +324,7 @@ export class MultiAgentOrchestrator {
       if (role === 'team' && this.#profile.delegation && this.#capabilities.enabled('delegate_worker')) tools.push(delegationTool('delegate_worker',
         async (id, input, toolSignal) => {
           if (!this.#capabilities.enabled('delegate_worker') ||
-            signal.aborted || toolSignal?.aborted || childActive || workspaceActive || blockingWrite()) {
+            followUp || signal.aborted || toolSignal?.aborted || childActive || workspaceActive || blockingWrite()) {
             return { ok: false, error: 'Delegation unavailable' }
           }
           const goal = input.goal
@@ -336,10 +347,14 @@ export class MultiAgentOrchestrator {
           }
         }))
       signal.throwIfAborted()
+      const advice = await preflight(this.#judgment, event, node.goal, signal)
+      signal.throwIfAborted()
       session = await this.#execution.open({
         cwd: workspace.root, role, correlationId: event.agentRunId,
         sessionDirectory: join(this.#sessions, teamKey ?? task.id), session: saved?.session, route, tools,
         systemPrompt: this.#extensions.workflow.systemPrompt(role, scope.access, node.check),
+        selectSkills: skillDisclosure(this.#judgment, event, node.goal, signal),
+        ...(this.#mode === 'quality' && advice.reasoningEffort ? { reasoningEffort: advice.reasoningEffort } : {}),
         ...this.#runtimePolicy(workspace, scope),
         reserveRequest: (request) => {
           signal.throwIfAborted()
@@ -386,7 +401,17 @@ export class MultiAgentOrchestrator {
           artifactRefs: target ? [target] : [], availableTools: tools.map(tool => tool.name), signal,
         })
         signal.throwIfAborted()
-        const outcome = await session.run(prompt)
+        let outcome = await session.run(advice.hint ? prompt + '\n\n' + advice.hint : prompt)
+        const attempted = new Set<TurnFollowUp['id']>()
+        while (!signal.aborted && outcome.status === 'completed' &&
+          (this.#judgment.mode('turn.completion', task.id) !== 'off' || this.#judgment.mode('turn.continue', task.id) !== 'off')) {
+          followUp = await reviewTurn(this.#judgment, event, { goal: node.goal, summary: outcome.text, checkConfigured: Boolean(node.check),
+            operations: this.#tasks.operations(task.id), completedReceipts: this.#completedReceipts(event), attempted, signal })
+          if (!followUp || signal.aborted) break
+          await session.checkpoint()
+          outcome = await session.run(followUp.nudge)
+        }
+        followUp = undefined
         executionCompleted = outcome.status === 'completed'
         if (!signal.aborted && outcome.status === 'completed' && outcome.text.trim()) {
           if (node.check?.command && (!this.#capabilities.enabled('run_project_command') || scope.path ||
@@ -406,11 +431,12 @@ export class MultiAgentOrchestrator {
             evidenceCount: evidence.size, artifactCount: artifacts.size, checked: Boolean(node.check),
             checkPassed: verification?.passed === true, role, access: scope.access, completedChildren,
           }, hardEvidence, hardEvidence ? [true, false] : [false], [...evidence], { signal })
+          const review = await this.#reviewWorkerPatch(task, node, event, scope, signal)
           result = {
             resultStatus: hardEvidence && accepted ? 'succeeded' : 'failed',
             executionStatus: 'completed',
             summary: outcome.text.slice(0, 1600), artifactRefs: [...artifacts], evidenceRefs: [...evidence],
-            remainingRisks: hardEvidence && accepted ? [] : ['verification_failed'],
+            remainingRisks: [...(hardEvidence && accepted ? [] : ['verification_failed']), ...(review ? ['patch_scope_review'] : [])],
           }
         }
       }
@@ -452,8 +478,30 @@ export class MultiAgentOrchestrator {
   }
 
 
+  async #reviewWorkerPatch(task: TaskSnapshot, node: WorkerNode, event: EventDraft, scope: CapabilityScope, signal: AbortSignal) {
+    if (this.#judgment.mode('swarm.patch', task.id) === 'off' || signal.aborted) return false
+    const writes = this.#tasks.operations(task.id).filter(operation => operation.taskNodeId === node.id &&
+      operation.attemptId === event.taskAttemptId && operation.effect === 'write' && operation.status === 'succeeded')
+    if (!writes.length) return false
+    const summary = writes.slice(0, 12).map(({ tool, target, changedPaths }) =>
+      tool + ': ' + (changedPaths?.join(', ') || target || '(no individual path)')).join('\n')
+    return this.#judgment.decide(event, 'swarm.patch', {
+      goal: node.goal, parentGoal: task.goal, proposedGoal: scope.path, summary, writeCount: writes.length,
+    }, false, [false, true], writes.map(operation => operation.id), { signal })
+  }
+
+  #completedReceipts(event: EventDraft): string[] {
+    return this.#db.eventsOfTypes(event.taskId, ['tool.finished'])
+      .filter(item => item.taskAttemptId === event.taskAttemptId && item.taskNodeId === event.taskNodeId && typeof item.payload.id === 'string')
+      .map(item => item.payload.id as string)
+  }
+
+  #canArchiveToolEvidence(taskId: string): boolean {
+    return this.#judgment.mode('tool.admission', taskId) === 'active' || this.#judgment.mode('tool.injection', taskId) === 'active'
+  }
+
   async run(task: TaskSnapshot, workspace: CodingWorkspace, stopSignal: AbortSignal): Promise<Outcome> {
-    const toolRun = new ToolRun(this.#tasks, this.#approval)
+    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence)
     const budget = new AbortController()
     const signal = AbortSignal.any([stopSignal, budget.signal])
     const agentKey = task.conversationId ?? task.id
@@ -473,6 +521,15 @@ export class MultiAgentOrchestrator {
     let outputFailed = false
     let textProduced = false
     let streamed = false
+    let followUp: TurnFollowUp | undefined
+    let advice: Awaited<ReturnType<typeof preflight>> = {}
+    const attempted = new Set<TurnFollowUp['id']>()
+    if (this.#judgment.mode('turn.completion', task.id) !== 'off' || this.#judgment.mode('turn.continue', task.id) !== 'off') {
+      for (const decision of this.#db.eventsOfTypes(task.id, ['judgment.evaluated'])) {
+        const { id } = decision.payload
+        if (decision.taskAttemptId === task.attemptId && (id === 'turn.completion' || id === 'turn.continue')) attempted.add(id)
+      }
+    }
     const seenSteers = new Set<string>()
     const queuedSteers = new Set<string>()
     let prompted = new Set<string>()
@@ -483,7 +540,7 @@ export class MultiAgentOrchestrator {
       (type, payload) => this.#db.transaction(() => { this.#db.append({ ...event, type, payload }) }))
     const hasUnknownWrite = () => this.#tasks.blocksToolWork(task.id)
     const dispatchAllowed = (toolSignal?: AbortSignal) =>
-      this.#profile.delegation && !signal.aborted && !toolSignal?.aborted && !workspaceActive && !workerActive && !hasUnknownWrite()
+      this.#profile.delegation && !followUp && !signal.aborted && !toolSignal?.aborted && !workspaceActive && !workerActive && !hasUnknownWrite()
     const runWorker = async (node: WorkerNode): Promise<WorkerResult | undefined> => {
       if (!session || !dispatchAllowed()) throw new Error('Worker cannot start at this boundary')
       if (node.result) return node.result
@@ -523,12 +580,13 @@ export class MultiAgentOrchestrator {
       const latest = this.#tasks.get(task.id)
       return [latest.worker, ...(latest.nodes ?? [])].filter((node): node is WorkerNode => Boolean(node && completed.has(node.id)))
     }
-    const tools: ExecutionTool[] = this.#extensions.tools(workspace, 'root', rootScope.access)
+    const availableTools = this.#extensions.tools(workspace, 'root', rootScope.access)
       .filter(tool => this.#capabilities.describe(rootScope, tool))
+    const tools: ExecutionTool[] = availableTools
       .map(tool => {
         const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input =>
           !workerActive && !this.#tasks.blocksToolWork(task.id, tool.policy?.whileActive ? event.agentRunId : undefined) &&
-          this.#capabilities.authorize(rootScope, tool, input))
+          followUpAllows(followUp, tool.name) && this.#capabilities.authorize(rootScope, tool, input), undefined, undefined, task.goal)
         return {
           ...wrapped,
           execute: async (id, input, toolSignal) => {
@@ -545,6 +603,9 @@ export class MultiAgentOrchestrator {
           },
         }
       })
+    const replay = this.#canArchiveToolEvidence(task.id) && toolRun.replayTool(() => event, signal, name => availableTools.some(tool => tool.name === name &&
+      this.#capabilities.describe(rootScope, tool)) && !followUp)
+    if (replay) tools.push(replay)
     if (this.#profile.delegation) {
       if (this.#capabilities.enabled('delegate_task')) tools.push(delegationTool('delegate_task', async (id, input, toolSignal) => {
           if (!this.#capabilities.enabled('delegate_task') || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Delegation unavailable' }
@@ -640,6 +701,8 @@ export class MultiAgentOrchestrator {
       sessionDirectory: join(this.#sessions, agentKey), session: ref, route, tools,
       systemPrompt: this.#extensions.workflow.systemPrompt('root', rootScope.access, task.check),
       ...this.#runtimePolicy(workspace, rootScope),
+      ...(this.#mode === 'quality' && advice.reasoningEffort ? { reasoningEffort: advice.reasoningEffort } : {}),
+      selectSkills: skillDisclosure(this.#judgment, event, task.goal, signal),
       resumeAfterOutputLimit: saved?.taskId === task.id && previousAttempt?.reason === 'model_output_limit',
       canRecoverModelOutput: () => !signal.aborted && !hasUnknownWrite(),
       reserveRequest: (request) => {
@@ -721,6 +784,8 @@ export class MultiAgentOrchestrator {
         }
       }
       if (signal.aborted) return { status: 'interrupted' }
+      advice = await preflight(this.#judgment, event, task.goal, signal)
+      signal.throwIfAborted()
       openingSavedSession = Boolean(saved)
       session = await this.#execution.open(config(initialRoute, saved?.session))
       if ((saved && (saved.session.id !== session.ref.id || saved.session.path !== session.ref.path)) ||
@@ -740,7 +805,13 @@ export class MultiAgentOrchestrator {
           if (!item || item.delivered) return false
           queuedSteers.add(id)
           try {
-            await session.steer(text, id)
+            const currentSession = session
+            const framed = await frameInstruction(this.#judgment, event, task.goal, text, signal)
+            if (session !== currentSession || signal.aborted || prompted.has(id)) {
+              queuedSteers.delete(id)
+              return false
+            }
+            await currentSession.steer(framed, id)
             return true
           } catch {
             queuedSteers.delete(id)
@@ -752,9 +823,12 @@ export class MultiAgentOrchestrator {
           this.#db.transaction(() => { this.#db.append({ ...event, type: 'model.route_changed', payload: { route } }) })
         }
         unlockRoute()
+        const previousGoal = saved && saved.taskId !== task.id && this.#judgment.mode('task.frame', task.id) !== 'off'
+          ? this.#tasks.get(saved.taskId).goal : ''
         let nextPrompt = saved?.taskId === task.id
           ? 'Resume the task using the saved conversation. Recheck current workspace state before new edits and avoid repeating confirmed changes.\n\nOriginal task goal: ' + task.goal
-          : task.goal
+          : await frameInstruction(this.#judgment, event, previousGoal, task.goal, signal, true)
+        if (advice.hint) nextPrompt += '\n\n' + advice.hint
         while (!signal.aborted) {
           const current = this.#tasks.get(task.id)
           if (current.route && !sameRoute(current.route, session.route)) {
@@ -782,21 +856,24 @@ export class MultiAgentOrchestrator {
             })
             unlockRoute()
           }
-          const completedNodes = await drain()
+          const completedNodes = followUp ? [] : await drain()
           if (signal.aborted) break
           if (completedNodes.length) nextPrompt += '\nAgent handoffs:\n' + JSON.stringify(handoffs(completedNodes)).slice(0, 8000)
           const latest = this.#tasks.get(task.id)
           if (conversationId && latest.route && !sameRoute(latest.route, session.route)) continue
           const instructions = latest.instructions.filter((item) => !item.delivered)
           prompted = new Set(instructions.map(({ id }) => id))
+          const constraints = await Promise.all(instructions.map(async ({ text }) =>
+            'Additional user instruction: ' + await frameInstruction(this.#judgment, event, task.goal, text, signal)))
           const prompt = await this.#context.build(event, {
             scope: memoryScope(task, session.route), goal: nextPrompt, judgmentGoal: task.goal,
-            constraints: instructions.map(({ text }) => 'Additional user instruction: ' + text),
+            constraints,
             signal,
           })
           if (signal.aborted) break
           streamed = false
           const result = await session.run(prompt)
+          followUp = undefined
           if (result.status !== 'completed') {
             outcome = result
             break
@@ -823,6 +900,15 @@ export class MultiAgentOrchestrator {
           const after = this.#tasks.get(task.id)
           const more = after.instructions.some((item) => !item.delivered) || this.#tasks.runnableNodes(task.id).length > 0 ||
             (!conversationId && after.route && !sameRoute(after.route, session.route))
+          if (!more && !hasUnknownWrite() && (this.#judgment.mode('turn.completion', task.id) !== 'off' ||
+            this.#judgment.mode('turn.continue', task.id) !== 'off')) {
+            followUp = await reviewTurn(this.#judgment, event, { goal: task.goal, summary: result.text, checkConfigured: Boolean(task.check),
+              operations: this.#tasks.operations(task.id), completedReceipts: this.#completedReceipts(event), attempted, signal })
+            if (followUp && !signal.aborted && !hasUnknownWrite()) {
+              nextPrompt = followUp.nudge
+              continue
+            }
+          }
           if (!more || hasUnknownWrite()) {
             outcome = { status: 'completed', route: session.route, textProduced, event }
             break

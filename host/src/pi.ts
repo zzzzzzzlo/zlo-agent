@@ -258,7 +258,7 @@ export class PiExecution implements AgentExecution {
     let stopping = false
     const pendingImages = new Map<string, ToolImage[]>()
     const vision = model.input.includes('image')
-    const resources = await codingResources(config.systemPrompt, config.instructionScopes, config.skillReadsAllowed)
+    const resources = await codingResources(config.systemPrompt, config.instructionScopes, config.skillReadsAllowed, config.selectSkills)
     const enabledTools = resources.skillTool ? [...config.tools, resources.skillTool] : config.tools
     const customTools = enabledTools.map(tool => asPiTool(tool, () => stopping, vision, pendingImages))
     const { session } = await createAgentSession({

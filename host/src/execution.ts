@@ -40,6 +40,11 @@ export interface ModelRequest {
   kind: 'prompt' | 'compaction'
 }
 
+export interface SkillMetadata {
+  readonly name: string
+  readonly description: string
+}
+
 export interface ExecutionConfig {
   cwd: string
   correlationId?: string
@@ -51,6 +56,7 @@ export interface ExecutionConfig {
   systemPrompt: string
   instructionScopes?: { user?: string; project?: string }
   skillReadsAllowed?(): boolean
+  selectSkills?(skills: readonly SkillMetadata[]): Promise<ReadonlySet<string>>
   reasoningEffort?: 'low' | 'medium' | 'high'
   resumeAfterOutputLimit?: boolean
   canRecoverModelOutput?(): boolean

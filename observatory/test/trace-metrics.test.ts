@@ -124,7 +124,7 @@ test('metrics count provider usage and costs once, preserve coverage, and separa
   assert.equal(byId.get('judgment.cost')?.value, 0.005)
   assert.equal(byId.get('security.approvals_denied')?.value, 1)
   assert.equal(byId.get('security.policy_denials')?.quality, 'unknown')
-  assert.equal(metrics.judgments.length, 6)
+  assert.equal(metrics.judgments.length, 16)
   const alternateMetrics = metrics.models.find(group => group.model === 'pro')!.metrics
   assert.equal(alternateMetrics.find(metric => metric.id === 'model.mean_latency')?.quality, 'unknown')
   assert.equal(alternateMetrics.find(metric => metric.id === 'model.cost')?.quality, 'unknown')

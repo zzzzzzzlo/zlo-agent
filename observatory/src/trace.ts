@@ -325,7 +325,7 @@ function judgmentLinks(events: TelemetryEvent[]) {
       settlements.set(`${event.taskNodeId}:${event.taskAttemptId}`, event)
     }
     const source = event.type === 'judgment.evaluated' ? text(event.payload.id) : event.type
-    if (event.agentRunId && source && ['agent.started', 'model.reserved', 'memory.recalled', 'model.task_fit'].includes(source)) {
+    if (event.agentRunId && source && ['agent.started', 'model.reserved', 'memory.recalled', 'memory.captured', 'model.task_fit'].includes(source)) {
       const key = `${event.agentRunId}:${source}`
       const group = related.get(key) ?? []
       group.push(event)
@@ -341,7 +341,13 @@ function judgmentLinks(events: TelemetryEvent[]) {
     const node = text(link?.taskNodeId) ?? event.taskNodeId
     const attempt = text(link?.taskAttemptId) ?? event.taskAttemptId
     const candidates = [plan ? plans.get(plan) : undefined, receipt ? receipts.get(receipt) : undefined]
-    if (point === 'handoff.sufficiency' && node && attempt) candidates.push(settlements.get(`${node}:${attempt}`))
+    if ((point === 'handoff.sufficiency' || point === 'swarm.patch') && node && attempt) candidates.push(settlements.get(`${node}:${attempt}`))
+    if (agent && point === 'memory.capture') candidates.push((related.get(`${agent}:memory.captured`) ?? [])
+      .find(candidate => candidate.seq > event.seq))
+    const toolDecision = ['tool.admission', 'tool.injection', 'files.locate'].includes(point ?? '')
+    if (toolDecision && Array.isArray(event.payload.evidenceRefs)) {
+      candidates.push(...event.payload.evidenceRefs.flatMap(key => typeof key === 'string' ? [receipts.get(key)] : []))
+    }
     if (agent && point === 'model.task_fit') {
       const nextDecision = related.get(`${agent}:model.task_fit`)?.find(candidate => candidate.seq > event.seq)
       const withinDecision = (candidate: TelemetryEvent) => !nextDecision || candidate.seq < nextDecision.seq
@@ -351,7 +357,8 @@ function judgmentLinks(events: TelemetryEvent[]) {
     if (agent && point === 'context.relevance') candidates.push((related.get(`${agent}:memory.recalled`) ?? [])
       .find(candidate => candidate.seq > event.seq))
     const linkedEventIds = [...new Set(candidates.filter((item): item is TelemetryEvent => Boolean(item &&
-      item.taskRunId === event.taskRunId && item.seq > event.seq)).map(item => item.id))]
+      item.taskRunId === event.taskRunId && (toolDecision ? item.seq < event.seq && item.agentRunId === agent
+        : item.seq > event.seq))).map(item => item.id))]
     return { eventId: event.id, point, linkedEventIds }
   })
 }

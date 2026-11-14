@@ -549,7 +549,7 @@ test('Windows Electron sends credential capture through Main and omits invalid c
     }
   })
 
-test('Windows Electron configures Jev through Main, persists all six point settings and protects the credential',
+test('Windows Electron configures Jev through Main, shows sixteen points and protects the credential',
   { skip: process.platform !== 'win32', timeout: 60000 }, async () => {
     const data = await mkdtemp(join(tmpdir(), 'zlo-electron-jev-'))
     const key = 'synthetic-jev-desktop-canary'
@@ -573,7 +573,7 @@ test('Windows Electron configures Jev through Main, persists all six point setti
       }
       const models = await openJev(page)
       const actual = () => page.evaluate(() => window.agentManagement.getJevStatus())
-      assert.equal(Object.keys((await actual()).settings.modes).length, 6)
+      assert.equal(Object.keys((await actual()).settings.modes).length, 16)
       assert.ok(Object.values((await actual()).settings.modes).every(mode => mode === 'off'))
       await models.getByRole('button', { name: '添加 API Key' }).click()
       await models.getByText('API Key 已加密保存，待测试').waitFor()
@@ -582,11 +582,14 @@ test('Windows Electron configures Jev through Main, persists all six point setti
       await models.getByRole('checkbox', { name: '启用协作模式' }).check()
       await models.getByRole('checkbox', { name: '启用模型适配' }).check()
       await models.getByRole('combobox', { name: '模型适配模式' }).selectOption('active')
+      await models.getByRole('checkbox', { name: '启用工具输出筛选' }).check()
+      await models.getByRole('combobox', { name: '工具输出筛选模式' }).selectOption('active')
       await models.getByRole('button', { name: '保存 Jev 设置' }).click()
       await eventually(async () => (await actual()).settings.enabled)
       assert.equal((await actual()).settings.modes['collaboration.mode'], 'shadow')
       assert.equal((await actual()).settings.modes['model.task_fit'], 'active')
       assert.equal((await actual()).settings.modes['task.replan'], 'off')
+      assert.equal((await actual()).settings.modes['tool.admission'], 'active')
       assert.ok(!JSON.stringify(await actual()).includes(key))
       assert.ok(!(await page.content()).includes(key))
       await app.close()
@@ -595,6 +598,7 @@ test('Windows Electron configures Jev through Main, persists all six point setti
       const restoredModels = await openJev(restored)
       assert.equal(await restoredModels.getByRole('checkbox', { name: '全局启用 Jev' }).isChecked(), true)
       assert.equal(await restoredModels.getByRole('combobox', { name: '模型适配模式' }).inputValue(), 'active')
+      assert.equal(await restoredModels.getByRole('combobox', { name: '工具输出筛选模式' }).inputValue(), 'active')
       await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 1 }) })
       await restoredModels.getByRole('combobox', { name: '判定供应商' }).selectOption('opencode')
       assert.equal(await restoredModels.getByLabel('API Endpoint').inputValue(), 'https://opencode.ai/inference/systemone/v1/systemone')

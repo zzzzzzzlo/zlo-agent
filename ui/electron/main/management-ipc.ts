@@ -4,7 +4,7 @@ import { dialog, ipcMain } from 'electron'
 import type { BrowserWindow, IpcMainInvokeEvent } from 'electron'
 import type { ConversationSummary } from '../../../shared/contracts/desktop.ts'
 import type { WorkspaceAccess } from '../../../shared/contracts/domain.ts'
-import { judgeProviders, parseJevSettings } from '../../../shared/contracts/jev.ts'
+import { judgeProviders, parseJevSettings, phaseTwoJudgmentPoints } from '../../../shared/contracts/jev.ts'
 import type { JevStatus } from '../../../shared/contracts/jev.ts'
 import type { AgentPreferences, ManagedProvider, ManagementSnapshot, ProviderId } from '../../../shared/contracts/management.ts'
 import type { DiagnosticEntry } from '../../../shared/diagnostics.ts'
@@ -193,8 +193,10 @@ export function registerManagementIpc(options: {
     const settings = parseJevSettings(value)
     if (!settings) return invalid()
     const previous = (await getJevStatus()).settings
-    if (settings.enabled && (!previous.enabled || previous.endpoint !== settings.endpoint)) {
-      await confirm(window, '允许判定服务处理任务证据？', '已启用的判定点会把经裁剪和脱敏的目标、交付摘要或授权记忆发送到以下地址。Shadow 也会发送。',
+    const sharesAdditionalEvidence = phaseTwoJudgmentPoints.some(({ id }) => settings.modes[id] !== 'off' && previous.modes[id] === 'off')
+    if (settings.enabled && (!previous.enabled || previous.endpoint !== settings.endpoint || sharesAdditionalEvidence)) {
+      await confirm(window, '允许判定服务处理任务证据？',
+        '启用的判定点会向以下地址发送经裁剪和脱敏的任务目标、用户追加说明、交付摘要、授权记忆、技能简介、文件或变更元数据，以及公开网页输出片段。Shadow 也会发送。',
         settings.endpoint)
     }
     return host.request({ schemaVersion: 1, type: 'saveJevSettings', settings })
