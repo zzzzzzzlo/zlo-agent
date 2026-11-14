@@ -10,6 +10,7 @@ import type { JudgmentOptions } from '../src/judgment.ts'
 import { LocalStore } from '../src/store.ts'
 import { telemetryEvent } from '../src/telemetry-projection.ts'
 import { openCodeJudgeFetch } from '../src/jev-transport.ts'
+import { Response as ProxyResponse } from 'undici'
 
 const key = 'synthetic-jev-test-key'
 const valid = (p = 0.01) => Response.json({
@@ -20,9 +21,13 @@ const point = 'delegation.worth'
 
 test('desktop proxy dispatch is scoped to the OpenCode System One URL', async () => {
   const calls: RequestInit[] = []
-  const routeFetch = openCodeJudgeFetch('http://127.0.0.1:8080', async (_input, options) => {
+  const direct: typeof fetch = async (_input, options) => {
     calls.push(options ?? {})
     return valid()
+  }
+  const routeFetch = openCodeJudgeFetch('http://127.0.0.1:8080', direct, async (_input, options) => {
+    calls.push(options as RequestInit)
+    return new ProxyResponse()
   })
   assert.ok(routeFetch)
   assert.equal(openCodeJudgeFetch('http://user@proxy:8080'), undefined)
