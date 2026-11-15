@@ -197,7 +197,7 @@ export class MultiAgentOrchestrator {
 
   #emit(event: EventDraft, runtime: RuntimeEvent, role: AgentRecord['role']): void {
     // Pi can emit the switch while opening the Session. Route changes are recorded after registration.
-    if (runtime.type === 'model.route_changed' || runtime.type === 'instruction.applied') return
+    if (runtime.type === 'model.route_changed' || runtime.type === 'instruction.applied' || runtime.type === 'prompt.accepted') return
     if (runtime.type === 'message.delta') {
       if (role === 'root' && runtime.delta) this.#onOutput?.(event, runtime.delta)
       const output = { taskId: event.taskId, agentRunId: event.agentRunId!, role, delta: runtime.delta }
@@ -235,6 +235,11 @@ export class MultiAgentOrchestrator {
     this.#db.transaction(() => {
       const run: AgentRun = { schemaVersion: 1, event, status, role }
       this.#db.put('agent-runs', event.agentRunId!, run)
+      const taskStatus = this.#tasks.get(event.taskId).status
+      if (taskStatus === 'succeeded' || taskStatus === 'failed' || taskStatus === 'blocked' ||
+        taskStatus === 'stopped' || taskStatus === 'needs_reconciliation') {
+        return
+      }
       this.#db.append({
         ...event, type: 'agent.finished',
         payload: { role, status, lifecycle: role === 'team' ? 'idle' : 'released',
@@ -571,6 +576,7 @@ export class MultiAgentOrchestrator {
     const seenSteers = new Set<string>()
     const queuedSteers = new Set<string>()
     let prompted = new Set<string>()
+    let promptAccepted = false
     let outcome: Outcome = { status: 'runtime_error' }
     const rootScope = this.#capabilities.root(task.workspaceAccess, Boolean(task.check))
     const visual = new VisualTelemetry(this.#mode,
@@ -757,6 +763,7 @@ export class MultiAgentOrchestrator {
         }
       },
       onEvent: (runtime) => {
+        if (runtime.type === 'prompt.accepted') promptAccepted = true
         if (runtime.type === 'instruction.applied') seenSteers.add(runtime.instructionId)
         if (runtime.type === 'message.delta' && runtime.delta) {
           streamed = true
@@ -782,7 +789,9 @@ export class MultiAgentOrchestrator {
         if (saveCheckpoint && !this.#db.isClosed) {
           await current.checkpoint()
           this.#onCheckpoint?.(task.id)
-          this.#tasks.markDelivered(task.id, [...seenSteers])
+          this.#tasks.markDelivered(task.id, [...(promptAccepted ? prompted : []), ...seenSteers])
+          prompted.clear()
+          promptAccepted = false
           seenSteers.clear()
         }
       } catch (error) {
@@ -919,6 +928,7 @@ export class MultiAgentOrchestrator {
           })
           if (signal.aborted) break
           streamed = false
+          promptAccepted = !this.#execution.verifySession
           const result = await session.run(prompt)
           followUp = undefined
           if (result.status !== 'completed') {
@@ -942,6 +952,8 @@ export class MultiAgentOrchestrator {
             throw error
           }
           this.#tasks.markDelivered(task.id, [...prompted, ...seenSteers])
+          prompted.clear()
+          promptAccepted = false
           seenSteers.clear()
           queuedSteers.clear()
           const receipts = await toolRun.waitForDeferred(signal)

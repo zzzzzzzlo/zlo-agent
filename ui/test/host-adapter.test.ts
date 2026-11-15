@@ -281,3 +281,36 @@ test('Zustand projects confirmed and pending models from events and sends null f
     adapter.dispose()
   }
 })
+
+test('P1-6: cancel dispatches stopConversation immediately even while another workspace mutation is pending', async () => {
+  const storeFactory = await loadWorkspaceFactory()
+  const unblockOlder = Promise.withResolvers<ConversationHistory>()
+  const stopCalls: { conversationId: string; taskId: string }[] = []
+  const { api } = testApi(async ({ before }) => before === undefined
+    ? { ...numberedPage(60, 100), turns: [{ ...turn, status: 'running' }] }
+    : unblockOlder.promise)
+  api.stopConversation = async (input) => {
+    stopCalls.push({ conversationId: input.conversationId, taskId: input.taskId })
+    return { accepted: true, status: 'stop_requested' }
+  }
+  const adapter = new HostAgentAdapter(api)
+  const store = storeFactory(adapter, false)
+  const close = store.getState().initialize()
+  try {
+    await setImmediate()
+    const olderPromise = store.getState().loadOlder()
+    await setImmediate()
+    assert.equal(store.getState().pending, true)
+
+    await store.getState().cancel()
+    assert.deepEqual(stopCalls, [{ conversationId: conversation.id, taskId: turn.taskId }])
+
+    unblockOlder.resolve(numberedPage(60, 100, 50))
+    await olderPromise
+    assert.equal(store.getState().pending, false)
+  } finally {
+    unblockOlder.resolve(numberedPage(60, 100, 50))
+    close()
+    adapter.dispose()
+  }
+})

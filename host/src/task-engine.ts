@@ -458,12 +458,18 @@ export class TaskEngine {
   markDelivered(taskId: string, ids: string[]): void {
     this.#db.transaction(() => {
       const task = this.get(taskId)
-      if (!ids.length) return
+      if (!ids.length || task.status === 'succeeded' || task.status === 'failed' || task.status === 'blocked' ||
+        task.status === 'stopped' || task.status === 'needs_reconciliation') return
+      let changed = 0
       for (const item of task.instructions) {
-        if (ids.includes(item.id)) item.delivered = true
+        if (!item.delivered && ids.includes(item.id)) {
+          item.delivered = true
+          changed++
+        }
       }
+      if (!changed) return
       this.#save(task)
-      this.#event(task, 'task.instructions_delivered', { count: ids.length })
+      this.#event(task, 'task.instructions_delivered', { count: changed })
     })
   }
 
@@ -1055,7 +1061,10 @@ export class TaskEngine {
   end(taskId: string, reason: EndReason): TaskSnapshot {
     return this.#db.transaction(() => {
       let task = this.get(taskId)
-      if (task.status === 'needs_reconciliation') return task
+      if (task.status === 'succeeded' || task.status === 'failed' || task.status === 'blocked' ||
+        task.status === 'stopped' || task.status === 'needs_reconciliation') {
+        return task
+      }
       const operations = this.operations(taskId)
       const unknown = operations.filter(operation =>
         operation.effect === 'write' && (operation.status === 'started' || isUnresolvedEffect(operation)))

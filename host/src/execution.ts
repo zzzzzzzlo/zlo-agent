@@ -15,6 +15,7 @@ export interface ExecutionTool {
 
 export type RuntimeEvent =
   | { type: 'message.delta'; delta: string }
+  | { type: 'prompt.accepted' }
   | { type: 'instruction.applied'; instructionId: string }
   | { type: 'model.request_started' }
   | { type: 'model.request_unaccounted' }

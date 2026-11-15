@@ -17,6 +17,7 @@ const definitions = {
   'desktop.host_protocol_invalid': ['error', 'desktop', 'protocol', 'An Agent Host protocol frame was rejected.'],
   'desktop.host_request_timeout': ['warn', 'desktop', 'protocol', 'An Agent Host request exceeded its deadline.'],
   'desktop.host_stderr_ignored': ['warn', 'desktop', 'protocol', 'Non-diagnostic Agent Host stderr was discarded.'],
+  'desktop.vault_degraded': ['warn', 'desktop', 'recovery', 'A credential vault could not be loaded; continuing in degraded mode.'],
   'host.startup_failed': ['error', 'host', 'process', 'The Agent Host failed to initialize.'],
   'host.startup_config_invalid': ['error', 'host', 'process', 'The Agent Host startup configuration was invalid.'],
   'host.startup_runtime_failed': ['error', 'host', 'process', 'The configured Agent execution runtime could not load.'],

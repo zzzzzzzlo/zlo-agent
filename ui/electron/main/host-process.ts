@@ -6,7 +6,10 @@ import { diagnostic } from '../../../shared/diagnostics.ts'
 import type { DiagnosticCode, DiagnosticEntry } from '../../../shared/diagnostics.ts'
 import { collectHostDiagnostics } from './diagnostic-log.ts'
 import type { ConversationEvent, DesktopCommand, DesktopErrorCode, DesktopHostStatus, HostMode } from '../../../shared/contracts/desktop.ts'
-import type { ManagementCommand, PrivateCredentialCommand } from '../../../shared/contracts/management.ts'
+import type { ManagementCommand, PrivateCredentialCommand, ProviderId } from '../../../shared/contracts/management.ts'
+import type { ChatGptSession } from '../../../shared/contracts/chatgpt.ts'
+import type { JudgeCredentials } from '../../../shared/contracts/jev.ts'
+import type { CustomProviderCredential, GrokCredential } from '../../../shared/contracts/provider-setup.ts'
 import { approvalKinds } from '../../../shared/contracts/tool-approval.ts'
 import type { ApprovalKind, ToolApprovalDecision, ToolApprovalRequest } from '../../../shared/contracts/tool-approval.ts'
 
@@ -103,6 +106,40 @@ function waitForClose(connection: Connection, timeoutMs: number): Promise<boolea
       resolve(true)
     })
   })
+}
+
+export interface InitialCredentialSources {
+  hostMode: HostMode
+  loadCredentials?: () => Promise<Partial<Record<ProviderId, string | null>>>
+  loadChatGpt?: () => Promise<ChatGptSession | null | undefined>
+  loadCustomProviders?: () => Promise<CustomProviderCredential[] | undefined>
+  loadGrok?: () => Promise<GrokCredential | undefined>
+  loadJudgeKeys?: () => Promise<JudgeCredentials>
+  onDiagnostic?: (entry: DiagnosticEntry) => void
+  correlationId?: string
+}
+
+export async function loadInitialProviderKeys(sources: InitialCredentialSources): Promise<Extract<PrivateCredentialCommand, { type: 'initializeProviderKeys' }>> {
+  const report = () => {
+    try { sources.onDiagnostic?.(diagnostic('desktop.vault_degraded', sources.correlationId)) }
+    catch { /* Diagnostic failures cannot prevent degraded startup. */ }
+  }
+  async function isolate<T>(load: (() => Promise<T>) | undefined, fallback: T): Promise<T> {
+    if (!load) return fallback
+    try { return await load() }
+    catch {
+      report()
+      return fallback
+    }
+  }
+  const [credentials, chatGpt, customProviders, grok, judgeKeys] = await Promise.all([
+    sources.hostMode === 'pi' ? isolate(sources.loadCredentials, {}) : Promise.resolve({}),
+    sources.hostMode === 'pi' ? isolate(sources.loadChatGpt, undefined) : Promise.resolve(undefined),
+    sources.hostMode === 'pi' ? isolate(sources.loadCustomProviders, undefined) : Promise.resolve(undefined),
+    sources.hostMode === 'pi' ? isolate(sources.loadGrok, undefined) : Promise.resolve(undefined),
+    isolate(sources.loadJudgeKeys, {}),
+  ])
+  return { schemaVersion: 1, type: 'initializeProviderKeys', credentials, chatGpt, customProviders, grok, judgeKeys }
 }
 
 export class HostProcessManager {

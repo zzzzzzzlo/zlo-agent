@@ -40,7 +40,8 @@ kbd { border: 1px solid var(--line); background: var(--canvas); border-radius: 4
 .startup-mark-failed { background: var(--surface-hover); color: var(--danger); }
 .startup-content h1 { font: 620 17px var(--font-display); color: var(--text); }
 .startup-content p { max-width: 34ch; color: var(--muted); }
-.startup-retry { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line-strong); padding: 6px 12px; border-radius: 7px; }
+.startup-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+.startup-retry, .startup-actions button { display: inline-flex; align-items: center; gap: 7px; border: 1px solid var(--line-strong); padding: 6px 12px; border-radius: 7px; }
 .startup-progress { width: 154px; height: 3px; border-radius: 3px; overflow: hidden; background: var(--line-strong); }
 .startup-progress span { display: block; height: 100%; width: 43%; border-radius: inherit; background: var(--accent); animation: startup-travel 1.1s ease-in-out infinite alternate; }
 @keyframes startup-travel { from { transform: translateX(0); } to { transform: translateX(132%); } }

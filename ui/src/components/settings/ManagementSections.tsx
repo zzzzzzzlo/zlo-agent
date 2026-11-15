@@ -83,6 +83,7 @@ export function ManagementSections({ section }: { section: ManagementSection }) 
       {!api ? <p className="management-note">当前环境没有桌面管理接口。</p>
         : !ready ? <>
           <p className="management-note" role="status">等待 Agent Host 连接。</p>
+          {section === 'models' && <OfflineModelRepair api={api} busy={busy} perform={perform} />}
           {section === 'diagnostics' && <OfflineDiagnostics api={api} />}
         </>
           : error ? <p className="dialog-error" role="alert">{error}</p>
@@ -282,6 +283,71 @@ function DiagnosticEntries({ entries }: { entries: ManagedDiagnostic[] }) {
       </div>
     ))}
   </section>
+}
+
+const offlineProviders = [
+  ['deepseek', 'DeepSeek'],
+  ['openai', 'OpenAI'],
+  ['anthropic', 'Anthropic'],
+  ['google', 'Google Gemini'],
+] as const
+
+function OfflineModelRepair({ api, busy, perform }: { api: DesktopManagementApi; busy: boolean; perform: PerformManagement }) {
+  const restart = useWorkspace((state) => state.restart)
+  const host = useWorkspace((state) => state.host)
+  const chatGpt = globalThis.window?.agentChatGpt
+  const providerSetup = globalThis.window?.agentProviderSetup
+  return (
+    <section className="management-group">
+      <h4>离线凭证修复</h4>
+      <p className="management-note">当本地 Agent Host 离线时，仍可重新连接或清除本机保存的供应商凭证并尝试重启。</p>
+      <div className="management-row">
+        <div>
+          <strong>本地执行服务</strong>
+          <small>{host.message ?? '当前离线'}</small>
+        </div>
+        <button type="button" className="button-neutral" disabled={busy || host.state === 'starting'} onClick={() => void restart()}>
+          重新连接
+        </button>
+      </div>
+      {offlineProviders.map(([id, label]) => (
+        <div className="management-row" key={id}>
+          <div>
+            <strong>{label}</strong>
+            <small>清除保存在系统安全存储中的 API Key</small>
+          </div>
+          <button type="button" className="button-neutral" disabled={busy}
+            onClick={() => perform(() => api.removeProviderKey({ provider: id }), `已清除 ${label} 凭证。`)}>
+            清除凭证
+          </button>
+        </div>
+      ))}
+      {chatGpt && (
+        <div className="management-row">
+          <div>
+            <strong>ChatGPT 账号授权</strong>
+            <small>移除本机保存的 OAuth 会话并尝试恢复</small>
+          </div>
+          <button type="button" className="button-neutral" disabled={busy}
+            onClick={() => perform(() => chatGpt.signOut(), '已移除 ChatGPT 账号授权。')}>
+            退出账号
+          </button>
+        </div>
+      )}
+      {providerSetup && (
+        <div className="management-row">
+          <div>
+            <strong>Grok 订阅授权</strong>
+            <small>移除本机保存的 Grok 授权凭证</small>
+          </div>
+          <button type="button" className="button-neutral" disabled={busy}
+            onClick={() => perform(() => providerSetup.grokSignOut(), '已移除 Grok 授权。')}>
+            断开连接
+          </button>
+        </div>
+      )}
+    </section>
+  )
 }
 
 function OfflineDiagnostics({ api }: { api: DesktopManagementApi }) {

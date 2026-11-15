@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import type { DiagnosticEntry } from '../../shared/diagnostics.ts'
-import { HostProcessManager, HostTransportError } from '../electron/main/host-process.ts'
+import { HostProcessManager, HostTransportError, loadInitialProviderKeys } from '../electron/main/host-process.ts'
 import type { ConversationEvent } from '../../shared/contracts/desktop.ts'
 
 const fixture = fileURLToPath(new URL('./fixtures/process-host.mjs', import.meta.url))
@@ -135,4 +135,28 @@ test('manager sends exit and waits for the child to finish before shutdown resol
     await rm(marker, { force: true })
     await rmdir(directory)
   }
+})
+
+test('P0-6: loadInitialProviderKeys isolates corrupted vaults, emits redacted diagnostics, and boots Host in degraded mode', async (t) => {
+  const entries: DiagnosticEntry[] = []
+  const manager = new HostProcessManager({
+    mode: 'pi',
+    spawnChild: () => startFixture('pi-ready'),
+    diagnostic: (entry) => entries.push(entry),
+    initialize: () => loadInitialProviderKeys({
+      hostMode: 'pi',
+      loadCredentials: async () => { throw new Error('DPAPI decrypt failed for sk-secret-leak') },
+      loadChatGpt: async () => { throw new Error('Corrupt oauth token bearer-secret-leak') },
+      loadCustomProviders: async () => { throw new Error('Corrupt custom provider') },
+      loadGrok: async () => ({ access: 'grok-access-token-123456', refresh: 'grok-refresh-token-123456', expires: Date.now() + 60_000 }),
+      loadJudgeKeys: async () => ({ 'https://judge.example.com/v1': 'judge-key-12345678' }),
+      onDiagnostic: (entry) => entries.push(entry),
+    }),
+  })
+  t.after(() => manager.shutdown())
+  const status = await manager.start()
+  assert.deepEqual(status, { state: 'ready', mode: 'pi' })
+  const degraded = entries.filter(entry => entry.code === 'desktop.vault_degraded')
+  assert.equal(degraded.length, 3)
+  assert.doesNotMatch(JSON.stringify(entries), /sk-secret-leak|bearer-secret-leak/)
 })

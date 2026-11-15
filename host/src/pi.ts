@@ -337,6 +337,7 @@ export class PiExecution implements AgentExecution {
     let compacting = false
     let compactStreamCalled = false
     let compactModelFailed = false
+    let awaitingPrimaryPrompt = false
     let recoveringOutput = false
     let outputRecoveryUsed = false
     let lastRequestHadFrames = false
@@ -452,12 +453,17 @@ export class PiExecution implements AgentExecution {
         lastAssistant = event.message
       }
       if (event.type === 'message_end' && event.message.role === 'user') {
-        const content = event.message.content
-        const text = typeof content === 'string' ? content : content.map((part) => part.type === 'text' ? part.text : '').join('')
-        const instructionId = steering.get(text)
-        if (instructionId) {
-          steering.delete(text)
-          emit({ type: 'instruction.applied', instructionId })
+        if (awaitingPrimaryPrompt && !recoveringOutput) {
+          awaitingPrimaryPrompt = false
+          emit({ type: 'prompt.accepted' })
+        } else {
+          const content = event.message.content
+          const text = typeof content === 'string' ? content : content.map((part) => part.type === 'text' ? part.text : '').join('')
+          const instructionId = steering.get(text)
+          if (instructionId) {
+            steering.delete(text)
+            emit({ type: 'instruction.applied', instructionId })
+          }
         }
       }
     })
@@ -517,7 +523,12 @@ export class PiExecution implements AgentExecution {
               outputRecoveryUsed = recoveringOutput = true
               emit({ type: 'model.output_recovery', trigger: 'resume' })
             }
-            await session.prompt(prompt, { expandPromptTemplates: false })
+            awaitingPrimaryPrompt = true
+            try {
+              await session.prompt(prompt, { expandPromptTemplates: false })
+            } finally {
+              awaitingPrimaryPrompt = false
+            }
             if (deepSeekThinking && isThinkingOnlyTruncation(lastAssistant) && canRecoverOutput()) {
               outputRecoveryUsed = recoveringOutput = true
               emit({ type: 'model.output_recovery', trigger: 'automatic' })

@@ -44,8 +44,9 @@ export function App() {
 
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
-      if (starting || event.isComposing || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return
-      if (event.key.toLowerCase() === 'n' && !page && !sessionAction && !newConversation && hostState === 'ready') {
+      if (event.isComposing || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return
+      if (starting && hostState !== 'offline') return
+      if (!starting && event.key.toLowerCase() === 'n' && !page && !sessionAction && !newConversation && hostState === 'ready') {
         event.preventDefault()
         setPage(undefined)
         setNewConversation(true)
@@ -69,8 +70,14 @@ export function App() {
     <LiquiThemeProvider injectTokens={false} theme={{ glass: optics[strength] }}>
       <div className="app-shell">
         <div className="window-backdrop" aria-hidden="true" />
-        <TitleBar destination={page && settingsLabels[page]} starting={starting} />
-        {starting ? <StartupScreen /> : <>
+        <TitleBar destination={page && settingsLabels[page]} starting={starting && !page} />
+        {starting && !page ? <StartupScreen onOpenSettings={(section) => navigate(section)} />
+          : starting && page ? (
+            <div className="workspace">
+              <ManagementPage section={page} onSelect={(section) => { setLastSetting(section); setPage(section) }}
+                onBack={() => setPage(undefined)} />
+            </div>
+          ) : <>
           <div className="workspace">
             {!page && sidebar && <Sidebar onCreate={() => { navigate(); setNewConversation(true) }}
               onSettings={() => setPage(lastSetting)} onSessionAction={setSessionAction} onSession={() => navigate()} />}

@@ -4,7 +4,7 @@ import { diagnostic, writeHostDiagnostic } from '../../../shared/diagnostics.ts'
 
 const [variant, marker = ''] = process.argv.slice(2)
 const output = (message) => process.stdout.write(JSON.stringify({ schemaVersion: 1, ...message }) + '\n')
-const ready = JSON.stringify({ schemaVersion: 1, kind: 'ready', mode: variant === 'bad-mode' ? 'pi' : 'faux' }) + '\n'
+const ready = JSON.stringify({ schemaVersion: 1, kind: 'ready', mode: variant === 'bad-mode' || variant === 'pi-ready' ? 'pi' : 'faux' }) + '\n'
 const response = (request, result) => output({ kind: 'result', commandId: request.commandId, type: request.type, result })
 if (variant === 'diagnostic') {
   const entry = diagnostic('host.model_failed', 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
@@ -15,7 +15,7 @@ if (variant === 'diagnostic') {
   process.stderr.write('x'.repeat(4096) + JSON.stringify(entry) + '\n')
   writeHostDiagnostic(entry.code, entry.correlationId)
 }
-if (variant !== 'no-ready') {
+if (variant !== 'no-ready' && variant !== 'pi-ready') {
   process.stdout.write(ready.slice(0, 11))
   setTimeout(() => process.stdout.write(ready.slice(11)), 25)
 }
@@ -23,6 +23,9 @@ const lines = createInterface({ input: process.stdin })
 for await (const line of lines) {
   const request = JSON.parse(line)
   switch (request.type) {
+    case 'initializeProviderKeys':
+      if (variant === 'pi-ready') process.stdout.write(ready)
+      break
     case 'listConversations':
       setTimeout(() => response(request, ['first']), 25)
       break

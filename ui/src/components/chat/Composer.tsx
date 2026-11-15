@@ -18,6 +18,7 @@ export function Composer() {
   const restart = useWorkspace((state) => state.restart)
   const running = isBusy(status)
   const available = host.state === 'ready' && !pending && (!session || session.loaded)
+  const canStop = host.state === 'ready' && Boolean(session?.loaded) && running && status !== 'stopping'
   const canSend = available && status !== 'stopping' && status !== 'reconciliation' && (!mock || !running)
   const canResume = available && !mock && (status === 'stopped' || status === 'blocked')
   const sendLabel = running ? '追加指令' : '发送消息'
@@ -48,7 +49,7 @@ export function Composer() {
             {host.state === 'offline' && <IconButton label="重启 Host" onClick={() => void restart()}><RotateCw size={15} /></IconButton>}
             <span className="composer-keys"><kbd>Enter</kbd> {running ? '追加' : '发送'}<kbd>Shift Enter</kbd> 换行</span>
             {canResume && <IconButton label="恢复执行" className="send-button" onClick={() => void resume()}><Play size={15} /></IconButton>}
-            {running && <IconButton label="停止生成" className="send-button stop-button" disabled={!available || status === 'stopping'} onClick={() => void cancel()}><Square size={13} fill="currentColor" /></IconButton>}
+            {running && <IconButton label="停止生成" className="send-button stop-button" disabled={!canStop} onClick={() => void cancel()}><Square size={13} fill="currentColor" /></IconButton>}
             <IconButton label={sendLabel} type="submit" className="send-button" disabled={!canSend || !value.trim()}><ArrowUp size={18} strokeWidth={2.2} /></IconButton>
           </div>
         </div>

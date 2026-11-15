@@ -7,7 +7,7 @@ import { windowChannels } from '../window-api'
 import { localDirectory } from './agent-input.ts'
 import { registerAgentIpc } from './agent-ipc.ts'
 import { createDiagnosticLog } from './diagnostic-log.ts'
-import { HostProcessManager, spawnAgentHost } from './host-process.ts'
+import { HostProcessManager, loadInitialProviderKeys, spawnAgentHost } from './host-process.ts'
 import { registerManagementIpc } from './management-ipc.ts'
 import { SecureJevCredentials, SecureProviderCredentials } from './provider-credentials.ts'
 import { ChatGptAccount } from './chatgpt-account.ts'
@@ -44,12 +44,16 @@ const providerSetup = hostMode === 'pi' ? new ProviderSetup(userData, () => host
 const host: HostProcessManager = new HostProcessManager({
   mode: hostMode,
   diagnostic: diagnostics.write,
-  async initialize() {
-    return { schemaVersion: 1, type: 'initializeProviderKeys',
-      credentials: hostMode === 'pi' ? await credentials.load() : {}, chatGpt: await chatGpt?.loadSession(),
-      customProviders: await providerSetup?.loadCustom().catch(() => undefined),
-      grok: await providerSetup?.loadGrok().catch(() => undefined),
-      judgeKeys: await jevCredentials.load().catch(() => ({})) }
+  initialize() {
+    return loadInitialProviderKeys({
+      hostMode,
+      loadCredentials: () => credentials.load(),
+      loadChatGpt: () => chatGpt ? chatGpt.loadSession() : Promise.resolve(undefined),
+      loadCustomProviders: () => providerSetup ? providerSetup.loadCustom() : Promise.resolve(undefined),
+      loadGrok: () => providerSetup ? providerSetup.loadGrok() : Promise.resolve(undefined),
+      loadJudgeKeys: () => jevCredentials.load(),
+      onDiagnostic: diagnostics.write,
+    })
   },
   spawnChild() {
     mkdirSync(defaultWorkspace, { recursive: true })

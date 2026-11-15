@@ -174,8 +174,8 @@ export function registerManagementIpc(options: {
     await options.credentials.set(id, null)
     try { return await host.request({ schemaVersion: 1, type: 'applyProviderKey', provider: id, key: null }) }
     catch (error) {
-      await host.restart()
-      throw error
+      if ((await host.restart()).state !== 'ready') throw error
+      return { id, name: id, credential: 'missing', connection: 'untested', models: [] }
     }
   }))
 

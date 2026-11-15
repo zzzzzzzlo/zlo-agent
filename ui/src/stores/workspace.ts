@@ -78,6 +78,7 @@ export function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boo
     let pendingMessage: SendMessageInput | SteerInput | undefined
     let pendingCreate: { signature: string; requestId: string } | undefined
     let pendingModel: SetConversationModelInput | undefined
+    const stoppingTasks = new Set<string>()
 
     function persist() {
       const { activeId, theme, strength, sidebar, drafts } = get()
@@ -192,7 +193,26 @@ export function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boo
       }
     }
 
-    async function control(action: 'stopConversation' | 'resumeConversation') {
+    async function stopActive(): Promise<void> {
+      const session = activeSession(get())
+      const turn = session?.turns.at(-1)
+      if (!commands || get().host.state !== 'ready' || !session?.loaded || !turn ||
+        turn.status === 'stopping' || stoppingTasks.has(turn.id)) return
+      stoppingTasks.add(turn.id)
+      set({ error: undefined })
+      try {
+        const result = await commands.stopConversation({
+          conversationId: session.id, taskId: turn.id, requestId: crypto.randomUUID(),
+        })
+        if (!result.accepted) throw new Error('该任务的状态已变化，请查看最新记录。')
+      } catch (error) {
+        issue(error)
+      } finally {
+        stoppingTasks.delete(turn.id)
+      }
+    }
+
+    async function control(action: 'resumeConversation') {
       const session = activeSession(get())
       const turn = session?.turns.at(-1)
       if (!session || !turn || !commands) return
@@ -331,7 +351,7 @@ export function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boo
           if (input?.trim() === text) get().setDraft(conversationId, '')
         })
       },
-      cancel: () => control('stopConversation'),
+      cancel: () => stopActive(),
       resume: () => control('resumeConversation'),
     }
   })

@@ -108,7 +108,7 @@ interface HostOptions {
 }
 
 const recoverableAfterCrash = new Set<TaskStatus>(['running', 'verifying', 'stop_requested', 'stopping'])
-const defaultStopTimeoutMs = 10000
+const defaultStopTimeoutMs = 25000
 
 function containsPath(parent: string, child: string): boolean {
   const diff = relative(parent, child)
@@ -219,7 +219,10 @@ export class LocalAgentHost {
       if (!existsSync(session.path)) return false
       const content = readFileSync(session.path, 'utf8')
       if (!content || !content.endsWith('\n')) return false
-      for (const line of content.trimEnd().split('\n')) JSON.parse(line)
+      const lines = content.trimEnd().split('\n')
+      const header = JSON.parse(lines[0]!) as { id?: unknown } | null
+      if (!header || typeof header !== 'object' || header.id !== session.id) return false
+      for (const line of lines.slice(1)) JSON.parse(line)
       return true
     } catch {
       return false
