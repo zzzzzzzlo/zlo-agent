@@ -235,6 +235,186 @@ test('stopping a task with an active shell records unknown effects and refuses t
   }
 })
 
+test('Pi waits for shell approval and can recover from a refused call and a nonzero exit', { timeout: 20_000 }, async () => {
+  const env = await fixture()
+  const defaultRoute = { provider: 'faux', model: 'shell-recovery' }
+  const faux = fauxProvider({ models: [{ id: defaultRoute.model }] })
+  const execution = new PiExecution(async () => {
+    const runtime = await ModelRuntime.create({
+      authPath: join(env.path, 'faux-auth.json'), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false,
+    })
+    runtime.registerNativeProvider(faux.provider)
+    return runtime
+  })
+  const shell = process.platform === 'win32' ? 'cmd' : 'sh'
+  const tool = (name: string, args: Parameters<typeof fauxToolCall>[1]) =>
+    fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' })
+  let denied = false
+  let failed = false
+  faux.setResponses([
+    tool('shell_exec', { shell, command: 'echo denied' }),
+    context => {
+      const result = context.messages.findLast(message => message.role === 'toolResult')
+      denied = result?.isError === true && JSON.stringify(result.content).includes('APPROVAL_NOT_GRANTED')
+      return tool('shell_exec', { shell, command: shell === 'cmd' ? 'echo test failed&exit /b 7' : 'echo test failed; exit 7' })
+    },
+    context => {
+      const result = context.messages.findLast(message => message.role === 'toolResult')?.content[0]
+      if (result?.type !== 'text') throw new Error('Missing shell launch result')
+      return tool('process_status', { processId: JSON.parse(result.text).processId, waitMs: 15_000 })
+    },
+    context => {
+      const result = context.messages.findLast(message => message.role === 'toolResult')
+      const content = result?.content[0]
+      failed = result?.isError === true && content?.type === 'text' && JSON.parse(content.text).exitCode === 7
+      return tool('create_text_file', { path: 'src/alternative.txt', content: 'completed through an alternative' })
+    },
+    fauxAssistantMessage('Used another approach after the command failed.'),
+  ])
+  const host = new LocalAgentHost({ ...env, execution, defaultRoute })
+  const first = Promise.withResolvers<string>()
+  let approvalCount = 0
+  const decide = (approvalId: string, approved: boolean) => host.command({
+    schemaVersion: 1, type: 'resolveToolApproval', approvalId, decision: { approved },
+  })
+  const unsubscribe = host.subscribeToolApprovals(notice => {
+    if (notice.kind !== 'tool.approval') return
+    if (++approvalCount === 1) first.resolve(notice.request.id)
+    else void decide(notice.request.id, true)
+  })
+  try {
+    const { taskId } = await host.createTask({ requestId: 'approval-recovery', cwd: env.workspace, goal: 'Create the report', route: defaultRoute,
+      workspaceAccess: 'trusted', check: { path: 'src/alternative.txt', contains: 'alternative' } })
+    const approvalId = await Promise.race([first.promise, delay(7_000, '', { ref: false })])
+    assert.ok(approvalId)
+    assert.equal(host.getTask(taskId).status, 'running')
+    assert.equal(host.events(taskId).filter(event => event.type === 'model.request_started').length, 1)
+    assert.ok(!host.getHistory(taskId).operations.some(operation => operation.tool === 'shell_exec'))
+    assert.equal(await decide(approvalId, false), true)
+    await host.idle()
+    assert.equal(approvalCount, 2)
+    assert.equal(denied, true)
+    assert.equal(failed, true)
+    assert.equal(host.getTask(taskId).status, 'succeeded')
+    assert.deepEqual(host.getHistory(taskId).operations.filter(operation => operation.tool === 'shell_exec').map(item => item.status), ['failed'])
+  } finally {
+    unsubscribe()
+    await host.close()
+    await rm(env.path, { recursive: true, force: true })
+  }
+})
+
+test('Pi receives an interrupted shell result, inspects partial output and cannot run another write', { timeout: 22_000 }, async () => {
+  const env = await fixture()
+  const defaultRoute = { provider: 'faux', model: 'shell-reconciliation' }
+  const faux = fauxProvider({ models: [{ id: defaultRoute.model }] })
+  const execution = new PiExecution(async () => {
+    const runtime = await ModelRuntime.create({
+      authPath: join(env.path, 'faux-auth.json'), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false,
+    })
+    runtime.registerNativeProvider(faux.provider)
+    return runtime
+  })
+  const windows = process.platform === 'win32'
+  const tool = (name: string, args: Parameters<typeof fauxToolCall>[1]) =>
+    fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' })
+  let interrupted = false
+  let inspected = false
+  let writeDenied = false
+  faux.setResponses([
+    tool('shell_exec', windows ? {
+      shell: 'powershell', command: "[IO.File]::WriteAllText((Join-Path (Get-Location) 'src/partial.txt'), 'existing output'); Start-Sleep -Seconds 30",
+    } : { shell: 'sh', command: "printf 'existing output' > src/partial.txt; sleep 30" }),
+    async context => {
+      const result = context.messages.findLast(message => message.role === 'toolResult')?.content[0]
+      if (result?.type !== 'text') throw new Error('Missing shell launch result')
+      const deadline = Date.now() + 7_000
+      while (Date.now() < deadline) {
+        if (await readFile(join(env.workspace, 'src', 'partial.txt'), 'utf8').catch(() => '') === 'existing output') {
+          return tool('process_stop', { processId: JSON.parse(result.text).processId })
+        }
+        await delay(30)
+      }
+      throw new Error('Shell did not produce partial output')
+    },
+    context => {
+      const result = context.messages.findLast(message => message.role === 'toolResult')
+      interrupted = result?.isError === true && JSON.stringify(result.content).includes('UNCONFIRMED_WRITE')
+      return tool('read_text_file', { path: 'src/partial.txt' })
+    },
+    context => {
+      const result = context.messages.findLast(message => message.role === 'toolResult')
+      inspected = result?.isError !== true && JSON.stringify(result?.content).includes('existing output')
+      return tool('edit_text_file', { path: 'src/partial.txt', oldText: 'existing output', newText: 'unsafe overwrite' })
+    },
+    context => {
+      const result = context.messages.findLast(message => message.role === 'toolResult')
+      writeDenied = result?.isError === true && JSON.stringify(result.content).includes('UNCONFIRMED_WRITE')
+      return fauxAssistantMessage('The partial file exists. The interrupted command needs reconciliation.')
+    },
+  ])
+  const host = new LocalAgentHost({ ...env, execution, defaultRoute, approveTool: async () => ({ approved: true }) })
+  try {
+    const { taskId } = await host.createTask({ requestId: 'shell-reconciliation', cwd: env.workspace, route: defaultRoute,
+      goal: 'Produce output', workspaceAccess: 'trusted' })
+    await host.idle()
+    assert.equal(interrupted, true)
+    assert.equal(inspected, true)
+    assert.equal(writeDenied, true)
+    assert.equal(host.getTask(taskId).status, 'needs_reconciliation')
+    assert.equal(await readFile(join(env.workspace, 'src', 'partial.txt'), 'utf8'), 'existing output')
+    assert.equal(host.resume(taskId, 'unsafe-resume').accepted, false)
+    assert.ok(host.events(taskId).some(event => event.type === 'operation.reconciliation_required' && event.payload.reason === 'unknown_effect'))
+  } finally {
+    await host.close()
+    await rm(env.path, { recursive: true, force: true })
+  }
+})
+
+test('an early assistant reply waits for the running shell and gets its result in the same session', { timeout: 15_000 }, async () => {
+  const env = await fixture()
+  const started = Promise.withResolvers<void>()
+  let processId: string | undefined
+  let runs = 0
+  let receivedResult = false
+  const execution = new ScriptExecution(async (_config, prompt, call) => {
+    runs++
+    if (!processId) {
+      const shell = process.platform === 'win32' ? 'powershell' : 'sh'
+      const command = shell === 'powershell'
+        ? "while (-not [IO.File]::Exists('release.flag')) { Start-Sleep -Milliseconds 25 }; [IO.File]::WriteAllText((Join-Path (Get-Location) 'src/report.txt'), 'verified')"
+        : "while [ ! -f release.flag ]; do sleep 0.025; done; printf verified > src/report.txt"
+      const launch = await call('shell_exec', { shell, command, timeoutMs: 10_000 }) as { ok: boolean; processId: string }
+      assert.ok(launch.ok)
+      processId = launch.processId
+      started.resolve()
+      return 'Command launched.'
+    }
+    assert.match(prompt, /Its recorded result is now: succeeded/)
+    const status = await call('process_status', { processId }) as { ok: boolean; exitCode: number }
+    receivedResult = status.ok && status.exitCode === 0
+    return 'Command completed.'
+  })
+  const host = new LocalAgentHost({ ...env, execution, approveTool: async () => ({ approved: true }) })
+  try {
+    const { taskId } = await host.createTask({ requestId: 'early-shell-reply', cwd: env.workspace, goal: 'Generate a report',
+      workspaceAccess: 'trusted', check: { path: 'src/report.txt', contains: 'verified' } })
+    await Promise.race([started.promise, delay(5_000, undefined, { ref: false }).then(() => { throw new Error('Shell did not start') })])
+    await delay(200)
+    assert.equal(host.getTask(taskId).status, 'running')
+    assert.equal(host.getHistory(taskId).operations.find(item => item.tool === 'shell_exec')?.status, 'started')
+    await writeFile(join(env.workspace, 'release.flag'), '')
+    await host.idle()
+    assert.equal(runs, 2)
+    assert.equal(receivedResult, true)
+    assert.equal(host.getTask(taskId).status, 'succeeded')
+    assert.equal(host.events(taskId).filter(event => event.type === 'agent.started').length, 1)
+  } finally {
+    await host.close()
+    await rm(env.path, { recursive: true, force: true })
+  }
+})
+
 test('approved Git worktrees isolate two real concurrent write nodes and merge only confirmed local commits', { timeout: 25_000 }, async () => {
   const env = await fixture()
   await writeFile(join(env.workspace, 'src', 'base.txt'), 'baseline')

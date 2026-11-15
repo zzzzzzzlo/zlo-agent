@@ -64,6 +64,11 @@ function receiptId(id: string): string {
   return createHash('sha256').update(id).digest('hex').slice(0, 32)
 }
 
+function deferredResultPrompt(receipts: readonly string[]): string {
+  return 'A shell command was still running when you responded. Its recorded result is now: ' + receipts.join(', ') +
+    '. Check the process status and output before finalizing. If the result is uncertain, inspect using scoped read-only tools and explain what needs verification. Do not rerun a command with unknown effects.'
+}
+
 export class MultiAgentOrchestrator {
   readonly #db: LocalStore
   readonly #tasks: TaskEngine
@@ -303,7 +308,7 @@ export class MultiAgentOrchestrator {
       const tools = availableTools
         .map(tool => {
           const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input =>
-            !childActive && !blockingWrite(tool.policy?.whileActive ? event.agentRunId : undefined) &&
+            !childActive &&
             followUpAllows(followUp, tool.name) && this.#capabilities.authorize(scope, tool, input), evidence, artifacts, node.goal)
           return {
             ...wrapped,
@@ -364,7 +369,6 @@ export class MultiAgentOrchestrator {
         ...this.#runtimePolicy(workspace, scope),
         reserveRequest: (request) => {
           signal.throwIfAborted()
-          if (blockingWrite(event.agentRunId)) throw new Error('Unconfirmed workspace operation')
           try { return lease!.request(request) } catch (error) {
             if (error instanceof ModelBudgetError) exhausted = true
             throw error
@@ -408,14 +412,24 @@ export class MultiAgentOrchestrator {
         })
         signal.throwIfAborted()
         let outcome = await session.run(advice.hint ? prompt + '\n\n' + advice.hint : prompt)
+        if (outcome.status === 'completed' && !signal.aborted) {
+          const receipts = await toolRun.waitForDeferred(signal)
+          if (receipts.length && !signal.aborted) {
+            await session.checkpoint()
+            outcome = await session.run(deferredResultPrompt(receipts))
+            if (outcome.status === 'completed' && !signal.aborted) await toolRun.waitForDeferred(signal)
+          }
+        }
         const attempted = new Set<TurnFollowUp['id']>()
         while (!signal.aborted && outcome.status === 'completed' &&
+          !blockingWrite() &&
           (this.#judgment.mode('turn.completion', task.id) !== 'off' || this.#judgment.mode('turn.continue', task.id) !== 'off')) {
           followUp = await reviewTurn(this.#judgment, event, { goal: node.goal, summary: outcome.text, checkConfigured: Boolean(node.check),
             operations: this.#tasks.operations(task.id), completedReceipts: this.#completedReceipts(event), attempted, signal })
           if (!followUp || signal.aborted) break
           await session.checkpoint()
           outcome = await session.run(followUp.nudge)
+          if (outcome.status === 'completed' && !signal.aborted) await toolRun.waitForDeferred(signal)
         }
         followUp = undefined
         executionCompleted = outcome.status === 'completed'
@@ -529,6 +543,7 @@ export class MultiAgentOrchestrator {
     let outputFailed = false
     let textProduced = false
     let streamed = false
+    let reportedDeferredResult = false
     let followUp: TurnFollowUp | undefined
     let advice: Awaited<ReturnType<typeof preflight>> = {}
     const attempted = new Set<TurnFollowUp['id']>()
@@ -593,7 +608,7 @@ export class MultiAgentOrchestrator {
     const tools: ExecutionTool[] = availableTools
       .map(tool => {
         const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input =>
-          !workerActive && !this.#tasks.blocksToolWork(task.id, tool.policy?.whileActive ? event.agentRunId : undefined) &&
+          !workerActive &&
           followUpAllows(followUp, tool.name) && this.#capabilities.authorize(rootScope, tool, input), undefined, undefined, task.goal)
         return {
           ...wrapped,
@@ -716,7 +731,6 @@ export class MultiAgentOrchestrator {
       canRecoverModelOutput: () => !signal.aborted && !hasUnknownWrite(),
       reserveRequest: (request) => {
         signal.throwIfAborted()
-        if (this.#tasks.blocksToolWork(task.id, event.agentRunId)) throw new Error('Unconfirmed workspace operation')
         try {
           const cap = lease!.request(request)
           visual.requestStarted()
@@ -906,6 +920,13 @@ export class MultiAgentOrchestrator {
           this.#tasks.markDelivered(task.id, [...prompted, ...seenSteers])
           seenSteers.clear()
           queuedSteers.clear()
+          const receipts = await toolRun.waitForDeferred(signal)
+          if (signal.aborted) break
+          if (receipts.length && !reportedDeferredResult) {
+            reportedDeferredResult = true
+            nextPrompt = deferredResultPrompt(receipts)
+            continue
+          }
           const after = this.#tasks.get(task.id)
           const more = after.instructions.some((item) => !item.delivered) || this.#tasks.runnableNodes(task.id).length > 0 ||
             (!conversationId && after.route && !sameRoute(after.route, session.route))

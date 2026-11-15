@@ -15,6 +15,7 @@ const shell = windows ? 'powershell' : 'sh'
 interface ToolResult {
   ok: boolean
   error?: string
+  code?: string
   processId: string
   state: string
   exitCode: number | null
@@ -87,6 +88,8 @@ test('authorized shell streams complete redacted frames and settles the original
   const final = await invoke('process_status', { processId })
   assert.equal(final.state, 'exited')
   assert.equal(final.exitCode, 7)
+  assert.equal(final.ok, false)
+  assert.equal(final.code, 'PROCESS_FAILED')
   const tail = await invoke('process_output', { processId, after: first.cursor })
   assert.match(tail.frames.map(frame => frame.text).join(''), /incomplete-line/)
   assert.ok(tail.frames.every(frame => frame.cursor > first.cursor))
@@ -132,6 +135,8 @@ test('process_stop stops the controlled child tree and keeps the original write 
   })
   const result = await invoke('process_stop', { processId })
   assert.equal(result.state, 'stopped')
+  assert.equal(result.ok, false)
+  assert.equal(result.code, 'UNCONFIRMED_WRITE')
   assert.equal(await operations[0]!.completion, 'unknown_effect')
   await delay(4_700)
   await assert.rejects(access(join(root, 'escaped.txt')), { code: 'ENOENT' })
@@ -156,7 +161,9 @@ test('shell enforces bounded input, output, timeout and task abort', async t => 
   const timed = await invoke('shell_exec', { shell, command: blocking, timeoutMs: 300 })
   assert.equal(timed.ok, true)
   assert.equal(await operations[1]!.completion, 'unknown_effect')
-  assert.equal((await invoke('process_status', { processId: timed.processId })).state, 'timed_out')
+  const timedStatus = await invoke('process_status', { processId: timed.processId })
+  assert.equal(timedStatus.state, 'timed_out')
+  assert.equal(timedStatus.code, 'UNCONFIRMED_WRITE')
   const abort = new AbortController()
   const cancelled = await invoke('shell_exec', { shell, command: blocking }, undefined, abort.signal)
   assert.equal(cancelled.ok, true)

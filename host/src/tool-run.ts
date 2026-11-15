@@ -59,7 +59,7 @@ function redactResult(value: unknown, depth = 0): unknown {
 }
 
 export class ToolRun {
-  readonly #deferred = new Map<string, { stop(): Promise<void>; settled: Promise<void> }>()
+  readonly #deferred = new Map<string, { stop(): Promise<void>; settled: DeferredToolOperation['completion'] }>()
   readonly #cleanup = new Set<() => Promise<void>>()
   readonly #tasks: TaskEngine
   readonly #approval: ToolApprovalBroker
@@ -140,6 +140,13 @@ export class ToolRun {
           approvalKind = tool.policy?.approvalFor?.(input) ?? tool.policy?.approval
         } catch { deny('policy'); return unavailable }
         if (!authorize(input)) { deny('policy'); return unavailable }
+        const blocked = this.#tasks.toolWorkBlock(ref, tool.name, effect, tool.policy)
+        if (blocked) {
+          deny('policy')
+          return blocked === 'unconfirmed_write'
+            ? { ok: false, code: 'UNCONFIRMED_WRITE', error: 'A previous write may have partially completed. Inspect the workspace or captured process output with read-only tools. Do not rerun the operation. Report what remains uncertain to the user.' }
+            : { ok: false, code: 'ACTIVE_WRITE', error: 'A workspace operation is in progress. For your shell command, read its process status or output before making another change.' }
+        }
         const operationId = ref.agentRunId + ':' + callId
         const target = workspaceTarget(input)
         let destination: string | undefined
@@ -165,7 +172,7 @@ export class ToolRun {
             }, combined, ref.taskId)
             const approved = approval.approved && !this.#closed && !combined.aborted && authorize(input)
             this.#tasks.auditToolApproval(ref, operationId, tool.name, approved, approvalKind)
-            if (!approved) return { ok: false, error: 'Operation was not authorized' }
+            if (!approved) return { ok: false, code: 'APPROVAL_NOT_GRANTED', error: 'Operation was not authorized. It did not run. Use an already authorized alternative or explain which step needs approval.' }
             destination = approval.approved ? approval.destination : undefined
           }
         }
@@ -260,12 +267,25 @@ export class ToolRun {
     const settled = operation.completion.catch(() => 'unknown_effect' as const)
       .then(status => {
         this.#finish(event, id, status)
-        if (!key || this.#closed || signal.aborted) return
-        if (status === 'failed') this.#recordFailure(key, paths)
-        if (status === 'succeeded') this.#failures.delete(key)
+        if (key && !this.#closed && !signal.aborted) {
+          if (status === 'failed') this.#recordFailure(key, paths)
+          if (status === 'succeeded') this.#failures.delete(key)
+        }
+        return status
       }).finally(() => this.#deferred.delete(id))
     this.#deferred.set(id, { stop: () => operation.stop(), settled })
     void settled.catch(() => {})
+  }
+
+  async waitForDeferred(signal: AbortSignal): Promise<Awaited<DeferredToolOperation['completion']>[]> {
+    if (signal.aborted || !this.#deferred.size) return []
+    const aborted = Promise.withResolvers<[]>()
+    const abort = () => aborted.resolve([])
+    signal.addEventListener('abort', abort, { once: true })
+    try {
+      const receipts = Promise.all([...this.#deferred.values()].map(resource => resource.settled))
+      return await Promise.race([receipts, aborted.promise])
+    } finally { signal.removeEventListener('abort', abort) }
   }
 
   async close(): Promise<void> {

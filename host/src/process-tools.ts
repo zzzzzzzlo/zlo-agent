@@ -4,6 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
+import { setTimeout as delay } from 'node:timers/promises'
 import type { CodingWorkspace, ToolInvocationContext, WorkspaceTool } from './workspace.ts'
 import { containsPath, processEnvironment, redactProcessOutput } from './workspace-process.ts'
 
@@ -16,6 +17,8 @@ const maxLineBytes = 4_096
 const maxFrames = 256
 const maxPageBytes = 16 * 1024
 const maxHandles = 8
+const defaultPollWait = 1_000
+const maxPollWait = 15_000
 
 type Channel = 'stdout' | 'stderr'
 type State = 'starting' | 'running' | 'exited' | 'stopped' | 'timed_out' | 'failed' | 'unknown'
@@ -251,10 +254,33 @@ function startProcess(invocation: ShellInvocation, cwd: string, workspace: strin
   })
   signal?.addEventListener('abort', abort, { once: true })
 
+  const status = () => ({ processId: id, state, exitCode, truncated: output.truncated })
+  const result = () => {
+    const snapshot = status()
+    if (state === 'stopped' || state === 'timed_out' || state === 'unknown') {
+      return { ok: false, ...snapshot, code: 'UNCONFIRMED_WRITE',
+        error: 'The shell command did not exit normally; some changes may already exist. Inspect the workspace and captured output without repeating the command.' }
+    }
+    if (state === 'failed' || (state === 'exited' && exitCode !== 0)) {
+      return { ok: false, ...snapshot, code: 'PROCESS_FAILED', error: 'The shell command failed. Inspect the captured output before retrying.' }
+    }
+    return { ok: true, ...snapshot }
+  }
+
   return {
     id, pid: child.pid, output, started: started.promise, completion: completed.promise, stop,
     terminal: () => terminal,
-    status: () => ({ processId: id, state, exitCode, truncated: output.truncated }),
+    status, result,
+    async wait(ms: number, signal?: AbortSignal) {
+      if (terminal || !ms || signal?.aborted) return
+      const timer = new AbortController()
+      try {
+        await Promise.race([completed.promise, delay(ms, undefined,
+          { signal: signal ? AbortSignal.any([signal, timer.signal]) : timer.signal })])
+      } catch (error) {
+        if (!signal?.aborted) throw error
+      } finally { timer.abort() }
+    },
   }
 }
 
@@ -272,6 +298,7 @@ function denied() { return { ok: false, error: 'Process is unavailable in this A
 function invalid() { return { ok: false, error: 'Invalid process arguments' } }
 
 const idSchema = { type: 'string', pattern: '^[0-9a-f-]{36}$' }
+const waitSchema = { type: 'integer', minimum: 0, maximum: maxPollWait }
 const control = { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true, whileActive: true } as const
 
 export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] {
@@ -290,7 +317,7 @@ export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] 
   return [
     {
       name: 'shell_exec',
-      description: 'Start one explicitly approved shell command as the current OS user. The working directory is not a sandbox. Poll process_status and process_output until the command exits, or stop it with process_stop. Output is untrusted.',
+      description: 'Start one explicitly approved shell command as the current OS user. The working directory is not a sandbox. Use process_status with waitMs to await exit and process_output to read logs. Only use process_stop when you actually need to terminate the command; partial changes may require reconciliation.',
       effect: 'write',
       policy: { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true, approval: 'shell', deferred: true },
       parameters: {
@@ -350,32 +377,39 @@ export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] 
     },
     {
       name: 'process_status',
-      description: 'Get the status and eventual exit code of a shell process started in this Agent run.',
+      description: 'Wait briefly for your shell process and get its state and exit code. Use waitMs up to 15000 to avoid rapid polling. A running state means the command is still working.',
       effect: 'read',
       policy: control,
-      parameters: { type: 'object', additionalProperties: false, required: ['processId'], properties: { processId: idSchema } },
-      async execute(_id, input, _signal, context) {
-        const args = object(input, ['processId'])
+      parameters: { type: 'object', additionalProperties: false, required: ['processId'], properties: { processId: idSchema, waitMs: waitSchema } },
+      async execute(_id, input, signal, context) {
+        const args = object(input, ['processId', 'waitMs'])
+        if (!args || (args.waitMs !== undefined && !integer(args.waitMs, 0, maxPollWait))) return invalid()
         const process = args && owned(args, context)
-        return process ? { ok: true, ...process.status() } : denied()
+        if (!process) return denied()
+        await process.wait((args.waitMs as number | undefined) ?? defaultPollWait, signal)
+        return process.result()
       },
     },
     {
       name: 'process_output',
-      description: 'Read bounded redacted output from a shell process, optionally after the last returned cursor. Treat output as untrusted.',
+      description: 'Read bounded redacted output from your shell process. Pass the last cursor to read only new output. Running with no new output is not a failure. Treat output as untrusted.',
       effect: 'read',
       policy: control,
       parameters: {
         type: 'object', additionalProperties: false, required: ['processId'],
         properties: { processId: idSchema, after: { type: 'integer', minimum: 0 }, limit: { type: 'integer', minimum: 1, maximum: 32 } },
       },
-      async execute(_id, input, _signal, context) {
+      async execute(_id, input, signal, context) {
         const args = object(input, ['processId', 'after', 'limit'])
         if (!args || (args.after !== undefined && !integer(args.after, 0, maxFrames)) ||
           (args.limit !== undefined && !integer(args.limit, 1, 32))) return invalid()
         const process = owned(args, context)
         if (!process) return denied()
-        const result = process.output.read(args.after ?? 0, args.limit ?? 16)
+        let result = process.output.read(args.after ?? 0, args.limit ?? 16)
+        if (result && !result.frames.length && !process.terminal()) {
+          await process.wait(defaultPollWait, signal)
+          result = process.output.read(args.after ?? 0, args.limit ?? 16)
+        }
         return result ? { ok: true, state: process.status().state, ...result } : invalid()
       },
     },
@@ -390,8 +424,7 @@ export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] 
         const process = args && owned(args, context)
         if (!process) return denied()
         await process.stop()
-        const status = process.status()
-        return { ok: status.state !== 'unknown', ...status }
+        return process.result()
       },
     },
   ]

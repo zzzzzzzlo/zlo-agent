@@ -160,8 +160,7 @@ test('input-dependent tool authorization preserves read scope, approval and writ
     const saved = { path: 'capture.png' }
     assert.deepEqual(await as('read').execute('view', {}), { ok: true })
     assert.deepEqual(await as('read').execute('write-denied', saved), { ok: false, error: 'Tool work is unavailable' })
-    assert.deepEqual(await as('trusted').execute('public-denied', { url: 'https://example.com' }),
-      { ok: false, error: 'Operation was not authorized' })
+    assert.match((await as('trusted').execute('public-denied', { url: 'https://example.com' }) as { error: string }).error, /It did not run/)
     assert.deepEqual(await as('trusted').execute('saved', saved), { ok: true })
     assert.deepEqual(calls, [{}, saved])
     assert.deepEqual(approvals, ['network'])

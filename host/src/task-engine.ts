@@ -681,10 +681,24 @@ export class TaskEngine {
   }
 
   blocksToolWork(taskId: string, managedOwner?: string, worktreeId?: string): boolean {
-    return this.operations(taskId).some(({ effect, status, managed, agentRunId, worktreeId: operationWorktree }) =>
-      effect === 'write' && (status === 'unknown_effect' ||
-        (status === 'started' && !separateWorktrees(worktreeId, operationWorktree) &&
-          !(managed && managedOwner && agentRunId === managedOwner))))
+    return Boolean(this.#toolWorkBlock(taskId, managedOwner, worktreeId))
+  }
+
+  toolWorkBlock(event: EventDraft, tool: string, effect: Operation['effect'], policy?: { whileActive?: boolean }) {
+    const task = this.get(event.taskId)
+    const worktreeId = allNodes(task).find(node => node.id === event.taskNodeId)?.worktreeId
+    return this.#toolWorkBlock(task.id, policy?.whileActive ? event.agentRunId : undefined, worktreeId, tool, effect)
+  }
+
+  #toolWorkBlock(taskId: string, managedOwner?: string, worktreeId?: string, tool?: string, effect?: Operation['effect']) {
+    const writes = this.operations(taskId).filter(operation => operation.effect === 'write')
+    // Only scoped local reads and the owning run's process probes may inspect uncertain effects.
+    const inspection = effect === 'read' && (tool === 'list_directory' || tool === 'read_text_file' ||
+      tool === 'search_files' || tool === 'search_content' || tool === 'process_status' || tool === 'process_output')
+    if (!inspection && writes.some(operation => operation.status === 'unknown_effect')) return 'unconfirmed_write' as const
+    if (writes.some(({ status, managed, agentRunId, worktreeId: operationWorktree }) =>
+      status === 'started' && !separateWorktrees(worktreeId, operationWorktree) &&
+      !(managed && managedOwner && agentRunId === managedOwner))) return 'active_write' as const
   }
 
   #nodeRunCapacity(task: TaskSnapshot): number {
@@ -860,7 +874,7 @@ export class TaskEngine {
       const active = allNodes(task).filter(({ status }) => status === 'running')
       const node = active.find(({ id: current }) => current === nodeId)
       if (task.status !== expected || event.taskId !== taskId || !task.attemptId ||
-        this.blocksToolWork(taskId, policy?.whileActive ? event.agentRunId : undefined, node?.worktreeId)) {
+        this.#toolWorkBlock(taskId, policy?.whileActive ? event.agentRunId : undefined, node?.worktreeId, tool, effect)) {
         throw new Error('Task is not accepting tool work')
       }
       if (this.#db.get('operations', id)) throw new Error('Duplicate tool call')

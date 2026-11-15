@@ -895,8 +895,8 @@ export class LocalAgentHost {
         this.#engine.end(task.id, executionFailure(result.status))
         return
       }
-      if (signal.aborted || this.#engine.operations(task.id).some((item) => item.status === 'unknown_effect' || item.status === 'started')) {
-        this.#engine.end(task.id, 'model_interrupted')
+      if (signal.aborted || this.#engine.operations(task.id).some(item => item.status === 'unknown_effect' || item.status === 'started')) {
+        this.#engine.end(task.id, signal.aborted ? 'model_interrupted' : 'unknown_effect')
         return
       }
       this.#engine.beginVerification(task.id)
@@ -919,7 +919,7 @@ export class LocalAgentHost {
                 : operations.some(item => item.status === 'failed') ? 'tool_execution_failed' : 'assistant_response_missing',
           }
       if (signal.aborted || this.#engine.operations(task.id).some(item => item.status === 'unknown_effect' || item.status === 'started')) {
-        this.#engine.end(task.id, 'model_interrupted')
+        this.#engine.end(task.id, signal.aborted ? 'model_interrupted' : 'unknown_effect')
         return
       }
       const latest = this.#engine.get(task.id)
