@@ -1,6 +1,7 @@
 import { isAbsolute, relative, sep } from 'node:path'
 import type { ConversationAction, ConversationRef, CreateConversationInput, DesktopCommand } from '../../../shared/contracts/desktop.ts'
 import { projectCommands } from '../../../shared/contracts/domain.ts'
+import { isToolApprovalMode } from '../../../shared/contracts/tool-approval.ts'
 import type { VerificationCheck } from '../../../shared/contracts/domain.ts'
 import { HostTransportError } from './host-process.ts'
 
@@ -99,8 +100,12 @@ function verificationCheck(value: unknown, trusted: boolean): VerificationCheck 
 }
 
 function createInput(value: unknown, allowedWorkspace: (path: string) => boolean): CreateConversationInput {
-  const input = object(value, ['requestId', 'title', 'workspace', 'workspaceAccess', 'route', 'check'])
+  const input = object(value, ['requestId', 'title', 'workspace', 'workspaceAccess', 'toolApprovalMode', 'route', 'check'])
   const result: CreateConversationInput = { requestId: requestId(input.requestId) }
+  if (input.toolApprovalMode !== undefined) {
+    if (!isToolApprovalMode(input.toolApprovalMode)) return invalid()
+    result.toolApprovalMode = input.toolApprovalMode
+  }
   if (input.title !== undefined) result.title = text(input.title, 120)
   if (input.workspace !== undefined) {
     const workspace = text(input.workspace, 1_024)

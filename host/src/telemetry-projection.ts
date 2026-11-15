@@ -140,8 +140,8 @@ function safePayload(type: string, p: Record<string, unknown>): Record<string, u
     case 'model.usage': return { input: num(p.input), output: num(p.output), cacheRead: num(p.cacheRead), cacheWrite: num(p.cacheWrite), estimatedCostUsd: num(p.estimatedCostUsd) }
     case 'tool.started': case 'tool.finished': case 'tool.approval_resolved': case 'tool.denied':
       return { id: ref(p.id), tool: label(p.tool), effect: oneOf(p.effect, ['read', 'write']), status, managed: bool(p.managed), approved: bool(p.approved),
-        reason: oneOf(p.reason, ['policy', 'approval_safety', 'repeated_failure', 'tool_result_failed', 'tool_exception', 'nonzero_exit', 'tool_cancelled']),
-        approvalKind: oneOf(p.approvalKind, approvalKinds) }
+        reason: oneOf(p.reason, ['policy', 'approval_safety', 'repeated_failure', 'approval_unattended', 'tool_result_failed', 'tool_exception', 'nonzero_exit', 'tool_cancelled']),
+        approvalKind: oneOf(p.approvalKind, approvalKinds), automatic: bool(p.automatic) }
     case 'task.permissions_changed': return { access: oneOf(p.access, accessLevels), previousAccess: oneOf(p.previousAccess, accessLevels) }
     case 'operation.reconciliation_required': case 'operation.reconciliation_checked': return { status, reason,
       operationId: ref(p.operationId), operationIds: refs(p.operationIds), changedEntries: num(p.changedEntries), truncated: bool(p.truncated) }

@@ -37,6 +37,12 @@ export const managementChannels = {
   reconcile: 'agent-management:reconcile',
 } as const
 
+export const toolApprovalChannels = {
+  pending: 'tool-approval:pending',
+  decide: 'tool-approval:decide',
+  change: 'tool-approval:change',
+} as const
+
 export const chatGptChannels = {
   status: 'agent-chatgpt:status',
   signIn: 'agent-chatgpt:sign-in',

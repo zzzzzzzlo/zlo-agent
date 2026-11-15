@@ -7,6 +7,8 @@ import { WorkspaceStatusBar } from './components/layout/WorkspaceStatusBar'
 import { ConversationToolbar } from './components/layout/ConversationToolbar'
 import { ManagementPage } from './components/layout/ManagementPage'
 import { ActivityPanel } from './components/layout/ActivityPanel'
+import { StartupScreen } from './components/layout/StartupScreen'
+import { ToolApprovalCard } from './components/layout/ToolApprovalCard'
 import { Sidebar } from './components/sidebar/Sidebar'
 import type { SessionAction } from './components/sidebar/Sidebar'
 import { SessionDialog } from './components/sidebar/SessionDialog'
@@ -30,16 +32,19 @@ export function App() {
   const [lastSetting, setLastSetting] = useState<SettingsSection>('models')
   const [sessionAction, setSessionAction] = useState<SessionAction>()
   const [newConversation, setNewConversation] = useState(false)
+  const [started, setStarted] = useState(false)
+  const starting = !started && hostState !== 'ready'
 
   useLayoutEffect(() => {
     document.documentElement.dataset.theme = theme
     document.documentElement.dataset.glass = strength
   }, [theme, strength])
   useEffect(initialize, [initialize])
+  useEffect(() => { if (hostState === 'ready') setStarted(true) }, [hostState])
 
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
-      if (event.isComposing || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return
+      if (starting || event.isComposing || !(event.ctrlKey || event.metaKey) || event.altKey || event.shiftKey) return
       if (event.key.toLowerCase() === 'n' && !page && !sessionAction && !newConversation && hostState === 'ready') {
         event.preventDefault()
         setPage(undefined)
@@ -52,7 +57,7 @@ export function App() {
     }
     window.addEventListener('keydown', shortcut)
     return () => window.removeEventListener('keydown', shortcut)
-  }, [hostState, page, lastSetting, sessionAction, newConversation])
+  }, [starting, hostState, page, lastSetting, sessionAction, newConversation])
 
   function navigate(section?: ManagementSection) {
     setPage(section)
@@ -64,22 +69,25 @@ export function App() {
     <LiquiThemeProvider injectTokens={false} theme={{ glass: optics[strength] }}>
       <div className="app-shell">
         <div className="window-backdrop" aria-hidden="true" />
-        <TitleBar destination={page && settingsLabels[page]} />
-        <div className="workspace">
-          {!page && sidebar && <Sidebar onCreate={() => { navigate(); setNewConversation(true) }}
-            onSettings={() => setPage(lastSetting)} onSessionAction={setSessionAction} onSession={() => navigate()} />}
-          <main className="chat-surface" aria-label="对话" hidden={Boolean(page)}>
-            <ConversationToolbar expanded={activity} onObservatory={() => setActivity(visible => !visible)} onManageModels={() => navigate('models')} />
-            <ChatSurface />
-            <Composer />
-          </main>
-          {page && <ManagementPage section={page} onSelect={(section) => { setLastSetting(section); setPage(section) }}
-            onBack={() => setPage(undefined)} />}
-          {!page && activity && session && <ActivityPanel key={session.id} session={session} onClose={() => setActivity(false)} onManage={navigate} />}
-        </div>
-        <WorkspaceStatusBar onReconcile={() => navigate('diagnostics')} />
-        {sessionAction && <SessionDialog action={sessionAction} onClose={() => setSessionAction(undefined)} />}
-        {newConversation && <NewConversationDialog onClose={() => setNewConversation(false)} />}
+        <TitleBar destination={page && settingsLabels[page]} starting={starting} />
+        {starting ? <StartupScreen /> : <>
+          <div className="workspace">
+            {!page && sidebar && <Sidebar onCreate={() => { navigate(); setNewConversation(true) }}
+              onSettings={() => setPage(lastSetting)} onSessionAction={setSessionAction} onSession={() => navigate()} />}
+            <main className="chat-surface" aria-label="对话" hidden={Boolean(page)}>
+              <ConversationToolbar expanded={activity} onObservatory={() => setActivity(visible => !visible)} onManageModels={() => navigate('models')} />
+              <ChatSurface />
+              <Composer />
+            </main>
+            {page && <ManagementPage section={page} onSelect={(section) => { setLastSetting(section); setPage(section) }}
+              onBack={() => setPage(undefined)} />}
+            {!page && activity && session && <ActivityPanel key={session.id} session={session} onClose={() => setActivity(false)} onManage={navigate} />}
+          </div>
+          <WorkspaceStatusBar onReconcile={() => navigate('diagnostics')} />
+          {sessionAction && <SessionDialog action={sessionAction} onClose={() => setSessionAction(undefined)} />}
+          {newConversation && <NewConversationDialog onClose={() => setNewConversation(false)} />}
+          <ToolApprovalCard />
+        </>}
       </div>
     </LiquiThemeProvider>
   )

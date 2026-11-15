@@ -1,5 +1,15 @@
 export const approvalKinds = ['shell', 'destructive', 'git', 'browser_action', 'export', 'network'] as const
 export type ApprovalKind = typeof approvalKinds[number]
+export type ToolApprovalMode = 'ask' | 'routine' | 'unattended'
+export function isToolApprovalMode(value: unknown): value is ToolApprovalMode {
+  return value === 'ask' || value === 'routine' || value === 'unattended'
+}
+
+export interface DesktopToolApprovals {
+  pending(): Promise<ToolApprovalRequest[]>
+  decide(input: { id: string; approved: boolean }): Promise<boolean>
+  onChange(listener: (requests: ToolApprovalRequest[]) => void): () => void
+}
 
 export interface ToolApprovalRequest {
   id: string

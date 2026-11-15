@@ -10,6 +10,8 @@ import { TaskEngine } from '../src/task-engine.ts'
 import { ToolApprovalBroker } from '../src/tool-approval.ts'
 import { ToolRun } from '../src/tool-run.ts'
 import { CodingWorkspace } from '../src/workspace.ts'
+import { publicReadApproval } from '../src/web-tools.ts'
+import type { ToolApprovalMode } from '../../shared/contracts/tool-approval.ts'
 import type { WorkspaceTool } from '../src/workspace.ts'
 
 test('approval is single-use and a stopped run rejects a late native answer', async () => {
@@ -28,6 +30,68 @@ test('approval is single-use and a stopped run rejects a late native answer', as
   assert.deepEqual(await approval, { approved: false })
   assert.equal(cancelled, id)
   assert.equal(broker.resolve(id, { approved: true }), false)
+})
+
+test('approval changes cancel only pending decisions for that task', async () => {
+  const broker = new ToolApprovalBroker()
+  const pending: string[] = []
+  broker.subscribe(notice => { if (notice.kind === 'tool.approval') pending.push(notice.request.id) })
+  const signal = new AbortController().signal
+  const details = { kind: 'shell', tool: 'shell_exec', detail: '{}', workspace: 'project' } as const
+  const left = broker.request(details, signal, 'one')
+  const right = broker.request(details, signal, 'two')
+  broker.cancelScope('one')
+  assert.deepEqual(await left, { approved: false })
+  assert.equal(broker.resolve(pending[0], { approved: true }), false)
+  assert.equal(broker.resolve(pending[1], { approved: true }), true)
+  assert.equal((await right).approved, true)
+})
+
+test('risk and unattended modes authorize only approved public reads and enforce the existing capability grant', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'zlo-tool-approval-mode-'))
+  const db = new LocalStore(':memory:')
+  try {
+    const workspace = new CodingWorkspace(root)
+    const tasks = new TaskEngine(db)
+    const { taskId } = tasks.create({ requestId: 'approval-mode', cwd: root, goal: 'Check approval modes', workspaceAccess: 'trusted' })
+    const task = tasks.start(taskId)
+    const event = { taskId, taskNodeId: task.rootNodeId, taskAttemptId: task.attemptId, agentRunId: 'approval-mode-run', type: '', payload: {} }
+    let mode: ToolApprovalMode = 'ask'
+    const asked: string[] = []
+    const executed: string[] = []
+    let granted = true
+    const run = new ToolRun(tasks, new ToolApprovalBroker(async request => {
+      asked.push(request.tool)
+      return { approved: false }
+    }), undefined, undefined, undefined, () => mode)
+    const tool = (name: string, effect: WorkspaceTool['effect'], policy: WorkspaceTool['policy']) =>
+      run.wrap({
+        name, description: '', parameters: {}, effect, policy,
+        async execute() { executed.push(name); return { ok: true } },
+      }, workspace, () => event, new AbortController().signal, () => granted)
+    const get = tool('web_fetch', 'read', { approval: 'network', publicRead: publicReadApproval })
+    const shell = tool('shell_exec', 'write', { approval: 'shell', publicRead: publicReadApproval })
+    const url = { url: 'https://example.com/docs' }
+    assert.equal((await get.execute('manual', url) as { ok: boolean }).ok, false)
+    mode = 'routine'
+    assert.deepEqual(await get.execute('automatic', url), { ok: true })
+    assert.equal((await get.execute('query', { url: 'https://example.com/docs?q=x' }) as { ok: boolean }).ok, false)
+    assert.equal((await shell.execute('shell-review', url) as { ok: boolean }).ok, false)
+    mode = 'unattended'
+    assert.deepEqual(await get.execute('background-read', url), { ok: true })
+    assert.equal((await shell.execute('shell-blocked', url) as { ok: boolean }).ok, false)
+    assert.equal((await get.execute('local-blocked', { url: 'https://127.0.0.1/path' }) as { ok: boolean }).ok, false)
+    granted = false
+    assert.equal((await get.execute('out-of-scope', url) as { ok: boolean }).ok, false)
+    assert.deepEqual(asked, ['web_fetch', 'web_fetch', 'shell_exec'])
+    assert.deepEqual(executed, ['web_fetch', 'web_fetch'])
+    assert.equal(db.events(taskId).filter(e => e.type === 'tool.approval_resolved' && e.payload.automatic).length, 2)
+    assert.equal(db.events(taskId).filter(e => e.type === 'tool.denied' && e.payload.reason === 'approval_unattended').length, 2)
+    await run.close()
+  } finally {
+    db.close()
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 test('artifact export ignores model-supplied destinations and only creates the approved new file', async () => {

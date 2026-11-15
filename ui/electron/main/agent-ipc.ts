@@ -2,8 +2,9 @@ import { realpath, stat } from 'node:fs/promises'
 import { basename, dirname, join, parse } from 'node:path'
 import { BrowserWindow, dialog, ipcMain } from 'electron'
 import type { IpcMainInvokeEvent, WebContents } from 'electron'
-import { agentChannels } from '../agent-channels.ts'
-import { desktopCommand, directoryOverlaps, localDirectory, noInput } from './agent-input.ts'
+import type { ToolApprovalDecision, ToolApprovalRequest } from '../../../shared/contracts/tool-approval.ts'
+import { agentChannels, toolApprovalChannels } from '../agent-channels.ts'
+import { desktopCommand, directoryOverlaps, entityId, localDirectory, noInput, object } from './agent-input.ts'
 import { HostTransportError } from './host-process.ts'
 import type { HostProcessManager } from './host-process.ts'
 
@@ -37,32 +38,58 @@ export function registerAgentIpc(options: {
   const { host } = options
   const selectedDirectories = new WeakMap<WebContents, Map<string, DirectoryIdentity>>()
   const pendingTrust = new WeakSet<WebContents>()
+  const pendingExport = new WeakSet<WebContents>()
+  const approvals = new Map<string, { request: ToolApprovalRequest; window: BrowserWindow; resolve(decision: ToolApprovalDecision): void }>()
+  const forWindow = (window: BrowserWindow) => [...approvals.values()].filter(item => item.window === window).map(item => item.request)
+  const publish = (window: BrowserWindow) => {
+    if (window.isDestroyed() || window.webContents.getURL() !== options.rendererUrl) return
+    window.webContents.send(toolApprovalChannels.change, forWindow(window))
+  }
 
   host.setToolApprover(async (request, signal) => {
     const window = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
     if (signal.aborted || !window || window.isDestroyed() || window.webContents.getURL() !== options.rendererUrl ||
       pendingTrust.has(window.webContents) || !localDirectory(request.workspace)) return { approved: false }
     if (request.kind === 'export') {
-      const { canceled, filePath } = await dialog.showSaveDialog(window, {
-        title: '导出工作区文件', defaultPath: request.suggestedName,
-        buttonLabel: '导出', properties: ['showOverwriteConfirmation'],
-      })
-      if (signal.aborted || canceled || !filePath || !localDirectory(filePath) || window.isDestroyed() ||
-        window.webContents.getURL() !== options.rendererUrl) return { approved: false }
-      const directory = await realpath(dirname(filePath))
-      const destination = join(directory, basename(filePath))
-      const protectedPaths = await Promise.all(options.protectedPaths.map(path => realpath(path).catch(() => path)))
-      if (protectedPaths.some(path => directoryOverlaps(path, destination))) return { approved: false }
-      return { approved: true, destination }
+      const contents = window.webContents
+      if (pendingExport.has(contents)) return { approved: false }
+      pendingExport.add(contents)
+      try {
+        const { canceled, filePath } = await dialog.showSaveDialog(window, {
+          title: '导出工作区文件', defaultPath: request.suggestedName,
+          buttonLabel: '导出', properties: ['showOverwriteConfirmation'],
+        })
+        if (signal.aborted || canceled || !filePath || !localDirectory(filePath) || window.isDestroyed() ||
+          window.webContents.getURL() !== options.rendererUrl) return { approved: false }
+        const directory = await realpath(dirname(filePath))
+        const destination = join(directory, basename(filePath))
+        const protectedPaths = await Promise.all(options.protectedPaths.map(path => realpath(path).catch(() => path)))
+        if (protectedPaths.some(path => directoryOverlaps(path, destination))) return { approved: false }
+        return { approved: true, destination }
+      } finally { pendingExport.delete(contents) }
     }
-    const { response } = await dialog.showMessageBox(window, {
-      type: 'warning', title: '授权 Agent 工具', message: '仅允许本次操作？',
-      detail: request.tool + '\n' + request.workspace + '\n\n' + request.detail +
-        (request.kind === 'shell' ? '\n\n命令按当前系统账户权限运行。' : ''),
-      buttons: ['拒绝', '允许本次'], defaultId: 0, cancelId: 0, noLink: true, signal,
-    })
-    return { approved: !signal.aborted && response === 1 && !window.isDestroyed() &&
-      window.webContents.getURL() === options.rendererUrl ? true : false }
+    const contents = window.webContents
+    const { promise, resolve } = Promise.withResolvers<ToolApprovalDecision>()
+    const cancel = () => resolve({ approved: false })
+    const navigated = (details: { isMainFrame: boolean; isSameDocument: boolean }) => {
+      if (details.isMainFrame && !details.isSameDocument) cancel()
+    }
+    signal.addEventListener('abort', cancel, { once: true })
+    contents.once('destroyed', cancel)
+    contents.on('did-start-navigation', navigated)
+    approvals.set(request.id, { request, window, resolve })
+    try {
+      if (signal.aborted) cancel()
+      else publish(window)
+      const decision = await promise
+      return signal.aborted ? { approved: false } : decision
+    } finally {
+      approvals.delete(request.id)
+      signal.removeEventListener('abort', cancel)
+      contents.off('destroyed', cancel)
+      contents.off('did-start-navigation', navigated)
+      publish(window)
+    }
   })
 
   async function checkWorkspace(window: BrowserWindow, workspace: string, expected?: DirectoryIdentity): Promise<DirectoryIdentity> {
@@ -116,6 +143,20 @@ export function registerAgentIpc(options: {
   register(agentChannels.restart, (_window, input) => {
     noInput(input)
     return host.restart()
+  })
+  register(toolApprovalChannels.pending, (window, input) => {
+    noInput(input)
+    return forWindow(window)
+  })
+  register(toolApprovalChannels.decide, (window, input) => {
+    const value = object(input, ['id', 'approved'])
+    const id = entityId(value.id)
+    if (typeof value.approved !== 'boolean') throw new HostTransportError('INVALID_INPUT', '审批操作无效。')
+    const pending = approvals.get(id)
+    if (!pending || pending.window !== window) return false
+    approvals.delete(id)
+    pending.resolve({ approved: value.approved })
+    return true
   })
   register(agentChannels.chooseWorkspace, async (window, input) => {
     noInput(input)

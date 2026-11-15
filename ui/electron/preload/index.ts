@@ -2,7 +2,8 @@ import { contextBridge, ipcRenderer } from 'electron'
 import type { IpcRendererEvent } from 'electron'
 import { windowChannels } from '../window-api'
 import type { WindowApi } from '../window-api'
-import { agentChannels, chatGptChannels, managementChannels, providerSetupChannels } from '../agent-channels.ts'
+import { agentChannels, chatGptChannels, managementChannels, providerSetupChannels, toolApprovalChannels } from '../agent-channels.ts'
+import type { DesktopToolApprovals, ToolApprovalRequest } from '../../../shared/contracts/tool-approval.ts'
 import type { DesktopProviderSetupApi } from '../../../shared/contracts/provider-setup.ts'
 import type { DesktopChatGptApi } from '../../../shared/contracts/chatgpt.ts'
 import type { ConversationEvent, DesktopHostApi, DesktopHostStatus } from '../../../shared/contracts/desktop.ts'
@@ -52,6 +53,17 @@ const agentHost: DesktopHostApi = {
   },
 }
 contextBridge.exposeInMainWorld('agentHost', agentHost)
+
+const toolApprovals: DesktopToolApprovals = {
+  pending: () => ipcRenderer.invoke(toolApprovalChannels.pending),
+  decide: input => ipcRenderer.invoke(toolApprovalChannels.decide, input),
+  onChange(listener) {
+    const receive = (_event: IpcRendererEvent, requests: ToolApprovalRequest[]) => listener(requests)
+    ipcRenderer.on(toolApprovalChannels.change, receive)
+    return () => ipcRenderer.removeListener(toolApprovalChannels.change, receive)
+  },
+}
+contextBridge.exposeInMainWorld('agentToolApprovals', toolApprovals)
 
 const agentManagement: DesktopManagementApi = {
   snapshot: input => ipcRenderer.invoke(managementChannels.snapshot, input),

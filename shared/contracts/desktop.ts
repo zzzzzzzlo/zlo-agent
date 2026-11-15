@@ -1,4 +1,5 @@
 import type { EndReason, ModelRoute, TaskStatus, ToolFailureReason, VerificationCheck, VerificationResult, WorkspaceAccess } from './domain.ts'
+import type { ToolApprovalMode } from './tool-approval.ts'
 
 export type { ModelRoute, TaskStatus, VerificationCheck, WorkspaceAccess } from './domain.ts'
 
@@ -10,6 +11,7 @@ export interface ConversationSummary {
   archived: boolean
   workspace: string
   workspaceAccess?: WorkspaceAccess
+  toolApprovalMode?: ToolApprovalMode
   route?: ModelRoute
   pendingRoute?: ModelRoute
   check?: VerificationCheck
@@ -76,6 +78,7 @@ export interface CreateConversationInput {
   title?: string
   workspace?: string
   workspaceAccess?: WorkspaceAccess
+  toolApprovalMode?: ToolApprovalMode
   route?: ModelRoute
   check?: VerificationCheck
 }

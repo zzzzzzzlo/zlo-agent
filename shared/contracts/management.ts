@@ -3,6 +3,7 @@ import type { ConversationSummary, UsageTotals } from './desktop.ts'
 import type { ChatGptSession } from './chatgpt.ts'
 import type { JevSettings, JevStatus, JudgeCredentials } from './jev.ts'
 import type { CustomProviderCredential, GrokCredential } from './provider-setup.ts'
+import type { ToolApprovalMode } from './tool-approval.ts'
 
 export type ProviderId = 'deepseek' | 'openai' | 'anthropic' | 'google'
 export type ManagedModel = ModelCatalogEntry
@@ -114,7 +115,7 @@ export interface DesktopManagementApi {
   conversationObservatory(input: { conversationId: string }): Promise<ConversationObservatory>
   recentDiagnostics(): Promise<ManagedDiagnostic[]>
   savePreferences(input: AgentPreferences): Promise<AgentPreferences>
-  setWorkspaceAccess(input: { conversationId: string; access: WorkspaceAccess }): Promise<ConversationSummary>
+  setWorkspaceAccess(input: { conversationId: string; access: WorkspaceAccess; toolApprovalMode?: ToolApprovalMode }): Promise<ConversationSummary>
   setProviderKey(input: { provider: ProviderId }): Promise<ManagedProvider>
   testProvider(input: { provider: ProviderId; model?: string }): Promise<ManagedProvider>
   removeProviderKey(input: { provider: ProviderId }): Promise<ManagedProvider>
@@ -134,7 +135,8 @@ export type ManagementCommand =
   | ManagementRequest<'managementSnapshot', { conversationId?: string }>
   | ManagementRequest<'conversationObservatory', { conversationId: string }>
   | ManagementRequest<'saveAgentPreferences', { preferences: AgentPreferences }>
-  | ManagementRequest<'setWorkspaceAccess', { conversationId: string; access: WorkspaceAccess; expected: WorkspaceAccess }>
+  | ManagementRequest<'setWorkspaceAccess', { conversationId: string; access: WorkspaceAccess; expected: WorkspaceAccess;
+    toolApprovalMode?: ToolApprovalMode; expectedApprovalMode?: ToolApprovalMode }>
   | ManagementRequest<'deleteConversationMemory', { conversationId: string; ids: string[] }>
   | ManagementRequest<'reconcileOperation', { conversationId: string; taskId: string; operationId: string }>
   | ManagementRequest<'testProviderAccount', { provider: ProviderId; model?: string }>

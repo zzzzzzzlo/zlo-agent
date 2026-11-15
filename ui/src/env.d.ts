@@ -9,6 +9,7 @@ declare global {
     agentHost?: DesktopHostApi
     agentManagement?: DesktopManagementApi
     agentChatGpt?: DesktopChatGptApi
+    agentToolApprovals?: import('../../shared/contracts/tool-approval.ts').DesktopToolApprovals
     agentProviderSetup?: import('../../shared/contracts/provider-setup.ts').DesktopProviderSetupApi
   }
 }

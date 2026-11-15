@@ -70,6 +70,7 @@ export function toSession(conversation: ConversationSummary, previous?: Projecte
     turns: previous?.turns ?? [], loaded: previous?.loaded ?? false, nextBefore: previous?.nextBefore,
     latestStatus: conversation.latestStatus && taskStates[conversation.latestStatus],
     workspace: conversation.workspace, workspaceAccess: conversation.workspaceAccess,
+    toolApprovalMode: conversation.toolApprovalMode,
     route: conversation.route, pendingRoute: conversation.pendingRoute, check: conversation.check,
     historyCursor: previous?.historyCursor ?? 0, turnOrder: previous?.turnOrder ?? new Map(),
   }

@@ -1,11 +1,13 @@
 import { useState } from 'react'
 import { ChartNoAxesColumn, ChevronDown, Cpu, Folder, ShieldCheck } from 'lucide-react'
 import type { WorkspaceAccess } from '../../../../shared/contracts/desktop.ts'
+import type { ToolApprovalMode } from '../../../../shared/contracts/tool-approval.ts'
 import { workspaceAccessLabels } from '../../features/sessions/model'
 import type { Session } from '../../features/sessions/model'
 import { activeSession, useWorkspace } from '../../stores/workspace'
 import { managementError } from '../settings/managementData'
 import { Modal } from '../ui/Modal'
+import { ApprovalModeSelect } from './ApprovalModeSelect'
 import { ConversationModelDialog, routeLabel } from './ConversationModelDialog'
 
 export function ConversationToolbar({ expanded, onObservatory, onManageModels }: {
@@ -51,15 +53,19 @@ export function ConversationToolbar({ expanded, onObservatory, onManageModels }:
 
 function ConversationPermissionDialog({ session, current, onClose }: { session: Session; current: WorkspaceAccess; onClose(): void }) {
   const [selected, setSelected] = useState<WorkspaceAccess>(current)
+  const currentMode = session.toolApprovalMode ?? 'ask'
+  const [mode, setMode] = useState<ToolApprovalMode>(currentMode)
+  const changed = selected !== current || mode !== currentMode
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string>()
   const ready = useWorkspace(state => state.host.state === 'ready')
   const api = globalThis.window?.agentManagement
   function save() {
-    if (!api || pending || !ready || selected === current) return
+    if (!api || pending || !ready || !changed) return
     setPending(true)
     setError(undefined)
-    void api.setWorkspaceAccess({ conversationId: session.id, access: selected }).then(onClose, reason => {
+    void api.setWorkspaceAccess({ conversationId: session.id, access: selected,
+      ...(mode === currentMode ? {} : { toolApprovalMode: mode }) }).then(onClose, reason => {
       setPending(false)
       setError(managementError(reason))
     })
@@ -74,10 +80,11 @@ function ConversationPermissionDialog({ session, current, onClose }: { session: 
           </select>
         </label>
         <p className="settings-hint">收紧权限会收敛当前运行。提高权限时，系统会确认工作区路径和授权范围。</p>
+        <ApprovalModeSelect value={mode} onChange={setMode} disabled={pending} />
         {error && <p className="dialog-error" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button type="button" className="button-neutral" onClick={onClose}>关闭</button>
-          <button type="submit" className="button-primary" disabled={pending || !ready || selected === current}>保存权限</button>
+          <button type="submit" className="button-primary" disabled={pending || !ready || !changed}>保存权限</button>
         </div>
       </form>
     </Modal>

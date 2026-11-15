@@ -4,6 +4,7 @@ import { dialog, ipcMain } from 'electron'
 import type { BrowserWindow, IpcMainInvokeEvent } from 'electron'
 import type { ConversationSummary } from '../../../shared/contracts/desktop.ts'
 import type { WorkspaceAccess } from '../../../shared/contracts/domain.ts'
+import { isToolApprovalMode } from '../../../shared/contracts/tool-approval.ts'
 import { judgeProviders, parseJevSettings, phaseTwoJudgmentPoints } from '../../../shared/contracts/jev.ts'
 import type { JevStatus } from '../../../shared/contracts/jev.ts'
 import type { AgentPreferences, ManagedProvider, ManagementSnapshot, ProviderId } from '../../../shared/contracts/management.ts'
@@ -123,9 +124,11 @@ export function registerManagementIpc(options: {
   }))
 
   register('setWorkspaceAccess', (window, value) => mutate(async () => {
-    const input = object(value, ['conversationId', 'access'])
+    const input = object(value, ['conversationId', 'access', 'toolApprovalMode'])
     const conversationId = entityId(input.conversationId)
     const next = access(input.access)
+    const mode = input.toolApprovalMode
+    if (mode !== undefined && !isToolApprovalMode(mode)) return invalid()
     const conversation = await host.request<ConversationSummary>({ schemaVersion: 1, type: 'getConversation', conversationId })
     const current = conversation.workspaceAccess ?? (conversation.check ? 'write' : 'read')
     if (ranks[next] > ranks[current]) {
@@ -137,7 +140,8 @@ export function registerManagementIpc(options: {
       await confirm(window, '授权工作区权限', next === 'trusted' ? '允许以当前系统账户权限运行项目代码？' : '允许此会话修改工作区文件？', path)
       if (await directoryIdentity(path) !== identity) return invalid()
     }
-    return host.request({ schemaVersion: 1, type: 'setWorkspaceAccess', conversationId, access: next, expected: current })
+    return host.request({ schemaVersion: 1, type: 'setWorkspaceAccess', conversationId, access: next, expected: current,
+      ...(mode === undefined ? {} : { toolApprovalMode: mode, expectedApprovalMode: conversation.toolApprovalMode ?? 'ask' }) })
   }))
 
   register('testProvider', async (_window, value) => {

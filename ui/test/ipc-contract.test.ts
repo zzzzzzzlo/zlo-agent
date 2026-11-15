@@ -61,6 +61,10 @@ test('IPC grants selected workspace and limits file verification to a relative p
   assert.deepEqual(desktopCommand('createConversation', { requestId: 'r' }, denied), {
     schemaVersion: 1, type: 'createConversation', requestId: 'r',
   })
+  assert.deepEqual(desktopCommand('createConversation', { ...request, toolApprovalMode: 'unattended' }, allowed), {
+    schemaVersion: 1, type: 'createConversation', ...request, toolApprovalMode: 'unattended',
+  })
+  assert.throws(() => desktopCommand('createConversation', { ...request, toolApprovalMode: 'full' }, allowed), { code: 'INVALID_INPUT' })
   assert.throws(() => desktopCommand('createConversation', { requestId: 'r', check }, denied), { code: 'INVALID_INPUT' })
   for (const path of [workspace, '../login.html', 'src/../login.html', 'C:login.html', 'src//login.html']) {
     assert.throws(() => desktopCommand('createConversation', { ...request, check: { path } }, allowed), { code: 'INVALID_INPUT' })

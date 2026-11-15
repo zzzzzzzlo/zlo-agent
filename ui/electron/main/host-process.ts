@@ -318,7 +318,7 @@ export class HostProcessManager {
         schemaVersion: 1, type: 'resolveToolApproval', approvalId: request.id, decision,
       }) + '\n')
     }
-    if (!this.#approve || connection.approvals.size) {
+    if (!this.#approve || connection.approvals.size >= 8) {
       answer({ approved: false })
       return
     }

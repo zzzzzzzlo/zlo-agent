@@ -8,7 +8,7 @@ import { localBrowserTimeout, localPageInput, localPageProperties, localPageTarg
 import type { LocalBrowserDocument } from './local-browser.ts'
 import { workspaceTarget } from './workspace.ts'
 import type { CodingWorkspace, ToolInvocationContext, WorkspaceTool } from './workspace.ts'
-import { cleanWebText, publicWeb, publicWebUrl, sensitiveWebInput, webSourceUrl } from './web-tools.ts'
+import { cleanWebText, publicReadApproval, publicWeb, publicWebUrl, sensitiveWebInput, webSourceUrl } from './web-tools.ts'
 import type { WebClient } from './web-tools.ts'
 import { closeDenyProxy, launchIsolatedBrowser } from './browser-runtime.ts'
 
@@ -271,6 +271,7 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
         } finally { opening.delete(key) }
       }, {
         approvalFor: input => object(input)?.url === undefined ? undefined : 'network',
+        publicRead: publicReadApproval,
         minimumAccessFor: input => object(input)?.url === undefined ? undefined : 'trusted',
         targets: input => object(input)?.url === undefined ? localPageTargets(input) : [],
       }),

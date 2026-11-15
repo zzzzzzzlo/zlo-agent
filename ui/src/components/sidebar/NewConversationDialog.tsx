@@ -1,12 +1,14 @@
 import { useState } from 'react'
 import { ChevronDown, FolderOpen } from 'lucide-react'
 import type { ModelRoute, VerificationCheck, WorkspaceAccess } from '../../../../shared/contracts/desktop.ts'
+import type { ToolApprovalMode } from '../../../../shared/contracts/tool-approval.ts'
 import { workspaceAccessLabels } from '../../features/sessions/model'
 import { useWorkspace } from '../../stores/workspace'
 import { Modal } from '../ui/Modal'
 import { ModelCatalogSelect, modelGroups } from '../settings/ModelCatalogSelect'
 import { useManagementSnapshot } from '../settings/managementData'
 import { useChatGptAccount } from '../settings/ChatGptManagement'
+import { ApprovalModeSelect } from '../layout/ApprovalModeSelect'
 
 const npmChecks = {
   npm_test: 'npm test',
@@ -28,6 +30,7 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
   const [title, setTitle] = useState('')
   const [workspace, setWorkspace] = useState<string>()
   const [requestedAccess, setWorkspaceAccess] = useState<WorkspaceAccess>()
+  const [approvalMode, setApprovalMode] = useState<ToolApprovalMode>('ask')
   const preferredAccess = catalog.snapshot?.preferences.workspaceAccess
   const workspaceAccess = requestedAccess ?? preferredAccess ?? (pi ? 'read' : 'write')
   const implicitAccess = preferredAccess === 'trusted' ? 'read' : preferredAccess
@@ -66,6 +69,7 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
           title: title.trim() || undefined,
           workspace,
           workspaceAccess: workspace ? workspaceAccess : undefined,
+          ...(approvalMode === 'ask' ? {} : { toolApprovalMode: approvalMode }),
           route: pi ? route : provider.trim() && model.trim() ? { provider: provider.trim(), model: model.trim() } : undefined,
           check: check(),
         }
@@ -143,7 +147,7 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
                 )}
               </>
             )}
-            <p className="settings-hint">留空模型时使用 Host 配置。工作区权限与验收检查分别设置。</p>
+            <ApprovalModeSelect value={approvalMode} onChange={setApprovalMode} disabled={pending} />
           </>
         )}
         {invalid && <p className="dialog-error" role="alert">{pi ? '请补全所选验收方式需要的路径。' : '请配对填写 Provider 与模型 ID，并补全所选验收方式需要的路径。'}</p>}

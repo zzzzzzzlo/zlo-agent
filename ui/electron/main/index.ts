@@ -144,6 +144,9 @@ app.whenReady().then(() => {
   registerProviderSetupIpc(providerSetup, windowFor)
 
   const startHost = async () => {
+    if (developmentData && process.env.ZLO_AGENT_E2E_HIDDEN === '1' && process.env.ZLO_AGENT_E2E_HOLD_STARTUP === '1') {
+      await new Promise<void>(resolve => setTimeout(resolve, 2500))
+    }
     if (process.platform === 'win32' && hostMode === 'pi') {
       let deadline: ReturnType<typeof setTimeout> | undefined
       try {

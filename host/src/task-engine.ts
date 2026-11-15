@@ -924,11 +924,12 @@ export class TaskEngine {
     this.#db.transaction(() => { this.#transition(this.get(taskId), 'verifying') })
   }
 
-  auditToolApproval(event: EventDraft, id: string, tool: string, approved: boolean, approvalKind?: ApprovalKind): void {
-    this.#db.transaction(() => { this.#db.append({ ...event, type: 'tool.approval_resolved', payload: { id, tool, approved, approvalKind } }) })
+  auditToolApproval(event: EventDraft, id: string, tool: string, approved: boolean, approvalKind?: ApprovalKind, automatic?: boolean): void {
+    this.#db.transaction(() => { this.#db.append({ ...event, type: 'tool.approval_resolved', payload: { id, tool, approved, approvalKind, automatic } }) })
   }
 
-  auditToolDenial(event: EventDraft, tool: string, effect: 'read' | 'write', reason: 'policy' | 'approval_safety' | 'repeated_failure'): void {
+  auditToolDenial(event: EventDraft, tool: string, effect: 'read' | 'write',
+    reason: 'policy' | 'approval_safety' | 'repeated_failure' | 'approval_unattended'): void {
     this.#db.transaction(() => { this.#db.append({ ...event, type: 'tool.denied', payload: { tool, effect, reason } }) })
   }
 

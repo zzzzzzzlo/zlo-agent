@@ -40,8 +40,10 @@ async function eventually(predicate, label, timeout = 20000) {
   throw new Error('Timed out waiting for ' + label)
 }
 
-async function launch(data, mode = 'faux') {
+async function launch(data, mode = 'faux', holdStartup = false) {
   const env = { ...process.env, ZLO_AGENT_DESKTOP_MODE: mode, ZLO_AGENT_DESKTOP_DATA: data, ZLO_AGENT_E2E_HIDDEN: '1' }
+  if (holdStartup) env.ZLO_AGENT_E2E_HOLD_STARTUP = '1'
+  else delete env.ZLO_AGENT_E2E_HOLD_STARTUP
   delete env.ELECTRON_RUN_AS_NODE
   delete env.ELECTRON_RENDERER_URL
   return electron.launch({
@@ -564,6 +566,78 @@ test('Windows Electron sends credential capture through Main and omits invalid c
     } finally {
       await app?.close()
       await rm(data, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
+    }
+  })
+
+test('Windows Electron gates cold startup and applies the saved approval mode to actual tool requests',
+  { skip: process.platform !== 'win32', timeout: 95_000 }, async () => {
+    const root = await mkdtemp(join(tmpdir(), 'zlo-approval-desktop-'))
+    const data = join(root, 'profile')
+    const workspace = join(root, 'project')
+    const target = join(workspace, 'approval-fixture.txt')
+    let app
+    try {
+      await mkdir(workspace)
+      await writeFile(target, 'local fixture')
+      app = await launch(data, 'faux', true)
+      const boot = await app.firstWindow()
+      await boot.getByRole('progressbar', { name: '正在连接本地执行服务' }).waitFor()
+      assert.equal(await boot.getByRole('button', { name: /新建会话/ }).count(), 0)
+      if (process.env.ZLO_UI_REVIEW_DIR) {
+        await delay(350) // Wait for the first composited frame of the hidden window.
+        await reviewScreenshot(app, 'startup.png')
+      }
+      const page = await ready(app, data)
+      await page.getByRole('progressbar').waitFor({ state: 'hidden' })
+      await app.evaluate(({ dialog }, path) => {
+        dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [path] })
+        dialog.showMessageBox = async () => { throw new Error('Tool approval must stay inside the app') }
+      }, workspace)
+      await page.getByRole('button', { name: /新建会话/ }).click()
+      await page.getByLabel('会话名称').fill('审批模式回归')
+      await page.getByRole('button', { name: '选择工作区' }).click()
+      await page.getByRole('button', { name: '创建会话' }).click()
+      await page.getByRole('dialog', { name: '新建会话' }).waitFor({ state: 'hidden' })
+      const [{ id }] = await page.evaluate(() => window.agentHost.listConversations())
+      const card = page.getByRole('region', { name: '工具审批' })
+      const setMode = async (mode) => {
+        await page.getByRole('button', { name: '会话权限设置' }).click()
+        const permission = page.getByRole('dialog', { name: '会话权限' })
+        await permission.getByLabel('工具审批模式').selectOption(mode)
+        await permission.getByRole('button', { name: '保存权限' }).click()
+        await permission.waitFor({ state: 'hidden' })
+        await eventually(async () => (await page.evaluate(id => window.agentHost.getConversation({ conversationId: id }), id)).toolApprovalMode === mode,
+          'saved approval mode')
+      }
+      await send(page, '[approval-check] 删除测试文件')
+      await card.getByRole('heading', { name: '确认文件操作' }).waitFor()
+      if (process.env.ZLO_UI_REVIEW_DIR) {
+        await delay(350)
+        await reviewScreenshot(app, 'approval-card.png')
+      }
+      assert.match(await card.locator('pre').textContent(), /approval-fixture\.txt/u)
+      const forged = await page.evaluate(() => window.agentToolApprovals.decide({ id: crypto.randomUUID(), approved: true }))
+      assert.equal(forged, false)
+      await setMode('unattended')
+      await card.waitFor({ state: 'hidden' })
+      await waitForRun(page, id, 1, 'succeeded')
+      assert.equal(await readFile(target, 'utf8'), 'local fixture')
+      await send(page, '[approval-check] 无人值守下尝试删除')
+      await waitForRun(page, id, 2, 'succeeded')
+      assert.equal(await card.count(), 0)
+      assert.equal(await readFile(target, 'utf8'), 'local fixture')
+      await setMode('routine')
+      await send(page, '[approval-check] 确认本次删除')
+      await card.getByRole('button', { name: '仅本次允许' }).click()
+      await waitForRun(page, id, 3, 'succeeded')
+      await assert.rejects(readFile(target), { code: 'ENOENT' })
+      await app.close()
+      app = await launch(data)
+      const restored = await ready(app, data)
+      assert.equal((await restored.evaluate(id => window.agentHost.getConversation({ conversationId: id }), id)).toolApprovalMode, 'routine')
+    } finally {
+      await app?.close()
+      await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })
     }
   })
 

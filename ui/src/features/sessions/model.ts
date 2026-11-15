@@ -28,6 +28,7 @@ export interface Session {
   latestStatus?: RunStatus
   workspace?: string
   workspaceAccess?: WorkspaceAccess
+  toolApprovalMode?: ConversationSummary['toolApprovalMode']
   route?: ConversationSummary['route']
   pendingRoute?: ConversationSummary['pendingRoute']
   check?: ConversationSummary['check']

@@ -3,18 +3,18 @@ import { Minus, PanelLeft, Square, X } from 'lucide-react'
 import { useWorkspace, activeSession } from '../../stores/workspace'
 import { IconButton } from '../ui/IconButton'
 import { BrandMark } from '../ui/BrandMark'
-export function TitleBar({ destination }: { destination?: string }) {
+export function TitleBar({ destination, starting = false }: { destination?: string; starting?: boolean }) {
   const sidebar = useWorkspace((state) => state.sidebar)
   const toggle = useWorkspace((state) => state.toggleSidebar)
   const session = useWorkspace(activeSession)
   return (
     <header className="titlebar">
-      <div className={`title-brand ${sidebar ? '' : 'is-collapsed'}`}>
+      {!starting && <div className={`title-brand ${sidebar ? '' : 'is-collapsed'}`}>
         {sidebar && <div className="wordmark"><span className="brand-tile"><BrandMark size={24} /></span><strong>Zlo Agent</strong></div>}
         {!destination && <IconButton label={sidebar ? '收起侧栏' : '展开侧栏'} aria-expanded={sidebar} onClick={toggle}><PanelLeft size={17} /></IconButton>}
-      </div>
+      </div>}
       <div className="title-main">
-        <div className="title-location"><span>工作区</span><span aria-hidden="true">/</span><strong>{destination ?? session?.title ?? '新会话'}</strong></div>
+        {!starting && <div className="title-location"><span>工作区</span><span aria-hidden="true">/</span><strong>{destination ?? session?.title ?? '新会话'}</strong></div>}
       </div>
       <WindowControls />
     </header>

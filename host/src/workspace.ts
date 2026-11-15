@@ -23,6 +23,7 @@ export interface ToolPolicy {
   selectsTaskWorkspace?(input: unknown): boolean
   approval?: ApprovalKind
   approvalFor?(input: unknown): ApprovalKind | undefined
+  publicRead?(input: unknown): boolean
   targets?(input: unknown): string[]
   deferred?: boolean
   whileActive?: boolean

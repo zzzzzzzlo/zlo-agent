@@ -13,6 +13,7 @@ import type { AgentRole, CapabilityScope, CodingCapabilities, CodingProfile, Ext
 import type { LocalStore } from './store.ts'
 import type { NodeProposal, TaskEngine, TaskSnapshot, WorkerNode, WorkerResult } from './task-engine.ts'
 import type { ToolApprovalBroker } from './tool-approval.ts'
+import type { ToolApprovalMode } from '../../shared/contracts/tool-approval.ts'
 import { ToolRun } from './tool-run.ts'
 import { ToolEvidenceArchive } from './tool-judgment.ts'
 import { followUpAllows, reviewTurn } from './turn-judgment.ts'
@@ -74,6 +75,7 @@ export class MultiAgentOrchestrator {
   readonly #judgment: LocalJudgment
   readonly #extensions: ProfileRuntime
   readonly #approval: ToolApprovalBroker
+  readonly #approvalMode: (task: TaskSnapshot) => ToolApprovalMode
   readonly #toolEvidence: ToolEvidenceArchive
   readonly #resolveWorkspace?: (workspace: CodingWorkspace, taskId: string, id: string, signal: AbortSignal) => Promise<CodingWorkspace | undefined>
   readonly #sessions: string
@@ -90,6 +92,7 @@ export class MultiAgentOrchestrator {
     capabilities: CodingCapabilities; profile: Readonly<CodingProfile>; context: ScopedContext; judgment: LocalJudgment; sessions: string;
     extensions: ProfileRuntime
     approval: ToolApprovalBroker
+    approvalMode?: (task: TaskSnapshot) => ToolApprovalMode
     mode?: HarnessMode
     resolveWorkspace?: (workspace: CodingWorkspace, taskId: string, id: string, signal: AbortSignal) => Promise<CodingWorkspace | undefined>
     onOutput?: (event: EventDraft, delta: string) => void
@@ -105,6 +108,7 @@ export class MultiAgentOrchestrator {
     this.#judgment = ports.judgment
     this.#extensions = ports.extensions
     this.#approval = ports.approval
+    this.#approvalMode = ports.approvalMode ?? (() => 'ask')
     this.#toolEvidence = new ToolEvidenceArchive(this.#db)
     this.#resolveWorkspace = ports.resolveWorkspace
     this.#sessions = ports.sessions
@@ -252,7 +256,7 @@ export class MultiAgentOrchestrator {
     }
     const evidence = new Set<string>()
     const artifacts = new Set<string>()
-    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence, () => stalled.abort())
+    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence, () => stalled.abort(), () => this.#approvalMode(task))
     let followUp: TurnFollowUp | undefined
     let session: ExecutionSession | undefined
     let unwatch: (() => Promise<void>) | undefined
@@ -505,7 +509,7 @@ export class MultiAgentOrchestrator {
 
   async run(task: TaskSnapshot, workspace: CodingWorkspace, stopSignal: AbortSignal): Promise<Outcome> {
     const stalled = new AbortController()
-    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence, () => stalled.abort())
+    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence, () => stalled.abort(), () => this.#approvalMode(task))
     const budget = new AbortController()
     const signal = AbortSignal.any([stopSignal, budget.signal, stalled.signal])
     const agentKey = task.conversationId ?? task.id

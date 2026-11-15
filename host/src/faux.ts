@@ -67,6 +67,9 @@ export class FauxExecution extends PiExecution {
         if (text.startsWith('[export-check]') && available.includes('export_artifact')) {
           return tool('export_artifact', { path: 'login.html' })
         }
+        if (text.startsWith('[approval-check]') && available.includes('delete_file')) {
+          return tool('delete_file', { path: 'approval-fixture.txt' })
+        }
         if (/(验证码|captcha)/iu.test(text) && available.includes('edit_text_file')) {
           return tool('edit_text_file', {
             path: 'login.html', oldText: '</form>',

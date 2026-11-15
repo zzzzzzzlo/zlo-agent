@@ -10,7 +10,8 @@ import { createFileTools } from './file-tools.ts'
 import { createGitTools, ManagedGitWorktrees } from './git-tools.ts'
 import { createProcessTools } from './process-tools.ts'
 import { BraveSearch, createWebTools, HackerNewsSearch, publicWeb } from './web-tools.ts'
-import type { ToolApprovalCommand } from '../../shared/contracts/tool-approval.ts'
+import { isToolApprovalMode } from '../../shared/contracts/tool-approval.ts'
+import type { ToolApprovalCommand, ToolApprovalMode } from '../../shared/contracts/tool-approval.ts'
 import type { ChatGptSession } from '../../shared/contracts/chatgpt.ts'
 import type { CustomProviderCredential, CustomProviderTest, GrokCredential, GrokLoginProgress } from '../../shared/contracts/provider-setup.ts'
 import { customRoute, grokProviderId, isCustomRoute, parseCustomCredential, validCustomId } from '../../shared/contracts/provider-setup.ts'
@@ -199,6 +200,7 @@ export class LocalAgentHost {
         sessions: join(this.#directory, 'sessions'),
         onOutput: (event, delta) => this.#conversations.recordDelta(event, delta),
         onCheckpoint: (taskId) => this.#conversations.checkpointOutput(taskId),
+        approvalMode: (task) => task.conversationId ? this.#conversations.get(task.conversationId).toolApprovalMode ?? 'ask' : 'ask',
       })
       this.#recover()
     } catch (error) {
@@ -629,12 +631,19 @@ export class LocalAgentHost {
     return conversation.workspaceAccess ?? this.#capabilities.root(undefined, Boolean(conversation.check)).access
   }
 
-  setConversationWorkspaceAccess(conversationId: string, requested: WorkspaceAccess, expected: WorkspaceAccess): ConversationSummary {
+  setConversationWorkspaceAccess(conversationId: string, requested: WorkspaceAccess, expected: WorkspaceAccess,
+    mode?: ToolApprovalMode, expectedMode?: ToolApprovalMode): ConversationSummary {
     const conversation = this.#conversations.get(management.id(conversationId))
     const access = management.access(requested)
     const current = this.#conversationAccess(conversation)
-    if (conversation.archived || current !== management.access(expected)) throw new ConversationError('CONFLICT', 'Conversation permission changed')
-    if (current === access) return conversation
+    const currentMode = conversation.toolApprovalMode ?? 'ask'
+    if (mode !== undefined && (!isToolApprovalMode(mode) || !isToolApprovalMode(expectedMode))) {
+      throw new ConversationError('INVALID_INPUT', 'Invalid tool approval mode')
+    }
+    if (conversation.archived || current !== management.access(expected) || (mode !== undefined && currentMode !== expectedMode)) {
+      throw new ConversationError('CONFLICT', 'Conversation permission changed')
+    }
+    if (current === access && (mode === undefined || currentMode === mode)) return conversation
     const task = conversation.latestTaskId ? this.#engine.get(conversation.latestTaskId) : undefined
     const active = Boolean(task && ['ready', 'running', 'verifying', 'stop_requested', 'stopping'].includes(task.status))
     if (accessRank[access] > accessRank[current] && active) {
@@ -644,7 +653,14 @@ export class LocalAgentHost {
       try { this.#workspace(conversation.workspace) }
       catch { throw new ConversationError('INVALID_INPUT', 'The workspace is unavailable') }
     }
-    const update = () => this.#conversations.setWorkspaceAccess(conversation.id, access)
+    // Approval changes take effect at the next tool boundary. Pending requests
+    // are cancelled by stopping the old run before an access change.
+    const update = () => this.#conversations.setWorkspaceAccess(conversation.id, access, mode)
+    if (current === access) {
+      const result = this.#store.transaction(update)
+      if (active && task) this.#approval.cancelScope(task.id)
+      return result
+    }
     if (!task || task.status === 'succeeded' || task.status === 'failed') return this.#store.transaction(update)
     this.#engine.setWorkspaceAccess(task.id, access, active ? 'permission:' + randomUUID() : undefined, update)
     if (active) this.#settleStop(task.id)
@@ -738,7 +754,8 @@ export class LocalAgentHost {
           ...this.#scheduler.budget(latestTaskId) } : undefined }
       }
       case 'saveAgentPreferences': return this.saveAgentPreferences(command.preferences)
-      case 'setWorkspaceAccess': return this.setConversationWorkspaceAccess(command.conversationId, command.access, command.expected)
+      case 'setWorkspaceAccess': return this.setConversationWorkspaceAccess(command.conversationId, command.access, command.expected,
+        command.toolApprovalMode, command.expectedApprovalMode)
       case 'deleteConversationMemory': return this.#removeMemory(command.conversationId, command.ids)
       case 'reconcileOperation': return this.#reconcile(command)
       case 'testProviderAccount': {

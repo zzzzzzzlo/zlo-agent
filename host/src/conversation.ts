@@ -9,6 +9,8 @@ import type { AgentEvent, EndReason, EventDraft, ModelRoute, TaskStatus, Verific
 import type { LocalStore } from './store.ts'
 import type { TaskSnapshot } from './task-engine.ts'
 import { parseProjectCommand, workspaceTarget } from './workspace.ts'
+import { isToolApprovalMode } from '../../shared/contracts/tool-approval.ts'
+import type { ToolApprovalMode } from '../../shared/contracts/tool-approval.ts'
 
 const conversations = 'conversations'
 const taskBindings = 'conversation-task-bindings'
@@ -96,6 +98,10 @@ export function parseCreateConversation(input: CreateConversationInput): CreateC
   const check = body.check === undefined ? undefined : object(body.check, 'workspace check')
   const workspace = body.workspace === undefined ? undefined : text(body.workspace, 'workspace', 1024)
   const access = body.workspaceAccess
+  const toolApprovalMode = body.toolApprovalMode
+  if (toolApprovalMode !== undefined && !isToolApprovalMode(toolApprovalMode)) {
+    throw new ConversationError('INVALID_INPUT', 'Invalid tool approval mode')
+  }
   if (access !== undefined && access !== 'read' && access !== 'write' && access !== 'trusted') {
     throw new ConversationError('INVALID_INPUT', 'Invalid workspace access')
   }
@@ -119,6 +125,7 @@ export function parseCreateConversation(input: CreateConversationInput): CreateC
     title: body.title === undefined ? undefined : text(body.title, 'title', 120).trim(),
     workspace,
     workspaceAccess: access,
+    toolApprovalMode,
     route: body.route === undefined ? undefined : parseRoute(body.route),
     check: projectCheck ?? (target ? { path: target, ...(contains !== undefined ? { contains } : {}) } : undefined),
   }
@@ -265,7 +272,8 @@ export class ConversationService {
 
   #createSignature(input: CreateConversationInput): string {
     return JSON.stringify(['create', input.title, input.workspace, input.route, input.check,
-      ...(input.workspaceAccess === undefined ? [] : [input.workspaceAccess])])
+      ...(input.workspaceAccess === undefined ? [] : [input.workspaceAccess]),
+      ...(input.toolApprovalMode === undefined ? [] : [{ toolApprovalMode: input.toolApprovalMode }])])
   }
 
   created(input: CreateConversationInput): ConversationSummary | undefined {
@@ -279,6 +287,7 @@ export class ConversationService {
       const conversation: StoredConversation = {
         id: randomUUID(), title: input.title ?? '新会话', createdAt: now, updatedAt: now, archived: false,
         workspace, workspaceAccess: input.workspaceAccess ?? (input.workspace ? defaultAccess : 'read'),
+        ...(input.toolApprovalMode ? { toolApprovalMode: input.toolApprovalMode } : {}),
         ...(route ? { route } : {}), ...(input.check ? { check: input.check } : {}), turnCount: 0,
       }
       this.#saveConversation(conversation)
@@ -357,10 +366,10 @@ export class ConversationService {
     })
   }
 
-  setWorkspaceAccess(id: string, access: WorkspaceAccess): ConversationSummary {
+  setWorkspaceAccess(id: string, access: WorkspaceAccess, toolApprovalMode?: ToolApprovalMode): ConversationSummary {
     const record = this.#record(id)
-    if (record.workspaceAccess === access) return summary(record)
-    const next = { ...record, workspaceAccess: access, updatedAt: Date.now() }
+    if (record.workspaceAccess === access && (!toolApprovalMode || toolApprovalMode === (record.toolApprovalMode ?? 'ask'))) return summary(record)
+    const next = { ...record, workspaceAccess: access, ...(toolApprovalMode ? { toolApprovalMode } : {}), updatedAt: Date.now() }
     this.#saveConversation(next)
     this.#event(id, 'conversation.permissions_changed', { conversation: summary(next) })
     return summary(next)

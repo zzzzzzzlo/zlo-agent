@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto'
 import { basename } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { EventDraft } from './contracts/domain.ts'
+import type { ToolApprovalMode } from '../../shared/contracts/tool-approval.ts'
 import type { ExecutionTool } from './execution.ts'
 import { toolImages } from './execution.ts'
 import type { LocalJudgment } from './judgment.ts'
@@ -66,17 +67,19 @@ export class ToolRun {
   readonly #judgment?: LocalJudgment
   readonly #archive?: ToolEvidenceArchive
   readonly #onRepeatedFailure: () => void
+  readonly #approvalMode: () => ToolApprovalMode
   readonly #evidenceAccess = new Map<string, () => boolean>()
   readonly #failures = new Map<string, { count: number; paths: string[] }>()
   #closed = false
 
   constructor(tasks: TaskEngine, approval: ToolApprovalBroker, judgment?: LocalJudgment, archive?: ToolEvidenceArchive,
-    onRepeatedFailure: () => void = () => {}) {
+    onRepeatedFailure: () => void = () => {}, approvalMode: () => ToolApprovalMode = () => 'ask') {
     this.#tasks = tasks
     this.#approval = approval
     this.#judgment = judgment
     this.#archive = archive
     this.#onRepeatedFailure = onRepeatedFailure
+    this.#approvalMode = approvalMode
   }
 
   guard(tool: ExecutionTool, event: () => EventDraft, signal: AbortSignal, workspaceTool?: WorkspaceTool): ExecutionTool {
@@ -128,7 +131,7 @@ export class ToolRun {
         if (this.#closed || combined.aborted) return unavailable
         const ref = event()
         let effect = tool.effect
-        const deny = (reason: 'policy' | 'approval_safety') => {
+        const deny = (reason: 'policy' | 'approval_safety' | 'approval_unattended') => {
           try { this.#tasks.auditToolDenial(ref, tool.name, effect, reason) } catch { /* A diagnostic cannot change a denial. */ }
         }
         let approvalKind
@@ -141,20 +144,30 @@ export class ToolRun {
         const target = workspaceTarget(input)
         let destination: string | undefined
         if (approvalKind) {
-          const detail = JSON.stringify(input) ?? 'null'
-          if (detail.length > 8_000 || redactProcessOutput(detail) !== detail || /[\u202a-\u202e\u2066-\u2069]/u.test(detail)) {
-            deny('approval_safety')
-            return { ok: false, error: 'The operation cannot be safely displayed for approval' }
+          const mode = this.#approvalMode()
+          let automatic = false
+          try {
+            automatic = mode !== 'ask' && effect === 'read' && approvalKind === 'network' && tool.policy?.publicRead?.(input) === true
+          } catch { /* Classification failure requires a manual decision. */ }
+          if (automatic) this.#tasks.auditToolApproval(ref, operationId, tool.name, true, approvalKind, true)
+          else if (mode === 'unattended') {
+            deny('approval_unattended')
+            return { ok: false, error: 'This operation requires separate user approval. Unattended mode declined it; use an already authorized alternative.' }
+          } else {
+            const detail = JSON.stringify(input) ?? 'null'
+            if (detail.length > 8_000 || redactProcessOutput(detail) !== detail || /[\u202a-\u202e\u2066-\u2069]/u.test(detail)) {
+              deny('approval_safety')
+              return { ok: false, error: 'The operation cannot be safely displayed for approval' }
+            }
+            const approval = await this.#approval.request({
+              kind: approvalKind, tool: tool.name, detail, workspace: workspace.root,
+              ...(approvalKind === 'export' && target ? { suggestedName: basename(target) } : {}),
+            }, combined, ref.taskId)
+            const approved = approval.approved && !this.#closed && !combined.aborted && authorize(input)
+            this.#tasks.auditToolApproval(ref, operationId, tool.name, approved, approvalKind)
+            if (!approved) return { ok: false, error: 'Operation was not authorized' }
+            destination = approval.approved ? approval.destination : undefined
           }
-          const approval = await this.#approval.request({
-            kind: approvalKind, tool: tool.name, detail, workspace: workspace.root,
-            ...(approvalKind === 'export' && target ? { suggestedName: basename(target) } : {}),
-          }, combined)
-          this.#tasks.auditToolApproval(ref, operationId, tool.name, approval.approved && !combined.aborted, approvalKind)
-          if (!approval.approved || this.#closed || combined.aborted || !authorize(input)) {
-            return { ok: false, error: 'Operation was not authorized' }
-          }
-          destination = approval.destination
         }
         try {
           const filePostcondition = tool.name === 'create_text_file'
