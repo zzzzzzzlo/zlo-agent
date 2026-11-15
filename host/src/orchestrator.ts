@@ -210,6 +210,7 @@ export class MultiAgentOrchestrator {
       return
     }
     const { type, ...payload } = runtime
+    if (this.#db.isClosed) return
     this.#db.transaction(() => { this.#db.append({ ...event, type, payload }) })
   }
 
@@ -230,6 +231,7 @@ export class MultiAgentOrchestrator {
   }
 
   #finish(event: EventDraft, status: AgentRun['status'], result?: WorkerResult, role: AgentRole = 'root'): void {
+    if (this.#db.isClosed) return
     this.#db.transaction(() => {
       const run: AgentRun = { schemaVersion: 1, event, status, role }
       this.#db.put('agent-runs', event.agentRunId!, run)
@@ -266,6 +268,7 @@ export class MultiAgentOrchestrator {
     const stalled = new AbortController()
     const timeMs = Math.min(node.budget?.timeMs ?? Infinity, deadlines[this.#mode].child)
     const timer = setTimeout(() => deadline.abort(), timeMs)
+    timer.unref()
     const signal = AbortSignal.any([rootSignal, deadline.signal, stalled.signal])
     let event: EventDraft = {
       taskId: task.id, taskRunId: task.taskRunId, taskNodeId: node.id,
@@ -500,7 +503,7 @@ export class MultiAgentOrchestrator {
           : deadline.signal.aborted ? 'worker_deadline' : exhausted ? 'budget_exhausted' : 'worker_failed'],
       }
       if (rootSignal.aborted) result = undefined
-      if (started) {
+      if (started && !this.#db.isClosed) {
         const settled = this.#tasks.settleWorker(task.id, node.id, result, verification, event.taskAttemptId)
         result = settled?.result ? { ...settled.result, verification: settled.verification } : undefined
       }
@@ -776,7 +779,7 @@ export class MultiAgentOrchestrator {
       session = undefined
       try {
         await unwatch?.()
-        if (saveCheckpoint) {
+        if (saveCheckpoint && !this.#db.isClosed) {
           await current.checkpoint()
           this.#onCheckpoint?.(task.id)
           this.#tasks.markDelivered(task.id, [...seenSteers])
@@ -809,6 +812,7 @@ export class MultiAgentOrchestrator {
     try {
       lease = this.#scheduler.reserve(() => event, 'root')
       deadline = setTimeout(() => budget.abort(), deadlines[this.#mode].root)
+      deadline.unref()
       lockRoute()
       const initialRoute = this.#tasks.get(task.id).route ?? saved?.route
       if (saved && initialRoute && !this.#scheduler.canSwitch(saved.route, initialRoute)) return { status: 'model_error' }

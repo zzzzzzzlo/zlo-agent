@@ -7,7 +7,8 @@ import { join } from 'node:path';
 import { createInterface } from 'node:readline';
 import { setImmediate as nextTick } from 'node:timers/promises';
 import { test, type TestContext } from 'node:test';
-import { LocalStore } from '../src/store.ts';
+import { DatabaseSync } from 'node:sqlite';
+import { LocalStore, StorePersistenceError } from '../src/store.ts';
 
 function databasePath(t: TestContext): string {
   const directory = mkdtempSync(join(tmpdir(), 'zlo-store-'));
@@ -153,4 +154,23 @@ test('delivers only committed events in cursor order and isolates failed or slow
   await nextTick();
   assert.deepEqual(fast, [[2, 'task.running'], [3, 'task.stopped']]);
   assert.deepEqual(slow, [[2, 'task.running'], [3, 'task.stopped'], [4, 'task.resumed']]);
+});
+
+test('configures SQLite busy_timeout on WAL database while wrapping persistence errors distinctly from business rollbacks', (t) => {
+  const path = databasePath(t);
+  const store = new LocalStore(path);
+  try {
+    const reader = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.equal(reader.prepare('PRAGMA journal_mode').get()?.journal_mode, 'wal');
+    } finally {
+      reader.close();
+    }
+    assert.throws(() => store.transaction(() => {
+      throw new Error('domain invariant failed');
+    }), (error: unknown) => error instanceof Error && !(error instanceof StorePersistenceError));
+  } finally {
+    store.close();
+  }
+  assert.throws(() => store.transaction(() => 1), (error: unknown) => error instanceof StorePersistenceError);
 });

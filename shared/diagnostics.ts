@@ -36,6 +36,7 @@ const definitions = {
   'host.tool_interrupted': ['warn', 'host', 'tool', 'A tool invocation was interrupted.'],
   'host.tool_unconfirmed': ['error', 'host', 'tool', 'A tool invocation has an unconfirmed side effect.'],
   'host.runtime_failed': ['error', 'host', 'runtime', 'An Agent Host runtime operation failed.'],
+  'host.memory_capture_failed': ['warn', 'host', 'runtime', 'Post-task memory capture failed after task settlement.'],
   'host.recovery_blocked': ['warn', 'host', 'recovery', 'A task requires reconciliation before it can be resumed.'],
 } as const satisfies Record<string, Definition>
 

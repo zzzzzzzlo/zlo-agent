@@ -8,7 +8,9 @@ import { fauxAssistantMessage, fauxProvider, fauxToolCall } from '@earendil-work
 import { ModelRuntime } from '@earendil-works/pi-coding-agent'
 import { FakeExecution } from '../src/fake.ts'
 import { LocalAgentHost } from '../src/host.ts'
+import { LocalMemory } from '../src/memory.ts'
 import { PiExecution } from '../src/pi.ts'
+import { StorePersistenceError } from '../src/store.ts'
 import type { AgentExecution } from '../src/execution.ts'
 
 async function paths(t: TestContext) {
@@ -266,6 +268,119 @@ test('User can append one leaf while the root runs, with a checked plan version'
     assert.equal(task.planVersion, 1)
     assert.equal(task.worker?.id, worker.id)
     assert.equal(task.worker?.result?.resultStatus, 'succeeded')
+  } finally {
+    await host.close()
+  }
+})
+
+test('P0-3: isolates post-task memory capture failure, keeps succeeded tasks queryable on storage errors, and releases store lock on stuck shutdown', { timeout: 10000 }, async (t) => {
+  const setup = await paths(t)
+  const originalCapture = LocalMemory.prototype.capture
+  let captureFault: 'none' | 'non_storage' | 'storage' = 'non_storage'
+  LocalMemory.prototype.capture = function (...args) {
+    if (captureFault === 'non_storage') throw new Error('Injected non-storage memory fault')
+    if (captureFault === 'storage') throw new StorePersistenceError('Injected SQLite disk full')
+    return originalCapture.apply(this, args)
+  }
+  t.after(() => { LocalMemory.prototype.capture = originalCapture })
+
+  const diagnostics: string[] = []
+  const originalStderrWrite = process.stderr.write.bind(process.stderr)
+  process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const parsed = JSON.parse(line) as { code?: string }
+        if (parsed.code) diagnostics.push(parsed.code)
+      } catch { /* ignore non-json */ }
+    }
+    return (originalStderrWrite as (...args: unknown[]) => boolean)(chunk, ...rest)
+  }) as typeof process.stderr.write
+  t.after(() => { process.stderr.write = originalStderrWrite })
+
+  let grokCancelled = 0
+  let host = new LocalAgentHost({
+    ...setup,
+    execution: new FakeExecution(),
+    providerRuntime: {
+      listProviderAccounts: async () => [],
+      testProviderAccount: async () => ({ id: 'openai', name: 'OpenAI', credential: 'missing', connection: 'untested', models: [] }),
+      validateProviderKey: async () => ({ id: 'openai', name: 'OpenAI', credential: 'stored', connection: 'connected', models: [] }),
+      setProviderKey: async () => {},
+      setChatGptSession: async () => [],
+      grokLogin: {
+        start: () => {},
+        poll: () => ({ state: 'pending' }),
+        cancel: () => { grokCancelled++ },
+        refresh: async (cred) => cred,
+      },
+    },
+  })
+
+  let firstTaskId = ''
+  let thirdTaskId = ''
+  try {
+    // 1. Non-storage memory capture throw does NOT fail succeeded task or poison Host
+    const first = await host.createTask({ requestId: 'p03-1', goal: 'demo', cwd: setup.cwd, check })
+    firstTaskId = first.taskId
+    await host.idle()
+    assert.equal(host.getTask(firstTaskId).status, 'succeeded')
+    assert.ok(diagnostics.includes('host.memory_capture_failed'))
+    assert.ok(!diagnostics.includes('host.runtime_failed'))
+
+    // 2. Host stays healthy and runs subsequent tasks normally
+    captureFault = 'none'
+    const second = await host.createTask({ requestId: 'p03-2', goal: 'demo', cwd: setup.cwd, check })
+    await host.idle()
+    assert.equal(host.getTask(second.taskId).status, 'succeeded')
+
+    // 3. Real StorePersistenceError triggers #failStorage, blocks mutations, keeps succeeded records queryable, and still allows cancelGrokLogin + clean close
+    captureFault = 'storage'
+    const third = await host.createTask({ requestId: 'p03-3', goal: 'demo', cwd: setup.cwd, check })
+    thirdTaskId = third.taskId
+    await assert.rejects(host.idle(), /Host persistence failed/)
+    assert.ok(diagnostics.includes('host.runtime_failed'))
+    assert.equal(host.getTask(firstTaskId).status, 'succeeded')
+    assert.equal(host.getTask(thirdTaskId).status, 'succeeded')
+    await assert.rejects(host.createTask({ requestId: 'p03-blocked', goal: 'demo', cwd: setup.cwd }), /Host persistence failed/)
+    assert.equal(await host.managementCommand({ schemaVersion: 1, type: 'cancelGrokLogin' }), true)
+    assert.equal(grokCancelled, 1)
+  } finally {
+    captureFault = 'none'
+    await assert.rejects(host.close(), /Host persistence failed/)
+  }
+
+  // 4. Stuck run exceeding stopTimeoutMs during host.close() still closes SQLite + writer lock so subsequent Host starts cleanly
+  const entered = Promise.withResolvers<void>()
+  const releaseStuck = Promise.withResolvers<void>()
+  const fake = new FakeExecution()
+  const stuckExecution: AgentExecution = {
+    validateRoute: route => fake.validateRoute(route),
+    async open(config) {
+      const session = await fake.open(config)
+      return {
+        ...session,
+        async run() {
+          entered.resolve()
+          await releaseStuck.promise
+          return { status: 'interrupted' }
+        },
+      }
+    },
+  }
+  const stuckHost = new LocalAgentHost({ ...setup, execution: stuckExecution, stopTimeoutMs: 40 })
+  const stuck = await stuckHost.createTask({ requestId: 'p03-stuck', goal: 'demo', cwd: setup.cwd })
+  await entered.promise
+  await assert.rejects(stuckHost.close(), /Run still active after shutdown deadline/)
+  releaseStuck.resolve()
+
+  host = new LocalAgentHost({ ...setup, execution: new FakeExecution() })
+  try {
+    assert.equal(host.getTask(firstTaskId).status, 'succeeded')
+    assert.equal(host.getTask(thirdTaskId).status, 'succeeded')
+    assert.equal(host.getTask(stuck.taskId).status, 'needs_reconciliation')
+    assert.equal(host.getTask(stuck.taskId).reason, 'stop_timeout')
   } finally {
     await host.close()
   }

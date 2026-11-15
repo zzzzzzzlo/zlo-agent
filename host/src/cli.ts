@@ -235,25 +235,36 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode, desktop: boo
       }
     }
   } finally {
-    try {
-      if (desktop && runtimeId === 'pi') {
+    let shutdownFailed = false
+    if (desktop && runtimeId === 'pi') {
+      try {
         await host.managementCommand({ schemaVersion: 1, type: 'cancelGrokLogin' })
+      } catch {
+        shutdownFailed = true
       }
+    }
+    try {
       const listener = await telemetry
       await listener?.close()
+    } catch {
+      shutdownFailed = true
+    }
+    try {
       await host.close()
     } catch {
+      shutdownFailed = true
+    }
+    if (shutdownFailed) {
       writeHostDiagnostic('host.shutdown_failed')
       const message = 'Host shutdown failed'
       send({ schemaVersion: 1, kind: 'error', error: { code: 'INTERNAL', message }, message })
       process.exitCode = 1
-    } finally {
-      stopOutput()
-      stopApprovals()
-      for (const unsubscribe of subscriptions.values()) unsubscribe()
-      for (const unsubscribe of conversationSubscriptions.values()) unsubscribe()
-      process.off('SIGINT', shutdown)
-      process.off('SIGTERM', shutdown)
     }
+    stopOutput()
+    stopApprovals()
+    for (const unsubscribe of subscriptions.values()) unsubscribe()
+    for (const unsubscribe of conversationSubscriptions.values()) unsubscribe()
+    process.off('SIGINT', shutdown)
+    process.off('SIGTERM', shutdown)
   }
 }

@@ -40,7 +40,7 @@ import type { HarnessMode } from './orchestrator.ts'
 import { accessRank, CodingCapabilities, ExtensionRegistry } from './policies.ts'
 import { probeOperation } from './reconciliation.ts'
 import type { CodingProfile } from './policies.ts'
-import { LocalStore } from './store.ts'
+import { LocalStore, StorePersistenceError } from './store.ts'
 import { isStopping, isUnresolvedEffect, TaskEngine } from './task-engine.ts'
 import type { CreateTask, NodeProposal, NodeReplan, TaskSnapshot } from './task-engine.ts'
 import { ToolApprovalBroker } from './tool-approval.ts'
@@ -248,6 +248,10 @@ export class LocalAgentHost {
 
   #assertOpen(): void {
     if (this.#closed || this.#closing) throw new ConversationError('HOST_UNAVAILABLE', 'Host is closing')
+  }
+
+  #assertWritable(): void {
+    this.#assertOpen()
     if (this.#storageFailure) throw this.#storageFailure
   }
 
@@ -303,7 +307,7 @@ export class LocalAgentHost {
   }
 
   createConversation(input: CreateConversationInput): ConversationSummary {
-    this.#assertOpen()
+    this.#assertWritable()
     const command = parseCreateConversation(input)
     const duplicate = this.#conversations.created(command)
     if (duplicate) return duplicate
@@ -339,12 +343,12 @@ export class LocalAgentHost {
   }
 
   renameConversation(input: RenameConversationInput): ConversationSummary {
-    this.#assertOpen()
+    this.#assertWritable()
     return this.#conversations.rename(input)
   }
 
   archiveConversation(input: ArchiveConversationInput): ConversationSummary {
-    this.#assertOpen()
+    this.#assertWritable()
     return this.#conversations.archive(input)
   }
 
@@ -364,7 +368,7 @@ export class LocalAgentHost {
   }
 
   async setConversationModel(input: SetConversationModelInput): Promise<ConversationSummary> {
-    this.#assertOpen()
+    this.#assertWritable()
     const command = parseSetConversationModel(input)
     const previous = this.#conversations.modelRequest(command)
     if (previous) return previous
@@ -376,7 +380,7 @@ export class LocalAgentHost {
         throw new ConversationError('MODEL_UNAVAILABLE', 'The selected model route is unavailable')
       }
     }
-    this.#assertOpen()
+    this.#assertWritable()
     const duplicate = this.#conversations.modelRequest(command)
     if (duplicate) return duplicate
     const conversation = this.#conversations.get(command.conversationId)
@@ -399,7 +403,7 @@ export class LocalAgentHost {
   }
 
   async sendMessage(input: SendMessageInput): Promise<SendMessageResult> {
-    this.#assertOpen()
+    this.#assertWritable()
     const command = parseSendMessage(input)
     const duplicate = this.#conversations.sent(command)
     if (duplicate) return duplicate
@@ -426,7 +430,7 @@ export class LocalAgentHost {
         throw new ConversationError('MODEL_UNAVAILABLE', 'The selected model route is unavailable')
       }
     }
-    this.#assertOpen()
+    this.#assertWritable()
     const alreadySent = this.#conversations.sent(command)
     if (alreadySent) return alreadySent
     const current = this.#conversations.canSend(command.conversationId)
@@ -447,7 +451,7 @@ export class LocalAgentHost {
   }
 
   async steerConversation(input: SteerInput): Promise<{ accepted: true }> {
-    this.#assertOpen()
+    this.#assertWritable()
     const command = parseSteer(input)
     this.#conversations.assertTaskOwner(command)
     const id = desktopRequestId(command.requestId)
@@ -463,7 +467,7 @@ export class LocalAgentHost {
   }
 
   stopConversation(input: ConversationAction): ActionResult {
-    this.#assertOpen()
+    this.#assertWritable()
     const command = parseConversationAction(input)
     this.#conversations.assertTaskOwner(command)
     const id = desktopRequestId(command.requestId)
@@ -474,7 +478,7 @@ export class LocalAgentHost {
   }
 
   resumeConversation(input: ConversationAction): ActionResult {
-    this.#assertOpen()
+    this.#assertWritable()
     const command = parseConversationAction(input)
     this.#conversations.assertTaskOwner(command)
     const id = desktopRequestId(command.requestId)
@@ -485,14 +489,14 @@ export class LocalAgentHost {
   }
 
   async createTask(input: Omit<CreateTask, 'conversationId'>): Promise<{ taskId: string }> {
-    this.#assertOpen()
+    this.#assertWritable()
     const { requestId, goal, cwd, check, route, workspaceAccess } = input
     const command = { requestId, goal, cwd, check, route, workspaceAccess }
     const existing = this.#engine.recorded<{ taskId: string }>(command.requestId, ['create', command])
     if (existing) return existing
     const workspace = this.#workspace(command.cwd)
     if (command.route) await this.#scheduler.validateRoute(command.route)
-    this.#assertOpen()
+    this.#assertWritable()
     // Preserve the submitted path in the idempotency signature while binding the workspace to its canonical target.
     if (relative(workspace.root, resolve(command.cwd)) !== '') throw new Error('Submit the canonical workspace path')
     const result = this.#engine.create(command)
@@ -501,7 +505,7 @@ export class LocalAgentHost {
   }
 
   stop(taskId: string, requestId: string): { accepted: boolean; status: TaskStatus } {
-    this.#assertOpen()
+    this.#assertWritable()
     this.#assertStandaloneTask(taskId)
     return this.#stop(taskId, requestId)
   }
@@ -524,16 +528,18 @@ export class LocalAgentHost {
     if (active.abort.signal.aborted) return
     active.abort.abort()
     active.stopTimer = setTimeout(() => {
+      if (this.#closed || this.#store.isClosed) return
       try {
         if (isStopping(this.#engine.get(taskId).status)) this.#engine.end(taskId, 'stop_timeout')
-      } catch {
-        this.#failStorage()
+      } catch (error) {
+        if (error instanceof StorePersistenceError) this.#failStorage()
+        else writeHostDiagnostic('host.runtime_failed', taskId)
       }
     }, this.#stopTimeoutMs)
   }
 
   resume(taskId: string, requestId: string) {
-    this.#assertOpen()
+    this.#assertWritable()
     this.#assertStandaloneTask(taskId)
     return this.#resume(taskId, requestId)
   }
@@ -547,20 +553,20 @@ export class LocalAgentHost {
   }
 
   addInstruction(taskId: string, requestId: string, text: string) {
-    this.#assertOpen()
+    this.#assertWritable()
     this.#assertStandaloneTask(taskId)
     return this.#engine.addInstruction(taskId, requestId, text)
   }
 
   addTask(taskId: string, requestId: string, goal: string, expectedVersion: number, dependencies?: string[]) {
-    this.#assertOpen()
+    this.#assertWritable()
     this.#assertStandaloneTask(taskId)
     if (!this.#profile.delegation) throw new Error('The Coding profile disables delegation')
     return this.#engine.addTask(taskId, requestId, goal, expectedVersion, dependencies)
   }
 
   async requestModelSwitch(taskId: string, requestId: string, route: ModelRoute) {
-    this.#assertOpen()
+    this.#assertWritable()
     this.#assertStandaloneTask(taskId)
     const existing = this.#engine.recorded<{ accepted: true }>(requestId, ['switch', taskId, route])
     if (existing) return existing
@@ -569,7 +575,7 @@ export class LocalAgentHost {
     if (!current && task.status === 'running') throw new Error('Initial model route is still being selected')
     if (current && !this.#scheduler.canSwitch(current, route)) throw new Error('Cross-provider context transfer is disabled')
     await this.#scheduler.validateRoute(route)
-    this.#assertOpen()
+    this.#assertWritable()
     const latest = this.#orchestrator.rootRoute(taskId) ?? this.#engine.get(taskId).route
     if (latest && !this.#scheduler.canSwitch(latest, route)) throw new Error('Cross-provider context transfer is disabled')
     return this.#engine.switchRoute(taskId, requestId, route)
@@ -624,6 +630,7 @@ export class LocalAgentHost {
   }
 
   async saveAgentPreferences(value: unknown): Promise<AgentPreferences> {
+    this.#assertWritable()
     const next = management.preferences(value)
     if (next.searchProvider === 'brave' && !process.env.ZLO_AGENT_BRAVE_SEARCH_API_KEY) {
       throw new ConversationError('INVALID_INPUT', 'Brave Search requires a local configuration key')
@@ -636,7 +643,7 @@ export class LocalAgentHost {
     if (next.searchProvider !== this.#agentPreferences.searchProvider && this.#active) {
       throw new ConversationError('CONFLICT', 'Stop the current run before changing its search provider')
     }
-    this.#assertOpen()
+    this.#assertWritable()
     const newlyDisabled = next.disabledTools.some(name => !this.#agentPreferences.disabledTools.includes(name))
     this.#store.transaction(() => this.#store.put('desktop-preferences', 'v1', next))
     this.#agentPreferences = next
@@ -650,6 +657,7 @@ export class LocalAgentHost {
 
   setConversationWorkspaceAccess(conversationId: string, requested: WorkspaceAccess, expected: WorkspaceAccess,
     mode?: ToolApprovalMode, expectedMode?: ToolApprovalMode): ConversationSummary {
+    this.#assertWritable()
     const conversation = this.#conversations.get(management.id(conversationId))
     const access = management.access(requested)
     const current = this.#conversationAccess(conversation)
@@ -775,7 +783,7 @@ export class LocalAgentHost {
           })])
         } finally { clearTimeout(timer) }
       }
-      this.#assertOpen()
+      this.#assertWritable()
       return await change()
     } finally {
       this.#credentialMutation = false
@@ -784,7 +792,16 @@ export class LocalAgentHost {
   }
 
   async managementCommand(command: ManagementCommand | PrivateCredentialCommand): Promise<unknown> {
-    this.#assertOpen()
+    if (command.type === 'cancelGrokLogin') {
+      if (this.#closed) return true
+      this.#providerRuntime?.grokLogin?.cancel()
+      return true
+    }
+    if (command.type === 'getJevStatus' || command.type === 'managementSnapshot' || command.type === 'conversationObservatory') {
+      this.#assertOpen()
+    } else {
+      this.#assertWritable()
+    }
     switch (command.type) {
       case 'getJevStatus': return this.#jev.status()
       case 'testJevConnection': return this.#jev.test()
@@ -812,6 +829,8 @@ export class LocalAgentHost {
       case 'deleteConversationMemory': return this.#removeMemory(command.conversationId, command.ids)
       case 'reconcileOperation': return this.#reconcile(command)
       case 'resolveTaskReconciliation': return this.#resolveTaskReconciliation(command)
+    }
+    switch (command.type) {
       case 'testProviderAccount': {
         const provider = management.providerId(command.provider)
         const model = command.model === undefined ? undefined : parseRoute({ provider, model: command.model }).model
@@ -857,9 +876,6 @@ export class LocalAgentHost {
         this.#requireProviderRuntime().grokLogin?.start()
         return true
       case 'pollGrokLogin': return this.#requireProviderRuntime().grokLogin?.poll()
-      case 'cancelGrokLogin':
-        this.#requireProviderRuntime().grokLogin?.cancel()
-        return true
       case 'refreshGrokLogin': return this.#requireProviderRuntime().grokLogin?.refresh(command.credential)
       case 'initializeProviderKeys':
         throw new ConversationError('INVALID_INPUT', 'Credentials are initialized before the desktop Host starts')
@@ -867,8 +883,26 @@ export class LocalAgentHost {
   }
 
   async command(command: HostCommand | DesktopCommand): Promise<unknown> {
-    this.#assertOpen()
-    if (command?.schemaVersion !== 1) throw new Error('Unsupported command version')
+    if (command?.schemaVersion !== 1) {
+      this.#assertOpen()
+      throw new Error('Unsupported command version')
+    }
+    switch (command.type) {
+      case 'getTask':
+      case 'getHistory':
+      case 'listTasks':
+      case 'getRouteStatus':
+      case 'discoverModels':
+      case 'getModelBudget':
+      case 'listConversations':
+      case 'getConversation':
+      case 'getConversationHistory':
+        this.#assertOpen()
+        break
+      default:
+        this.#assertWritable()
+        break
+    }
     switch (command.type) {
       case 'resolveToolApproval': return this.#approval.resolve(command.approvalId, command.decision)
       case 'createTask': {
@@ -917,20 +951,34 @@ export class LocalAgentHost {
   }
 
   #dispatch(): void {
-    if (this.#closing || this.#active || this.#storageFailure || this.#credentialMutation) return
+    if (this.#closing || this.#closed || this.#store.isClosed || this.#active || this.#storageFailure || this.#credentialMutation) return
     try {
       const ready = this.#engine.list().find((task) => task.status === 'ready')
       if (!ready) return
       const task = this.#engine.start(ready.id)
       const active: ActiveTask = { taskId: task.id, abort: new AbortController(), done: Promise.resolve() }
       this.#active = active
-      active.done = this.#run(task, active.abort.signal).catch(() => this.#failStorage()).finally(() => {
+      active.done = this.#run(task, active.abort.signal).catch((error) => {
+        if (this.#closed || this.#store.isClosed) return
+        if (error instanceof StorePersistenceError) {
+          this.#failStorage()
+          return
+        }
+        writeHostDiagnostic('host.runtime_failed', task.id)
+        try {
+          this.#engine.end(task.id, 'runtime_error')
+        } catch (endError) {
+          if (endError instanceof StorePersistenceError) this.#failStorage()
+        }
+      }).finally(() => {
         clearTimeout(active.stopTimer)
         this.#active = undefined
         this.#dispatch()
       })
-    } catch {
-      this.#failStorage()
+    } catch (error) {
+      if (this.#closed || this.#store.isClosed) return
+      if (error instanceof StorePersistenceError) this.#failStorage()
+      else writeHostDiagnostic('host.runtime_failed')
     }
   }
 
@@ -984,7 +1032,15 @@ export class LocalAgentHost {
         continue
       }
       const settled = this.#engine.verify(task.id, verification)
-      if (settled.status === 'succeeded') await this.#captureMemory(settled, result.route, result.event, signal)
+      if (settled.status === 'succeeded') {
+        try {
+          await this.#captureMemory(settled, result.route, result.event, signal)
+        } catch (error) {
+          if (this.#closed || this.#store.isClosed) return
+          if (error instanceof StorePersistenceError) this.#failStorage()
+          else writeHostDiagnostic('host.memory_capture_failed', settled.id)
+        }
+      }
       return
     }
     this.#engine.end(task.id, 'budget_exhausted')
@@ -1021,11 +1077,17 @@ export class LocalAgentHost {
     if (this.#closed) return
     this.#closing = true
     this.#jev.close()
+    let shutdownError: unknown
     if (this.#active) {
       const active = this.#active
       if (!this.#storageFailure) {
-        this.#engine.requestStop(active.taskId, 'shutdown:' + randomUUID(), 'shutdown')
-        this.#settleStop(active.taskId)
+        try {
+          this.#engine.requestStop(active.taskId, 'shutdown:' + randomUUID(), 'shutdown')
+          this.#settleStop(active.taskId)
+        } catch (error) {
+          if (error instanceof StorePersistenceError) this.#failStorage()
+          shutdownError ??= error
+        }
       }
       let timer: NodeJS.Timeout | undefined
       try {
@@ -1035,14 +1097,23 @@ export class LocalAgentHost {
             timer = setTimeout(() => reject(new Error('Run still active after shutdown deadline')), this.#stopTimeoutMs + 100)
           }),
         ])
+      } catch (error) {
+        shutdownError ??= error
       } finally {
         clearTimeout(timer)
       }
     }
     if (!this.#closed) {
-      this.#store.close()
-      this.#closed = true
+      try {
+        if (this.#active) clearTimeout(this.#active.stopTimer)
+        this.#store.close()
+      } catch (error) {
+        shutdownError ??= error
+      } finally {
+        this.#closed = true
+      }
     }
     if (this.#storageFailure) throw this.#storageFailure
+    if (shutdownError) throw shutdownError
   }
 }

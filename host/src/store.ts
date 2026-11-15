@@ -19,6 +19,19 @@ interface Subscription {
 const SCHEMA_VERSION = 1;
 const REPLAY_BATCH_SIZE = 128;
 
+export class StorePersistenceError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'StorePersistenceError';
+  }
+}
+
+function asPersistenceError(error: unknown): StorePersistenceError {
+  if (error instanceof StorePersistenceError) return error;
+  const message = error instanceof Error ? error.message : 'Local store persistence failed';
+  return new StorePersistenceError(message, { cause: error });
+}
+
 /** Store JSON DTOs and append-only events in one transaction boundary. */
 export class LocalStore {
   readonly #db: DatabaseSync;
@@ -33,13 +46,14 @@ export class LocalStore {
     this.#writerLock = path === ':memory:' ? undefined : acquireWriterLock(path);
     let db: DatabaseSync | undefined;
     try {
-      db = new DatabaseSync(path);
+      db = new DatabaseSync(path, { timeout: 5000 });
       this.#db = db;
       const journal = db.prepare('PRAGMA journal_mode = WAL').get()?.journal_mode;
       if (path !== ':memory:' && journal !== 'wal') {
         throw new Error('Local store requires WAL journaling');
       }
       db.exec('PRAGMA synchronous = FULL');
+      db.exec('PRAGMA busy_timeout = 5000');
       this.#migrate();
     } catch (error) {
       try {
@@ -49,6 +63,10 @@ export class LocalStore {
       }
       throw error;
     }
+  }
+
+  get isClosed(): boolean {
+    return !this.#db.isOpen;
   }
 
   close(): void {
@@ -65,7 +83,11 @@ export class LocalStore {
 
   transaction<T>(callback: () => T): T {
     if (this.#changedTasks) throw new Error('Nested store transactions are unsupported');
-    this.#db.exec('BEGIN IMMEDIATE');
+    try {
+      this.#db.exec('BEGIN IMMEDIATE');
+    } catch (error) {
+      throw asPersistenceError(error);
+    }
     const changedTasks = new Set<string>();
     const settlements: ((committed: boolean) => void)[] = [];
     this.#changedTasks = changedTasks;
@@ -78,10 +100,20 @@ export class LocalStore {
         void Promise.resolve(result).catch(() => {});
         throw new Error('Store transaction callback must be synchronous');
       }
-      this.#db.exec('COMMIT');
+      try {
+        this.#db.exec('COMMIT');
+      } catch (error) {
+        throw asPersistenceError(error);
+      }
       committed = true;
     } catch (error) {
-      if (this.#db.isTransaction) this.#db.exec('ROLLBACK');
+      if (this.#db.isTransaction) {
+        try {
+          this.#db.exec('ROLLBACK');
+        } catch (rollbackError) {
+          throw asPersistenceError(rollbackError);
+        }
+      }
       throw error;
     } finally {
       this.#changedTasks = undefined;
@@ -159,28 +191,43 @@ export class LocalStore {
 
   put(namespace: string, id: string, value: unknown): void {
     this.#requireTransaction();
-    this.#db.prepare(`
-      INSERT INTO records(namespace, id, value) VALUES (?, ?, ?)
-      ON CONFLICT(namespace, id) DO UPDATE SET value = excluded.value
-    `).run(namespace, id, encode(value));
+    const encoded = encode(value);
+    try {
+      this.#db.prepare(`
+        INSERT INTO records(namespace, id, value) VALUES (?, ?, ?)
+        ON CONFLICT(namespace, id) DO UPDATE SET value = excluded.value
+      `).run(namespace, id, encoded);
+    } catch (error) {
+      throw asPersistenceError(error);
+    }
   }
 
   delete(namespace: string, id: string): void {
     this.#requireTransaction();
-    this.#db.prepare('DELETE FROM records WHERE namespace = ? AND id = ?').run(namespace, id);
+    try {
+      this.#db.prepare('DELETE FROM records WHERE namespace = ? AND id = ?').run(namespace, id);
+    } catch (error) {
+      throw asPersistenceError(error);
+    }
   }
 
   append(draft: EventDraft, streamId = draft.taskId): AgentEvent {
     const changedTasks = this.#requireTransaction();
+    const seq = this.eventCursor(streamId) + 1;
     const event: AgentEvent = {
       ...draft,
       schemaVersion: 1,
       id: randomUUID(),
-      seq: this.eventCursor(streamId) + 1,
+      seq,
       occurredAt: new Date().toISOString(),
     };
-    this.#db.prepare('INSERT INTO events(task_id, seq, id, event) VALUES (?, ?, ?, ?)')
-      .run(streamId, event.seq, event.id, encode(event));
+    const encoded = encode(event);
+    try {
+      this.#db.prepare('INSERT INTO events(task_id, seq, id, event) VALUES (?, ?, ?, ?)')
+        .run(streamId, event.seq, event.id, encoded);
+    } catch (error) {
+      throw asPersistenceError(error);
+    }
     changedTasks.add(streamId);
     if (streamId === draft.taskId) {
       for (const project of this.#projectors) project(event);
@@ -189,8 +236,12 @@ export class LocalStore {
   }
 
   eventCursor(streamId: string): number {
-    const row = this.#db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE task_id = ?').get(streamId);
-    return Number(row?.seq);
+    try {
+      const row = this.#db.prepare('SELECT COALESCE(MAX(seq), 0) AS seq FROM events WHERE task_id = ?').get(streamId);
+      return Number(row?.seq);
+    } catch (error) {
+      throw asPersistenceError(error);
+    }
   }
 
   /** Project primary events inside their write transaction. Projections write to separate streams. */

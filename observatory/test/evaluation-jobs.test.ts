@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import type { EvaluationEvidence, TelemetryTask } from '../../shared/contracts/observatory.ts'
+import type { EvaluationEvidence, TelemetryEvent, TelemetryTask } from '../../shared/contracts/observatory.ts'
 import { ObservatoryDatabase } from '../src/database.ts'
 import { EvaluationJobs } from '../src/evaluation-jobs.ts'
 import { Evaluator } from '../src/evaluation.ts'
@@ -89,6 +89,74 @@ test('cancelled jobs and interrupted records settle locally without an implicit 
     assert.equal(jobs.cancel(id), true)
     assert.equal((await waitJob(db, id)).status, 'cancelled')
     assert.equal(jobs.cancel(id), false)
+  } finally {
+    await jobs.close()
+    db.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test('post-settlement memory capture tail events stay within evaluation snapshot boundary while non-tail changes fail closed', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'zlo-tail-eval-'))
+  const db = new ObservatoryDatabase(directory)
+  const baseline = { ...taskFinished(new Date().toISOString()), cursor: 5 }
+  let current = structuredClone(baseline)
+  let tailEvents: TelemetryEvent[] = [
+    {
+      schemaVersion: 1, id: randomUUID(), seq: 6, occurredAt: new Date().toISOString(),
+      taskId: baseline.id, taskRunId: baseline.taskRunId, type: 'judgment.evaluated',
+      payload: { id: 'memory.capture' },
+    },
+    {
+      schemaVersion: 1, id: randomUUID(), seq: 7, occurredAt: new Date().toISOString(),
+      taskId: baseline.id, taskRunId: baseline.taskRunId, type: 'memory.captured',
+      payload: { count: 1 },
+    },
+  ]
+  let advanceDuringEvidence = true
+  const source = {
+    snapshot: async () => structuredClone(current),
+    events: async (_id: string, after: number) => tailEvents.filter(event => event.seq > after),
+    async evidence(id: string, nodeId?: string): Promise<EvaluationEvidence> {
+      if (advanceDuringEvidence) current = { ...current, cursor: 7 }
+      return {
+        taskId: id, taskRunId: baseline.taskRunId, nodeId, capturedAt: new Date().toISOString(),
+        goal: 'Verify tail boundary', constraints: [],
+        verification: { verdict: 'verified', passed: true, basis: 'workspace_path' },
+        artifacts: [], operations: [], structure: [], limitations: [],
+      }
+    },
+  }
+  const jobs = new EvaluationJobs(db, source, new Evaluator())
+  try {
+    // 1. cursor=5 at observe/start -> cursor=6 at before -> cursor=7 (memory.captured) at after succeeds cleanly
+    current = { ...baseline, cursor: 6 }
+    const okId = jobs.start(baseline, undefined, [], false)!
+    const okJob = await waitJob(db, okId)
+    assert.equal(okJob.status, 'completed')
+    assert.equal((okJob.snapshot as { cursor: number; baselineCursor?: number }).cursor, 7)
+    assert.equal((okJob.snapshot as { cursor: number; baselineCursor?: number }).baselineCursor, 5)
+
+    // 2. Non-benign tail event (e.g. tool.started) fails closed
+    advanceDuringEvidence = false
+    tailEvents = [
+      ...tailEvents,
+      {
+        schemaVersion: 1, id: randomUUID(), seq: 8, occurredAt: new Date().toISOString(),
+        taskId: baseline.id, taskRunId: baseline.taskRunId, type: 'tool.started',
+        payload: { tool: 'create_text_file', effect: 'write' },
+      },
+    ]
+    current = { ...baseline, cursor: 8 }
+    const badEventId = jobs.start(baseline, undefined, [], false)!
+    const badEventJob = await waitJob(db, badEventId)
+    assert.equal(badEventJob.status, 'failed')
+
+    // 3. Real task mutation (attemptCount changed) fails closed
+    current = { ...baseline, cursor: 7, attemptCount: 2 }
+    const mutatedId = jobs.start(baseline, undefined, [], false)!
+    const mutatedJob = await waitJob(db, mutatedId)
+    assert.equal(mutatedJob.status, 'failed')
   } finally {
     await jobs.close()
     db.close()
