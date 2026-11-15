@@ -34,7 +34,7 @@ OAuth 规格与可用性见 [OpenAI 注册和登录](https://developers.openai.c
 
 对话顶部显示生效中的模型、待应用的路由和工作区权限。权限变更走现有 Main 授权流程。右侧「中台」可在当前对话展开，显示会话累计 Token、模型请求、估算费用和工具调用。运行明细可切换已加载的轮次。
 
-Host 按会话关联的全部已持久化任务计算累计值，覆盖尚未加载的聊天分页。Token 分为未缓存输入、输出、缓存读取和缓存写入。估算费用只累计有价格的用量报告，并展示价格覆盖数量。最近任务预算来自本地调度器，显示已确认、已预留和未确认用量。供应商账户剩余额度目前无统一数据源。
+Host 按会话关联的全部已持久化任务计算累计值，覆盖尚未加载的聊天分页。Token 分为未缓存输入、输出、缓存读取和缓存写入。估算费用只累计有价格的用量报告，并展示价格覆盖数量。最近任务的已确认、已预留和未确认用量来自本地调度器。任务累计 Token 只计量。供应商账户剩余额度目前无统一数据源。
 
 会话中台使用 Host 的只读管理接口，运行期间自动刷新。跨会话运行分析和独立质量评估仍由 [Zlo Observatory](23-observatory.md) 提供。页面组织参考 [Mu 工作区导航](https://github.com/qybaihe/mu) 和 [Codex 会话权限控件](https://learn.chatgpt.com/docs/permission-modes?site_variant=chatgpt&translationFallback=zh-Hans)。
 
@@ -45,7 +45,7 @@ Host 按会话关联的全部已持久化任务计算累计值，覆盖尚未加
 | Preload 方法 | Main / Host 处理 |
 | --- | --- |
 | `snapshot`、`recentDiagnostics` | 读取有界的 Host 管理投影、应用版本和经过验证的诊断文件 |
-| `conversationObservatory` | 读取指定会话的聚合计数、模型用量与最近任务预算。响应只包含结构化统计字段 |
+| `conversationObservatory` | 读取指定会话的聚合计数、模型用量与最近任务的用量核算。响应只包含结构化统计字段 |
 | `savePreferences` | Main 对权限放宽进行原生确认，Host 校验模型和保存策略 |
 | `setWorkspaceAccess` | Main 校验目录和授权，Host 用预期权限防止并发覆盖 |
 | `setProviderKey`、`testProvider`、`removeProviderKey` | Main 负责凭证，Host 用固定 Provider 接口核验并切换 Pi 配置 |

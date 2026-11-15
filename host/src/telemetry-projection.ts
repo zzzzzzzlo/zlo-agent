@@ -9,7 +9,7 @@ import type { Attempt, TaskSnapshot } from './task-engine.ts'
 import { redactProcessOutput } from './workspace-process.ts'
 
 const states = 'ready running verifying succeeded failed blocked stop_requested stopping stopped needs_reconciliation interrupted unknown_effect started completed active idle released settled uncertain verified unresolved'.split(' ')
-const reasons = 'user_stop host_shutdown process_interrupted model_error model_interrupted runtime_error verification_failed unknown_effect checkpoint_error stop_timeout budget_exhausted model_output_limit'.split(' ')
+const reasons = 'user_stop host_shutdown process_interrupted model_error model_interrupted runtime_error verification_failed unknown_effect checkpoint_error stop_timeout budget_exhausted model_output_limit tool_retry_loop'.split(' ')
 const roles = ['root', 'team', 'worker'] as const
 const accessLevels = ['read', 'write', 'trusted'] as const
 const verificationEvidence = 'workspace_text_file_exists workspace_file_contains_expected_text workspace_command_passed project_command_exit_zero project_command_not_authorized project_command_previous_result project_command_effect_unknown workspace_command_not_authorized workspace_write_active verification_interrupted workspace_command_unavailable workspace_command_failed workspace_file_unavailable workspace_file_missing_expected_text node_unknown_effect'.split(' ')
@@ -140,7 +140,7 @@ function safePayload(type: string, p: Record<string, unknown>): Record<string, u
     case 'model.usage': return { input: num(p.input), output: num(p.output), cacheRead: num(p.cacheRead), cacheWrite: num(p.cacheWrite), estimatedCostUsd: num(p.estimatedCostUsd) }
     case 'tool.started': case 'tool.finished': case 'tool.approval_resolved': case 'tool.denied':
       return { id: ref(p.id), tool: label(p.tool), effect: oneOf(p.effect, ['read', 'write']), status, managed: bool(p.managed), approved: bool(p.approved),
-        reason: oneOf(p.reason, ['policy', 'approval_safety', 'tool_result_failed', 'tool_exception', 'nonzero_exit', 'tool_cancelled']),
+        reason: oneOf(p.reason, ['policy', 'approval_safety', 'repeated_failure', 'tool_result_failed', 'tool_exception', 'nonzero_exit', 'tool_cancelled']),
         approvalKind: oneOf(p.approvalKind, approvalKinds) }
     case 'task.permissions_changed': return { access: oneOf(p.access, accessLevels), previousAccess: oneOf(p.previousAccess, accessLevels) }
     case 'operation.reconciliation_required': case 'operation.reconciliation_checked': return { status, reason,

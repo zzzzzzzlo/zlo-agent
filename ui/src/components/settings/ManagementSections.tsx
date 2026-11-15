@@ -322,13 +322,11 @@ function Diagnostics(props: ActionProps) {
               <div><dt>估算成本</dt><dd>{incompleteCost ? (totals.cost ? '已知部分 ' + dollars.format(totals.cost) : '暂无报价') : dollars.format(totals.cost)}</dd></div>
             </dl>
             <p className="management-note">最近 {snapshot.tasks.length} 个任务的用量。</p>
-            <h4>最近任务预算</h4>
+            <h4>最近任务用量</h4>
             <dl className="management-metadata">
-              <div><dt>Token 上限</dt><dd>{budget?.tokenLimit === undefined ? '未配置' : number.format(budget.tokenLimit)}</dd></div>
               {budget?.confirmed !== undefined && <div><dt>确认消耗</dt><dd>{number.format(budget.confirmed)}</dd></div>}
               {budget?.reserved !== undefined && <div><dt>已预留</dt><dd>{number.format(budget.reserved)}</dd></div>}
               {budget?.uncertain !== undefined && <div><dt>中断待核算</dt><dd>{number.format(budget.uncertain)}</dd></div>}
-              <div><dt>成本上限</dt><dd>{budget?.costLimitUsd === undefined ? '未配置' : dollars.format(budget.costLimitUsd)}</dd></div>
             </dl>
           </>
         ) : <p className="management-note">请选择一个会话。</p>}

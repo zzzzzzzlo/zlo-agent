@@ -46,7 +46,7 @@ export interface OutputEvent {
 
 type Outcome =
   | { status: 'completed'; route: ModelRoute; textProduced: boolean; event: EventDraft }
-  | { status: 'interrupted' | 'model_error' | 'model_output_limit' | 'runtime_error' | 'checkpoint_error' | 'budget_exhausted' }
+  | { status: 'interrupted' | 'model_error' | 'model_output_limit' | 'runtime_error' | 'checkpoint_error' | 'budget_exhausted' | 'tool_retry_loop' }
 
 export type HarnessMode = 'fast' | 'quality'
 const deadlines: Record<HarnessMode, { root: number; child: number }> = {
@@ -242,16 +242,17 @@ export class MultiAgentOrchestrator {
     parentRoute: ModelRoute, parentScope: CapabilityScope, rootSignal: AbortSignal, suspendParent = false): Promise<WorkerHandoff | undefined> {
     const role = node.role ?? 'worker'
     const deadline = new AbortController()
+    const stalled = new AbortController()
     const timeMs = Math.min(node.budget?.timeMs ?? Infinity, deadlines[this.#mode].child)
     const timer = setTimeout(() => deadline.abort(), timeMs)
-    const signal = AbortSignal.any([rootSignal, deadline.signal])
+    const signal = AbortSignal.any([rootSignal, deadline.signal, stalled.signal])
     let event: EventDraft = {
       taskId: task.id, taskRunId: task.taskRunId, taskNodeId: node.id,
       agentId: randomUUID(), agentRunId: randomUUID(), parentAgentRunId: parent.agentRunId, type: '', payload: {},
     }
     const evidence = new Set<string>()
     const artifacts = new Set<string>()
-    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence)
+    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence, () => stalled.abort())
     let followUp: TurnFollowUp | undefined
     let session: ExecutionSession | undefined
     let unwatch: (() => Promise<void>) | undefined
@@ -278,7 +279,7 @@ export class MultiAgentOrchestrator {
       }
       const parentNode = this.#tasks.get(task.id).nodes?.find(item => item.id === node.parentNodeId)
       const scopes = [node, ...(parentNode ? [parentNode] : [])].flatMap(({ id, budget }) =>
-        budget?.requests !== undefined || budget?.tokens !== undefined ? [{ nodeId: id, requests: budget.requests, tokens: budget.tokens }] : [])
+        budget?.requests === undefined ? [] : [{ nodeId: id, requests: budget.requests }])
       lease = this.#scheduler.reserve(() => event, role, scopes)
       const scope = this.#childScope(workspace, parentScope, node, role)
       const teamKey = role === 'team'
@@ -351,7 +352,8 @@ export class MultiAgentOrchestrator {
       signal.throwIfAborted()
       session = await this.#execution.open({
         cwd: workspace.root, role, correlationId: event.agentRunId,
-        sessionDirectory: join(this.#sessions, teamKey ?? task.id), session: saved?.session, route, tools,
+        sessionDirectory: join(this.#sessions, teamKey ?? task.id), session: saved?.session, route,
+        tools: tools.map(tool => toolRun.guard(tool, () => event, signal, availableTools.find(item => item.name === tool.name))),
         systemPrompt: this.#extensions.workflow.systemPrompt(role, scope.access, node.check),
         selectSkills: skillDisclosure(this.#judgment, event, node.goal, signal),
         ...(this.#mode === 'quality' && advice.reasoningEffort ? { reasoningEffort: advice.reasoningEffort } : {}),
@@ -464,7 +466,8 @@ export class MultiAgentOrchestrator {
         resultStatus: 'failed', summary: 'Child Agent did not produce verified evidence.',
         executionStatus: executionCompleted ? 'completed' : 'failed',
         artifactRefs: [...artifacts], evidenceRefs: [...evidence],
-        remainingRisks: [deadline.signal.aborted ? 'worker_deadline' : exhausted ? 'budget_exhausted' : 'worker_failed'],
+        remainingRisks: [stalled.signal.aborted ? 'tool_retry_loop'
+          : deadline.signal.aborted ? 'worker_deadline' : exhausted ? 'budget_exhausted' : 'worker_failed'],
       }
       if (rootSignal.aborted) result = undefined
       if (started) {
@@ -501,9 +504,10 @@ export class MultiAgentOrchestrator {
   }
 
   async run(task: TaskSnapshot, workspace: CodingWorkspace, stopSignal: AbortSignal): Promise<Outcome> {
-    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence)
+    const stalled = new AbortController()
+    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence, () => stalled.abort())
     const budget = new AbortController()
-    const signal = AbortSignal.any([stopSignal, budget.signal])
+    const signal = AbortSignal.any([stopSignal, budget.signal, stalled.signal])
     const agentKey = task.conversationId ?? task.id
     const saved = this.#db.get<AgentRecord>('agents', agentKey)
     let event: EventDraft = {
@@ -698,7 +702,8 @@ export class MultiAgentOrchestrator {
       .sort((left, right) => right.finishedAt!.localeCompare(left.finishedAt!))[0] : undefined
     const config = (route: ModelRoute | undefined, ref?: SessionRef): ExecutionConfig => ({
       cwd: workspace.root, role: 'root', correlationId: event.agentRunId,
-      sessionDirectory: join(this.#sessions, agentKey), session: ref, route, tools,
+      sessionDirectory: join(this.#sessions, agentKey), session: ref, route,
+      tools: tools.map(tool => toolRun.guard(tool, () => event, signal, availableTools.find(item => item.name === tool.name))),
       systemPrompt: this.#extensions.workflow.systemPrompt('root', rootScope.access, task.check),
       ...this.#runtimePolicy(workspace, rootScope),
       ...(this.#mode === 'quality' && advice.reasoningEffort ? { reasoningEffort: advice.reasoningEffort } : {}),
@@ -934,6 +939,7 @@ export class MultiAgentOrchestrator {
       }
       if (checkpointFailed || outputFailed) outcome = { status: 'checkpoint_error' }
       else if (stopSignal.aborted) outcome = { status: 'interrupted' }
+      else if (stalled.signal.aborted) outcome = { status: 'tool_retry_loop' }
       else if (budget.signal.aborted) outcome = { status: 'budget_exhausted' }
       if (registered) {
         const status = outcome.status === 'completed' ? 'completed' : outcome.status === 'interrupted' ? 'interrupted' : 'failed'

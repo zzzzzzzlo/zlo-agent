@@ -6,8 +6,8 @@ import type { LocalStore } from './store.ts'
 
 type Role = 'root' | 'team' | 'worker'
 type Usage = Extract<RuntimeEvent, { type: 'model.usage' }>
-export interface ModelLimits { requests: number; tokens: number; activeAgents: number }
-interface BudgetScope { nodeId: string; tokens?: number; requests?: number }
+export interface ModelLimits { requests: number; activeAgents: number }
+interface BudgetScope { nodeId: string; requests: number }
 interface Budget { requests: number; confirmed: number; reserved: number; uncertain: number }
 interface Reservation {
   id: string
@@ -21,7 +21,7 @@ interface Reservation {
 const budgets = 'model-budgets'
 const scopedBudgets = 'model-node-budgets'
 const reservations = 'model-reservations'
-const defaults: ModelLimits = { requests: 96, tokens: 2_000_000, activeAgents: 5 }
+const defaults: ModelLimits = { requests: 96, activeAgents: 5 }
 const emptyBudget: Budget = { requests: 0, confirmed: 0, reserved: 0, uncertain: 0 }
 
 export class ModelBudgetError extends Error {}
@@ -41,7 +41,7 @@ export class LocalModelScheduler {
     this.#store = store
     this.#judgment = judgment
     this.#automatic = automatic
-    this.#limits = { ...defaults, ...limits }
+    this.#limits = { requests: limits.requests ?? defaults.requests, activeAgents: limits.activeAgents ?? defaults.activeAgents }
     if (Object.values(this.#limits).some(value => !Number.isSafeInteger(value) || value < 1)) {
       throw new Error('Invalid model budget limits')
     }
@@ -124,34 +124,27 @@ export class LocalModelScheduler {
         }
         const entry = this.#store.transaction(() => {
           const budget = this.budget(event.taskId)
-          const available = (limit: number, ledger: Budget) => limit - ledger.confirmed - ledger.reserved - ledger.uncertain
-          const taskAvailable = available(this.#limits.tokens, budget)
-          const minimum = request.estimatedInputTokens + (request.fixedMaxOutputTokens === false ? 1 : request.maxOutputTokens)
-          if (budget.requests >= this.#limits.requests || taskAvailable < minimum) {
+          if (budget.requests >= this.#limits.requests) {
             throw new ModelBudgetError('Task model budget exhausted')
           }
-          let granted = Math.min(tokens, taskAvailable)
           const ledgers = scopes.map(scope => {
             const key = JSON.stringify([event.taskId, scope.nodeId])
             const ledger = this.#store.get<Budget>(scopedBudgets, key) ?? emptyBudget
-            const remaining = available(scope.tokens ?? Infinity, ledger)
-            if (ledger.requests >= (scope.requests ?? Infinity) || remaining < minimum) {
+            if (ledger.requests >= scope.requests) {
               throw new ModelBudgetError('Delegated model budget exhausted')
             }
-            granted = Math.min(granted, remaining)
             return { key, ledger }
           })
-          const adjusted = { ...request, maxOutputTokens: granted - request.estimatedInputTokens }
-          const entry = { id: randomUUID(), event, request: adjusted, tokens: granted, started: performance.now(),
+          const entry = { id: randomUUID(), event, request, tokens, started: performance.now(),
             status: 'pending' as const, scopeKeys: ledgers.map(({ key }) => key) }
           for (const { key, ledger } of ledgers) {
-            this.#store.put(scopedBudgets, key, { ...ledger, requests: ledger.requests + 1, reserved: ledger.reserved + granted })
+            this.#store.put(scopedBudgets, key, { ...ledger, requests: ledger.requests + 1, reserved: ledger.reserved + tokens })
           }
-          this.#store.put(budgets, event.taskId, { ...budget, requests: budget.requests + 1, reserved: budget.reserved + granted })
+          this.#store.put(budgets, event.taskId, { ...budget, requests: budget.requests + 1, reserved: budget.reserved + tokens })
           this.#store.put(reservations, entry.id, entry)
           this.#store.append({ ...event, correlationId: entry.id, type: 'model.reserved', payload: { route: request.route, kind: request.kind,
-            estimatedTokens: granted, estimatedInputTokens: request.estimatedInputTokens, maxOutputTokens: adjusted.maxOutputTokens,
-            taskTokenLimit: this.#limits.tokens, taskRequestLimit: this.#limits.requests } })
+            estimatedTokens: tokens, estimatedInputTokens: request.estimatedInputTokens, maxOutputTokens: request.maxOutputTokens,
+            taskRequestLimit: this.#limits.requests } })
           return entry
         })
         this.#pending.set(runId, entry)
@@ -200,7 +193,6 @@ export class LocalModelScheduler {
   }
 
   budget(taskId: string): Budget { return this.#store.get<Budget>(budgets, taskId) ?? emptyBudget }
-  get tokenLimit(): number { return this.#limits.tokens }
 
   getRouteStatus() { return { quota: 'unknown' as const, activeReservations: this.#active.size } }
 }

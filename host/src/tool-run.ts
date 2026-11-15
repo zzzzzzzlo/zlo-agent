@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import { basename } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { EventDraft } from './contracts/domain.ts'
@@ -14,6 +15,37 @@ import { judgeToolResult } from './tool-judgment.ts'
 import type { ToolEvidenceArchive } from './tool-judgment.ts'
 
 const unavailable = { ok: false, error: 'Tool work is unavailable' }
+const failureLimit = 4 // Initial call plus three retries.
+const retryAdvice = 'Read the last tool error and correct the arguments or choose another approach. Re-read the current file before retrying an exact text edit.'
+
+function callFingerprint(tool: string, input: unknown): string | undefined {
+  try {
+    const json = JSON.stringify(input, (_key, value) => value && typeof value === 'object' && !Array.isArray(value)
+      ? Object.fromEntries(Object.keys(value).sort().map(key => [key, value[key]])) : value)
+    return createHash('sha256').update(tool).update('\0').update(json ?? '').digest('hex')
+  } catch { return undefined }
+}
+
+function normalizedPaths(paths: unknown[]): string[] {
+  return paths.flatMap(path => {
+    const normalized = workspaceTarget({ path })
+    return normalized === undefined ? [] : [process.platform === 'win32' ? normalized.toLowerCase() : normalized]
+  })
+}
+
+function toolPaths(tool: WorkspaceTool, input: unknown): string[] {
+  try { return normalizedPaths(tool.policy?.targets?.(input) ?? [workspaceTarget(input)]) }
+  catch { return [] }
+}
+
+function writeProgress(tool: WorkspaceTool, input: unknown, result: unknown): string[] {
+  if (tool.policy?.approval === 'export') return []
+  if (result && typeof result === 'object' && 'changed' in result) {
+    if (result.changed === false) return []
+    if (Array.isArray(result.changed)) return normalizedPaths(result.changed)
+  }
+  return toolPaths(tool, input)
+}
 
 function redactResult(value: unknown, depth = 0): unknown {
   if (typeof value === 'string') return redactProcessOutput(value).replace(/\boc_sk_[\w-]{16,}/gu, '[redacted]')
@@ -33,14 +65,56 @@ export class ToolRun {
   #evidenceReplayAvailable = false
   readonly #judgment?: LocalJudgment
   readonly #archive?: ToolEvidenceArchive
+  readonly #onRepeatedFailure: () => void
   readonly #evidenceAccess = new Map<string, () => boolean>()
+  readonly #failures = new Map<string, { count: number; paths: string[] }>()
   #closed = false
 
-  constructor(tasks: TaskEngine, approval: ToolApprovalBroker, judgment?: LocalJudgment, archive?: ToolEvidenceArchive) {
+  constructor(tasks: TaskEngine, approval: ToolApprovalBroker, judgment?: LocalJudgment, archive?: ToolEvidenceArchive,
+    onRepeatedFailure: () => void = () => {}) {
     this.#tasks = tasks
     this.#approval = approval
     this.#judgment = judgment
     this.#archive = archive
+    this.#onRepeatedFailure = onRepeatedFailure
+  }
+
+  guard(tool: ExecutionTool, event: () => EventDraft, signal: AbortSignal, workspaceTool?: WorkspaceTool): ExecutionTool {
+    return { ...tool, execute: async (id, input, toolSignal) => {
+      if (this.#closed || signal.aborted || toolSignal?.aborted) return unavailable
+      const key = callFingerprint(tool.name, input)
+      const previous = key ? this.#failures.get(key) : undefined
+      if (previous && previous.count >= failureLimit) {
+        let effect = workspaceTool?.effect ?? 'read'
+        try { effect = workspaceTool?.policy?.effectFor?.(input) ?? effect } catch { /* Use the declared effect. */ }
+        try { this.#tasks.auditToolDenial(event(), tool.name, effect, 'repeated_failure') }
+        catch { /* A diagnostic cannot re-enable the call. */ }
+        this.#onRepeatedFailure()
+        return { ok: false, error: 'Repeated tool failure. This unchanged call was blocked.', retryAdvice }
+      }
+      const result = await tool.execute(id, input, toolSignal)
+      if (!key || this.#closed || signal.aborted || toolSignal?.aborted || !result ||
+        typeof result !== 'object' || !('ok' in result)) return result
+      if (result.ok === true && !workspaceTool?.policy?.deferred) this.#failures.delete(key)
+      if (result.ok !== false) return result
+      const count = this.#recordFailure(key, workspaceTool ? toolPaths(workspaceTool, input) : [])
+      return count === failureLimit ? { ...result, retryAdvice } : result
+    } }
+  }
+
+  #recordFailure(key: string, paths: string[]): number {
+    const count = (this.#failures.get(key)?.count ?? 0) + 1
+    this.#failures.delete(key)
+    this.#failures.set(key, { count, paths })
+    if (this.#failures.size > 256) this.#failures.delete(this.#failures.keys().next().value!)
+    return count
+  }
+
+  #resetRelatedFailures(changes: string[]) {
+    for (const [key, { paths }] of this.#failures) {
+      if (changes.some(change => paths.some(path =>
+        path === change || path.startsWith(change + '/') || change.startsWith(path + '/')))) this.#failures.delete(key)
+    }
   }
 
   wrap(tool: WorkspaceTool, workspace: CodingWorkspace, event: () => EventDraft, signal: AbortSignal,
@@ -100,7 +174,7 @@ export class ToolRun {
               if (!tool.policy?.deferred || deferred || this.#closed) throw new Error('Deferred operation not permitted')
               if (operation.pid !== undefined) this.#tasks.attachProcess(ref.taskId, operationId, operation.pid)
               deferred = true
-              this.#register(operationId, ref, operation)
+              this.#register(operationId, ref, operation, callFingerprint(tool.name, input), toolPaths(tool, input), combined)
             },
             onCleanup: (cleanup) => {
               if (this.#closed || this.#cleanup.size >= 32) throw new Error('Tool resource capacity exhausted')
@@ -123,6 +197,7 @@ export class ToolRun {
           this.#finish(ref, operationId, successful ? 'succeeded' : 'failed', reason, changedPaths)
         }
         if (!deferred && successful) {
+          if (effect === 'write') this.#resetRelatedFailures(writeProgress(tool, input, result))
           evidence?.add(operationId)
           if (target && (tool.name === 'read_text_file' || tool.name === 'view_image' || effect === 'write')) artifacts?.add(target)
         }
@@ -168,9 +243,14 @@ export class ToolRun {
     }
   }
 
-  #register(id: string, event: EventDraft, operation: DeferredToolOperation): void {
+  #register(id: string, event: EventDraft, operation: DeferredToolOperation, key: string | undefined, paths: string[], signal: AbortSignal): void {
     const settled = operation.completion.catch(() => 'unknown_effect' as const)
-      .then(status => this.#finish(event, id, status)).finally(() => this.#deferred.delete(id))
+      .then(status => {
+        this.#finish(event, id, status)
+        if (!key || this.#closed || signal.aborted) return
+        if (status === 'failed') this.#recordFailure(key, paths)
+        if (status === 'succeeded') this.#failures.delete(key)
+      }).finally(() => this.#deferred.delete(id))
     this.#deferred.set(id, { stop: () => operation.stop(), settled })
     void settled.catch(() => {})
   }
@@ -178,6 +258,7 @@ export class ToolRun {
   async close(): Promise<void> {
     this.#closed = true
     this.#evidenceAccess.clear()
+    this.#failures.clear()
     const work = [...this.#deferred.values()].map(async resource => {
       await resource.stop()
       await resource.settled

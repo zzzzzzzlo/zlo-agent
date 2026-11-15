@@ -14,7 +14,6 @@ const grant = {
   scopePath: { ...string, maxLength: 512 },
   tools: { type: 'array', maxItems: 128, uniqueItems: true, items: { ...string, maxLength: 64 } },
   budget: { type: 'object', additionalProperties: false, properties: {
-    tokens: { type: 'integer', minimum: 1, maximum: 10_000_000 },
     requests: { type: 'integer', minimum: 1, maximum: 512 },
     timeMs: { type: 'integer', minimum: 1, maximum: 3_600_000 },
   } },

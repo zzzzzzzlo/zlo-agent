@@ -41,14 +41,15 @@ Root 使用 `delegate_task` 或 `propose_task_plan`，Team 可用 `delegate_work
 | 配置 | 默认值与效果 |
 | --- | --- |
 | `ZLO_AGENT_HARNESS_MODE` | `quality` 使用 Pi 默认推理策略，Root 15 分钟、子节点 5 分钟。`fast` 请求低推理强度，Root 10 分钟、子节点 2 分钟。父 Run 可提前取消子节点，节点也可申请更短的 `timeMs`。 |
-| `ZLO_AGENT_TASK_TOKEN_LIMIT` | 默认每任务 2,000,000 Token。可在 Host 启动环境调整。 |
 | `ZLO_AGENT_TASK_REQUEST_LIMIT` | 默认每任务 96 次请求。可在 Host 启动环境调整。 |
 
-输出上限由 Pi 模型目录和剩余额度共同决定。支持限制输出的 Provider 使用 Host 实际批准的 `maxTokens`。ChatGPT 账号路由按其模型上限预留。重试和压缩各自占用预算。已确认的 Token 按实际用量结算，缺报的预留在重启后继续按不确定用量记账。中台可从 `agent.started` 与 `model.reserved`、`model.reservation_settled` 读取策略、预算和核销结果。配置随 Host 启动生效。
+Root 和委派节点的累计 Token 仅计量。旧的 `ZLO_AGENT_TASK_TOKEN_LIMIT` 与委派 `budget.tokens` 不再生效。单请求使用 Pi 和 Provider 的上下文、输出能力，累计用量不会缩减 `maxTokens`。重试和压缩仍计入请求次数。实际用量和未报告的预留继续持久化，中台从 `model.reserved`、`model.reservation_settled` 读取关联。
+
+工具层以同一次 Agent 运行中的工具名和规范化参数识别重复失败。首次失败加三次同参数重试后，工具结果保留原错误并提示修正参数或换方法。再提交相同调用时，Host 在审批和执行前拦截，记录 `tool.denied/repeated_failure`。Root 保存检查点进入可恢复的 `tool_retry_loop`，子节点报告自己的失败。修改参数可以尝试新方案，同一运行内有相关路径的成功写入会清除过期的失败计数。结果未知的外部副作用继续走现有核对流程。参考 [DSH 重复调用设计](https://github.com/deepseek-ai/deepseek-harness/blob/master/.agents/notes/archived/feature/2026-07-08-repeat-tool-guard.md) 与 [OpenHands 纠正提示](https://github.com/OpenHands/software-agent-sdk/blob/main/openhands-sdk/openhands/sdk/conversation/stuck_detector.py)。
 
 ## 复现真实视觉对照
 
-将 `567f463` 放入独立工作区并安装同一份锁定依赖。用本地授权的 DeepSeek API Key 作为进程环境变量运行现有对照脚本。下面的设置让两版使用相同的遮挡初稿和外层预算。为避免浏览器启动并发影响观察，分别运行两个场景。
+将 `567f463` 放入独立工作区并安装同一份锁定依赖。用本地授权的 DeepSeek API Key 作为进程环境变量运行现有对照脚本。两版使用相同初稿、请求次数和超时，`ZLO_VISUAL_BENCH_TOKENS` 仅传给旧版基线。报告记录各自的上限，比较用量时应考虑这个差异。
 
 ```powershell
 $env:ZLO_VISUAL_BENCH_SEEDED = '1'

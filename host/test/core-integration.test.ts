@@ -493,18 +493,81 @@ test('the official Pi session runs a plan, a writing Team and a nested worker th
   }
 })
 
-test('the budget gate denies a provider request before the execution backend does any work', async () => {
+test('the request-count gate denies a second provider request before sending it', async () => {
   const env = await fixture()
   let executed = false
-  const execution = new ScriptExecution(async () => { executed = true; return 'Unexpected' })
-  const host = new LocalAgentHost({ ...env, execution, modelLimits: { tokens: 99 } })
+  const execution = new ScriptExecution(async config => {
+    config.reserveRequest?.({ route, estimatedInputTokens: 5, maxOutputTokens: 25, kind: 'compaction' })
+    executed = true
+    return 'Unexpected'
+  })
+  const host = new LocalAgentHost({ ...env, execution, modelLimits: { requests: 1 } })
   try {
     const { taskId } = await host.createTask({ requestId: 'budget-limit', goal: 'Run', cwd: env.workspace })
     await host.idle()
     assert.equal(host.getTask(taskId).reason, 'budget_exhausted')
     assert.equal(executed, false)
-    assert.ok(!host.events(taskId).some(event => event.type === 'model.request_started'))
+    assert.equal(host.events(taskId).filter(event => event.type === 'model.request_started').length, 1)
     assert.deepEqual(await host.command({ type: 'getRouteStatus', schemaVersion: 1 }), { quota: 'unknown', activeReservations: 0 })
+  } finally {
+    await host.close()
+    await rm(env.path, { recursive: true, force: true })
+  }
+})
+
+test('Pi gets correction advice, blocks the fourth unchanged retry, and resumes with a corrected patch', async () => {
+  const env = await fixture()
+  const path = 'src/patch.txt'
+  await writeFile(join(env.workspace, path), 'Actual original text.\n')
+  const defaultRoute = { provider: 'faux', model: 'retry-guard' }
+  const faux = fauxProvider({ models: [{ id: defaultRoute.model }] })
+  const execution = new PiExecution(async () => {
+    const runtime = await ModelRuntime.create({
+      authPath: join(env.path, 'faux-auth.json'), modelsPath: null, allowModelNetwork: false, refreshOnCreate: false,
+    })
+    runtime.registerNativeProvider(faux.provider)
+    return runtime
+  })
+  const patch = (oldText: string) => fauxAssistantMessage(fauxToolCall('apply_patch', { edits: [{
+    path, oldText, newText: 'Updated text.',
+  }] }), { stopReason: 'toolUse' })
+  let sawAdvice = false
+  faux.setResponses([
+    patch('Stale text.'), patch('Stale text.'), patch('Stale text.'), patch('Stale text.'),
+    context => {
+      const tool = context.messages.findLast(message => message.role === 'toolResult')
+      const result = tool?.content[0]
+      if (result?.type === 'text') {
+        const parsed = JSON.parse(result.text)
+        sawAdvice = tool?.isError === true && typeof parsed.error === 'string' && typeof parsed.retryAdvice === 'string'
+      }
+      return patch('Stale text.')
+    },
+  ])
+  const host = new LocalAgentHost({ ...env, execution, defaultRoute })
+  try {
+    const { taskId } = await host.createTask({
+      requestId: 'retry-loop', goal: 'Update patch.txt', cwd: env.workspace, route: defaultRoute, workspaceAccess: 'write',
+      check: { path, contains: 'Updated text.' },
+    })
+    await host.idle()
+    assert.equal(sawAdvice, true)
+    assert.equal(await readFile(join(env.workspace, path), 'utf8'), 'Actual original text.\n')
+    assert.equal(host.getTask(taskId).status, 'blocked')
+    assert.equal(host.getTask(taskId).reason, 'tool_retry_loop')
+    const events = host.events(taskId)
+    assert.equal(events.filter(event => event.type === 'tool.finished' && event.payload.tool === 'apply_patch' &&
+      event.payload.status === 'failed').length, 4)
+    assert.equal(events.filter(event => event.type === 'tool.denied' && event.payload.reason === 'repeated_failure').length, 1)
+    const firstSession = events.find(event => event.type === 'agent.started')?.sessionId
+    assert.ok(firstSession)
+    faux.setResponses([patch('Actual original text.'), fauxAssistantMessage('Patched.')])
+    assert.equal(host.resume(taskId, 'retry-loop-resume').accepted, true)
+    await host.idle()
+    assert.equal(host.getTask(taskId).status, 'succeeded')
+    assert.equal(await readFile(join(env.workspace, path), 'utf8'), 'Updated text.\n')
+    assert.deepEqual(host.events(taskId).filter(event => event.type === 'agent.started').map(event => event.sessionId),
+      [firstSession, firstSession])
   } finally {
     await host.close()
     await rm(env.path, { recursive: true, force: true })

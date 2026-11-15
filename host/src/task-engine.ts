@@ -14,7 +14,6 @@ export interface WorkerResult {
   remainingRisks: string[]
 }
 export interface NodeBudget {
-  tokens?: number
   requests?: number
   timeMs?: number
 }
@@ -210,16 +209,19 @@ function separateWorktrees(left?: string, right?: string): boolean {
 }
 const nodeAccessRank: Record<WorkspaceAccess, number> = { read: 0, write: 1, trusted: 2 }
 const canWrite = (access?: WorkspaceAccess) => access === 'write' || access === 'trusted'
-const nodeBudgetLimits = { tokens: 10_000_000, requests: 512, timeMs: 3_600_000 } as const
+const nodeBudgetLimits = { requests: 512, timeMs: 3_600_000 } as const
 
 function planBudget(value: NodeBudget): NodeBudget {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Invalid node budget')
+  const budget: NodeBudget = {}
   for (const [key, count] of Object.entries(value)) {
+    if (key === 'tokens') continue // Older callers may still send a retired limit.
     if (!Object.hasOwn(nodeBudgetLimits, key) || !Number.isSafeInteger(count) || count < 1 || count > nodeBudgetLimits[key as keyof NodeBudget]) {
       throw new Error('Invalid node budget')
     }
+    budget[key as keyof NodeBudget] = count
   }
-  return { ...value }
+  return budget
 }
 
 function planTools(value: string[]): string[] {
@@ -558,7 +560,7 @@ export class TaskEngine {
       node.access === access && node.scopePath === path &&
       JSON.stringify(node.tools) === JSON.stringify(tools) &&
       (node.budget === undefined) === (budget === undefined) &&
-      node.budget?.tokens === budget?.tokens && node.budget?.requests === budget?.requests && node.budget?.timeMs === budget?.timeMs &&
+      node.budget?.requests === budget?.requests && node.budget?.timeMs === budget?.timeMs &&
       JSON.stringify(node.check) === JSON.stringify(check))
     return prior ?? this.proposePlan(taskId, requestId, task.planVersion,
       [{ ref: 'child', role: 'worker', parentNodeId, goal, access, scopePath: path, tools, budget, check }])[0]!
@@ -926,7 +928,7 @@ export class TaskEngine {
     this.#db.transaction(() => { this.#db.append({ ...event, type: 'tool.approval_resolved', payload: { id, tool, approved, approvalKind } }) })
   }
 
-  auditToolDenial(event: EventDraft, tool: string, effect: 'read' | 'write', reason: 'policy' | 'approval_safety'): void {
+  auditToolDenial(event: EventDraft, tool: string, effect: 'read' | 'write', reason: 'policy' | 'approval_safety' | 'repeated_failure'): void {
     this.#db.transaction(() => { this.#db.append({ ...event, type: 'tool.denied', payload: { tool, effect, reason } }) })
   }
 
@@ -1011,7 +1013,7 @@ export class TaskEngine {
         return this.#finish(task, 'stopped', task.stopIntent?.source === 'shutdown' ? 'host_shutdown' : 'user_stop', 'task.stopped')
       }
       if (reason === 'process_interrupted' || reason === 'model_interrupted') return this.#finish(task, 'stopped', reason, 'task.stopped')
-      if (reason === 'model_error' || reason === 'model_output_limit') return this.#finish(task, 'blocked', reason)
+      if (reason === 'model_error' || reason === 'model_output_limit' || reason === 'tool_retry_loop') return this.#finish(task, 'blocked', reason)
       return this.#finish(task, 'failed', reason)
     })
   }

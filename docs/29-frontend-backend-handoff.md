@@ -17,7 +17,7 @@ Renderer 通过 `window.agentHost`、`window.agentManagement`、`window.agentCha
 | 侧边栏与新建会话 | 列表、创建、重命名、归档、系统目录选择 | `agentHost` 的会话方法 |
 | 对话、编辑器与工具卡 | 分页历史、流式文本、工具状态、追加指令、停止、恢复 | `getHistory`、会话事件及操作方法 |
 | 对话工具栏 | 当前模型、待应用模型、会话权限 | `setConversationModel`、`setWorkspaceAccess` |
-| 会话中台抽屉 | 当前会话累计 Token、估算成本、工具调用次数和最近任务预算 | `conversationObservatory` |
+| 会话中台抽屉 | 当前会话累计 Token、估算成本、工具调用次数和最近任务用量 | `conversationObservatory` |
 | API 接入与账号 | DeepSeek、OpenAI、Anthropic、Google 的凭证、连接测试和模型目录。独立的 ChatGPT 登录与登出 | `snapshot({})`、Provider 方法、`agentChatGpt` |
 | 执行策略与工具 | 默认工作区权限、默认模型、自动或固定选模、工具开关、搜索 Provider | `snapshot({})`、`savePreferences` |
 | 任务详情与异常核对 | 任务状态、DAG、Root/Team/Worker、用量、验收、操作回执、未知副作用探测 | `snapshot({ conversationId })`、`reconcile` |
@@ -89,7 +89,7 @@ Renderer 通过 `window.agentHost`、`window.agentManagement`、`window.agentCha
 | 方法 | 参数 | 返回值和行为 |
 | --- | --- | --- |
 | `snapshot(input)` | `{ conversationId?: string }`，全局页传 `{}` | `ManagementSnapshot`，含版本、偏好、Provider、工具、脱敏诊断。指定会话时还返回会话摘要、最多 20 个最近任务和作用域内记忆。 |
-| `conversationObservatory(input)` | `{ conversationId }` | `ConversationObservatory`，含总轮数、四类 Token、模型请求和用量覆盖、估算费用、工具状态计数及可选最近任务预算。 |
+| `conversationObservatory(input)` | `{ conversationId }` | `ConversationObservatory`，含总轮数、四类 Token、模型请求和用量覆盖、估算费用、工具状态计数及可选最近任务用量。 |
 | `recentDiagnostics()` | 无 | `ManagedDiagnostic[]`，含时间、模块、类别、错误码、摘要和 `correlationId`。 |
 | `savePreferences(input)` | 完整 `AgentPreferences` 对象 | 保存后返回偏好。先读取快照再按字段合并，放宽策略可能弹出原生确认。 |
 | `setWorkspaceAccess(input)` | `{ conversationId, access }` | 更新后的 `ConversationSummary`。提升需要 Main 确认工作区，运行中先停止才能提升。收紧会让活动任务收敛。 |

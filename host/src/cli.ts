@@ -55,7 +55,6 @@ async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Pro
     const modelId = process.env.ZLO_AGENT_MODEL_ID
     const harnessMode = process.env.ZLO_AGENT_HARNESS_MODE ?? 'quality'
     if (harnessMode !== 'quality' && harnessMode !== 'fast') throw new Error('Invalid harness mode')
-    const tokens = configuredLimit(process.env.ZLO_AGENT_TASK_TOKEN_LIMIT)
     const requests = configuredLimit(process.env.ZLO_AGENT_TASK_REQUEST_LIMIT)
     const defaultRoute = mode === '--faux' ? { provider: 'faux', model: 'desktop-test' }
       : modelProvider || modelId ? parseRoute({ provider: modelProvider, model: modelId }) : undefined
@@ -106,7 +105,7 @@ async function startHost(args: string[], bootstrap?: AsyncIterator<string>): Pro
     const host = new LocalAgentHost({
       directory, execution, runtimeId, providerRuntime, defaultRoute, jevKey, judgeKeys, defaultWorkspace: process.env.ZLO_AGENT_DEFAULT_WORKSPACE,
       jevFetch: bootstrap ? openCodeJudgeFetch(process.env.ZLO_OPENCODE_JUDGE_PROXY) : undefined,
-      harnessMode, modelLimits: { ...(tokens === undefined ? {} : { tokens }), ...(requests === undefined ? {} : { requests }) },
+      harnessMode, modelLimits: requests === undefined ? undefined : { requests },
     })
     return { host, runtimeId }
   } catch {

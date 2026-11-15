@@ -106,7 +106,7 @@ export interface ConversationObservatory {
   pricedReports: number
   estimatedCostUsd: number | null
   tools: { name: string; status: string; count: number }[]
-  latestTask?: { id: string; tokenLimit: number; requests: number; confirmed: number; reserved: number; uncertain: number }
+  latestTask?: { id: string; tokenLimit?: number; requests: number; confirmed: number; reserved: number; uncertain: number }
 }
 
 export interface DesktopManagementApi {

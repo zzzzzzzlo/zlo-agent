@@ -134,9 +134,8 @@ function ObservatoryTotals({ snapshot }: { snapshot: ConversationObservatory }) 
         </dl>
       </section>}
       {latestTask && <section className="observatory-section">
-        <h3>最近任务预算</h3>
-        <div className="observatory-budget"><span>已确认用量</span><strong>{format.format(latestTask.confirmed)} / {format.format(latestTask.tokenLimit)}</strong></div>
-        <meter min={0} max={latestTask.tokenLimit} value={Math.min(latestTask.tokenLimit, latestTask.confirmed)} aria-label="最近任务 Token 预算" />
+        <h3>最近任务用量</h3>
+        <div className="observatory-budget"><span>已确认 Token</span><strong>{format.format(latestTask.confirmed)}</strong></div>
         <p className="observatory-coverage">已预留 {format.format(latestTask.reserved)} · 未确认 {format.format(latestTask.uncertain)}</p>
       </section>}
       <details className="observatory-section observatory-tools">

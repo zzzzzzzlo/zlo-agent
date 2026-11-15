@@ -109,3 +109,57 @@ test('input-dependent tool authorization preserves read scope, approval and writ
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('only relevant workspace changes clear unchanged tool failures, and guards are isolated per run', async () => {
+  const path = await mkdtemp(join(tmpdir(), 'zlo-tool-retries-'))
+  const db = new LocalStore(':memory:')
+  try {
+    const workspace = new CodingWorkspace(path)
+    const tasks = new TaskEngine(db)
+    const { taskId } = tasks.create({ requestId: 'retry-scope', cwd: path, goal: 'Edit sample' })
+    const task = tasks.start(taskId)
+    const event = { taskId, taskNodeId: task.rootNodeId, taskAttemptId: task.attemptId, agentRunId: 'retry-root', type: '', payload: {} }
+    const signal = new AbortController().signal
+    let blocked = 0
+    let executes = 0
+    let changes = false
+    let corrected = false
+    const run = new ToolRun(tasks, new ToolApprovalBroker(), undefined, undefined, () => { blocked++ })
+    const worker = new ToolRun(tasks, new ToolApprovalBroker())
+    const patch: WorkspaceTool = {
+      name: 'fixture_patch', description: '', parameters: {}, effect: 'write',
+      async execute(_id, input) {
+        executes++
+        return corrected || (input as { text: string }).text === 'new plan' ? { ok: true } : { ok: false, error: 'Original mismatch' }
+      },
+    }
+    const edit: WorkspaceTool = {
+      name: 'fixture_edit', description: '', parameters: {}, effect: 'write',
+      async execute() { return { ok: true, changed: changes } },
+    }
+    const bound = (toolRun: ToolRun, tool: WorkspaceTool) =>
+      toolRun.guard(toolRun.wrap(tool, workspace, () => event, signal, () => true), () => event, signal, tool)
+    const failing = bound(run, patch)
+    const change = bound(run, edit)
+    const input = { path: 'sample.txt', text: 'stale' }
+    for (let i = 0; i < 4; i++) await failing.execute('initial-' + i, input)
+    const otherArgs = await failing.execute('corrected-args', { ...input, path: 'other.txt', text: 'new plan' })
+    assert.deepEqual(otherArgs, { ok: true })
+    await change.execute('noop', { path: input.path })
+    changes = true
+    await change.execute('different-file', { path: 'elsewhere.txt' })
+    assert.deepEqual(await bound(worker, patch).execute('worker-first', input), { ok: false, error: 'Original mismatch' })
+    assert.equal(blocked, 0)
+    await failing.execute('unchanged', { text: input.text, path: input.path })
+    assert.equal(blocked, 1)
+    assert.equal(executes, 6)
+    await change.execute('changed-file', { path: input.path })
+    corrected = true
+    assert.deepEqual(await failing.execute('now-fixed', input), { ok: true })
+    assert.equal(executes, 7)
+    await Promise.all([run.close(), worker.close()])
+  } finally {
+    db.close()
+    await rm(path, { recursive: true, force: true })
+  }
+})

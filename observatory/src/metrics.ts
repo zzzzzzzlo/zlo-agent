@@ -167,8 +167,8 @@ function modelMetrics(spans: TraceSpan[], complete: boolean): Metric[] {
       'Cumulative input-plus-output reservation estimates, including settled requests.', { complete, estimated: true }),
     values('model.output_budget', 'Mean per-request output cap', 'tokens', requested.map(span => quantity(span.detail.maxOutputTokens)),
       'Mean configured max output tokens for requests where Host recorded that cap.', { complete, aggregate: 'mean' }),
-    values('model.task_token_limit', 'Largest observed task token limit', 'tokens', requested.map(span => quantity(span.detail.taskTokenLimit)),
-      'Maximum configured task token limit among selected reservations. This is a Host limit, independent of provider quota.',
+    values('model.task_token_limit', 'Historical task Token limit', 'tokens', requested.map(span => quantity(span.detail.taskTokenLimit)),
+      'Maximum legacy Host task Token limit recorded in the selected reservations. Current Host tasks have no cumulative Token limit.',
       { complete, aggregate: 'max' }),
     values('model.budget_open', 'Open token estimates', 'tokens', requested.filter(span => !span.end).map(span => quantity(span.detail.estimatedTokens)),
       'Estimated tokens reserved by requests without a settlement.', { complete, estimated: true }),
@@ -422,6 +422,9 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
       observed('reliability.stopped', 'Stopped transitions', 'task.stopped', 'Observed Task stop transitions.'),
       observed('reliability.resumed', 'Resumes', 'task.resumed', 'Observed accepted resume transitions.'),
       observed('reliability.output_recoveries', 'Output recovery', 'model.output_recovery', 'Model continuation triggered by the output cap.'),
+      count('reliability.tool_retry_blocks', 'Unchanged tool retries blocked',
+        toolDenials.filter(event => event.payload.reason === 'repeated_failure').length,
+        'Tool calls rejected before execution after repeating failed arguments.', complete),
       count('reliability.incomplete_streams', 'Incomplete streams', traces.filter(trace => !trace.coverage.complete).length,
         'Task streams with cursor gaps or conflicting sequences.'),
       count('reliability.missing_events', 'Missing events', traces.reduce((sum, trace) => sum + trace.coverage.missingEvents, 0),
@@ -429,7 +432,7 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
       count('reliability.unpaired', 'Unpaired span events', traces.reduce((sum, trace) => sum + trace.coverage.unpairedEvents, 0),
         'Unmatched span endpoints, ambiguous request starts or usage records without a safely matched reservation.'),
       ...['runtime_error', 'process_interrupted', 'model_interrupted', 'checkpoint_error', 'user_stop', 'host_shutdown', 'stop_timeout',
-        'model_error', 'model_output_limit', 'budget_exhausted', 'unknown_effect', 'verification_failed'].map(reason =>
+        'model_error', 'model_output_limit', 'budget_exhausted', 'tool_retry_loop', 'unknown_effect', 'verification_failed'].map(reason =>
         count(`reliability.reason.${reason}`, reason, ended.filter(trace => trace.task.reason === reason).length, 'Current Host end reason.')),
     ],
     security: [

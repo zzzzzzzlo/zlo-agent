@@ -42,6 +42,7 @@ const reasons: Partial<Record<EndReason, string>> = {
   checkpoint_error: '会话检查点不可用。请先核对执行记录。',
   stop_timeout: '停止未在规定时间内完成，需要人工核对。',
   budget_exhausted: '任务达到本轮执行预算。',
+  tool_retry_loop: '同一工具使用相同参数连续失败，执行已暂停。可以补充说明或恢复执行。',
 }
 
 function toTool(tool: ConversationTool): ToolUpdate {

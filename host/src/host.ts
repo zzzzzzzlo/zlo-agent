@@ -587,7 +587,7 @@ export class LocalAgentHost {
       }
       return management.taskView(task, events, this.#engine.operations(task.id),
         this.#capabilities.root(task.workspaceAccess, Boolean(task.check)).access,
-        { tokenLimit: this.#scheduler.tokenLimit, ...this.#scheduler.budget(task.id) })
+        this.#scheduler.budget(task.id))
     })
     if (memory) memory.recalls = memory.recalls.sort((a, b) => b.timestamp - a.timestamp).slice(0, 100)
     // Catalog generation is static. Use the private workspace only as a descriptor if a project was removed.
@@ -734,7 +734,7 @@ export class LocalAgentHost {
       case 'managementSnapshot': return this.managementSnapshot(command.conversationId)
       case 'conversationObservatory': {
         const { latestTaskId, ...activity } = this.#conversations.activity(management.id(command.conversationId))
-        return { ...activity, latestTask: latestTaskId ? { id: latestTaskId, tokenLimit: this.#scheduler.tokenLimit,
+        return { ...activity, latestTask: latestTaskId ? { id: latestTaskId,
           ...this.#scheduler.budget(latestTaskId) } : undefined }
       }
       case 'saveAgentPreferences': return this.saveAgentPreferences(command.preferences)

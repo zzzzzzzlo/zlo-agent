@@ -12,11 +12,11 @@ import { visualBicycle } from './fixtures/visual-bicycle.ts'
 const route = { provider: 'deepseek', model: 'deepseek-flash' }
 const tasks = { pelican: '鹈鹕', crocodile: '鳄鱼' } as const
 const baselinePath = process.argv[2], outputPath = process.argv[3], selected = process.argv[4], variant = process.argv[5]
-const tokenBudget = Number(process.env.ZLO_VISUAL_BENCH_TOKENS ?? '160000')
+const baselineTokenBudget = Number(process.env.ZLO_VISUAL_BENCH_TOKENS ?? '160000')
 const seeded = process.env.ZLO_VISUAL_BENCH_SEEDED === '1'
 if (!baselinePath || !outputPath || selected && selected !== 'both' && !Object.hasOwn(tasks, selected) ||
   variant && variant !== 'before' && variant !== 'after' || !process.env.DEEPSEEK_API_KEY ||
-  !Number.isSafeInteger(tokenBudget) || tokenBudget < 80_000 || tokenBudget > 320_000) {
+  !Number.isSafeInteger(baselineTokenBudget) || baselineTokenBudget < 80_000 || baselineTokenBudget > 320_000) {
   process.stderr.write('Set DEEPSEEK_API_KEY locally. Usage: node host/scripts/visual-benchmark.ts <baseline checkout> <output directory> [both|pelican|crocodile] [before|after]\n')
   process.exit(2)
 }
@@ -34,7 +34,8 @@ async function run(name: string, animal: typeof tasks[keyof typeof tasks], phase
   const execution = phase === 'before' ? new baselinePi.PiExecution() : new PiExecution()
   await execution.setProviderKey('deepseek', key)
   const Host = phase === 'before' ? baselineHost.LocalAgentHost : LocalAgentHost
-  const host = new Host({ directory: join(root, 'state'), execution, modelLimits: { requests: 12, tokens: tokenBudget } })
+  const modelLimits = { requests: 12, ...(phase === 'before' ? { tokens: baselineTokenBudget } : {}) }
+  const host = new Host({ directory: join(root, 'state'), execution, modelLimits })
   const started = performance.now()
   let stop: NodeJS.Timeout | undefined
   try {
@@ -55,7 +56,8 @@ async function run(name: string, animal: typeof tasks[keyof typeof tasks], phase
     const render = await createPreviewTools(new CodingWorkspace(workspace))[0].execute('benchmark-review',
       { path: 'index.html', width: seeded ? 640 : 800, height: seeded ? 360 : 600, timesMs: [0, 450, 900] }) as { ok: boolean; samples?: unknown[]; [toolImages]?: ToolImage[] }
     for (const [index, frame] of (render[toolImages] ?? []).entries()) await writeFile(join(root, `frame-${index}.jpg`), frame.bytes)
-    const result = { scenario: name, phase, seeded, tokenBudget, taskStatus: task.status, reason: task.reason, elapsedMs,
+    const result = { scenario: name, phase, seeded, tokenBudget: phase === 'before' ? baselineTokenBudget : null,
+      taskStatus: task.status, reason: task.reason, elapsedMs,
       modelRequests: events.filter(event => event.type === 'model.request_started').length,
       reportedUsage: usage.length, input: total('input'), output: total('output'), cacheRead: total('cacheRead'), cacheWrite: total('cacheWrite'),
       internalPreviews: preview.length, visualRounds: events.filter(event => event.type === 'visual.round_finished').map(event => event.payload),

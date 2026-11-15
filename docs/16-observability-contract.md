@@ -30,4 +30,4 @@
 
 消费端应忽略未识别的可选字段和事件类型。所有绝对路径、原始工具输出、Prompt、凭证及 Pi Session 文件留在所属业务或本机存储。中台按任务、节点、Agent Run 和操作 ID 聚合。采集前按自身授权限定访问范围与留存期，观测投影保持只读。
 
-当前预留事件可附带 `estimatedInputTokens`、`maxOutputTokens`、`taskTokenLimit`，核销记录可附带 `durationMs`，用量可与预留共享 `correlationId`。`memory.recalled` 可附带 `elapsedMs`、`contextBytes`、`budgetBytes`，`memory.captured` 可附带 `elapsedMs`。`tool.denied` 记录工具名、效果类别及有限拒绝原因，`tool.approval_resolved` 可附带批准类型，`task.permissions_changed` 可附带此前访问级别。旧历史缺少这些字段时由消费者保留缺测状态。
+当前预留事件可附带 `estimatedInputTokens`、`maxOutputTokens`、`taskRequestLimit`，核销记录可附带 `durationMs`，用量可与预留共享 `correlationId`。`taskTokenLimit` 仅用于读取历史事件。`memory.recalled` 可附带 `elapsedMs`、`contextBytes`、`budgetBytes`，`memory.captured` 可附带 `elapsedMs`。`tool.denied` 记录工具名、效果类别及有限拒绝原因。原因 `repeated_failure` 表示相同参数的失败重试在执行前被拦截，事件不含工具参数。`tool.approval_resolved` 可附带批准类型，`task.permissions_changed` 可附带此前访问级别。历史缺少的字段保留缺测状态。
