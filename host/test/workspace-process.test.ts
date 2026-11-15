@@ -201,3 +201,36 @@ test('Git inspection ignores workspace executables and disables the repository f
   assert.equal(result.ok, true)
   await assert.rejects(readFile(marker), { code: 'ENOENT' })
 })
+
+test('npm project commands ignore workspace NUL and NUL.txt files and export_artifact blocks reserved destinations', async (t) => {
+  const { root, workspace } = await fixture(t)
+  await writeFile(join(root, 'package.json'), JSON.stringify({
+    scripts: { test: 'node check-env.cjs' },
+  }))
+  await writeFile(join(root, 'NUL.txt'), 'injected-from-nul-txt=1\nscript-shell=bad-shell\n')
+  await writeFile(join(root, 'check-env.cjs'), `
+    console.log(JSON.stringify({
+      injected: process.env.npm_config_injected_from_nul_txt ?? null,
+    }));
+  `)
+  const run = tool(workspace, 'run_project_command')
+  const result = await run({ command: 'npm_test', path: '.' }) as { ok: boolean; stdout: string }
+  assert.equal(result.ok, true)
+  assert.doesNotMatch(result.stdout, /"injected":"1"/u)
+
+  const artifactRoot = await mkdtemp(join(tmpdir(), 'zlo-artifact-dest-'))
+  const privateDir = await mkdtemp(join(tmpdir(), 'zlo-artifact-priv-'))
+  t.after(async () => {
+    await rm(artifactRoot, { recursive: true, force: true })
+    await rm(privateDir, { recursive: true, force: true })
+  })
+  await writeFile(join(root, 'report.txt'), 'artifact payload')
+  const { createArtifactTools } = await import('../src/artifact-tools.ts')
+  const [exportTool] = createArtifactTools(workspace, privateDir)
+  for (const invalidName of ['CONIN$.txt', 'CONOUT$.txt', 'NUL .txt', 'report.txt.', 'report.txt ']) {
+    const denied = await exportTool!.execute('exp', { path: 'report.txt' }, undefined, {
+      taskId: 't1', agentRunId: 'a1', destination: join(artifactRoot, invalidName), onCleanup() {}, defer() {},
+    })
+    assert.deepEqual(denied, { ok: false, error: 'The selected destination is not eligible for export' })
+  }
+})

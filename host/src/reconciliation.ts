@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { lstat } from 'node:fs/promises'
 import type { FilePostcondition, Operation } from './task-engine.ts'
-import type { CodingWorkspace } from './workspace.ts'
+import type { CodingWorkspace, WorkspaceAccess } from './workspace.ts'
 
 async function identity(workspace: CodingWorkspace): Promise<string> {
   const stat = await lstat(workspace.root, { bigint: true })
@@ -25,12 +25,13 @@ export async function prepareFilePostcondition(
 }
 
 export async function probeOperation(
-  workspace: CodingWorkspace, operation: Operation,
+  workspace: CodingWorkspace, operation: Operation, access: WorkspaceAccess = 'read',
 ): Promise<NonNullable<Operation['reconciliation']>> {
   const unresolved = (evidence: string) => ({ status: 'unresolved' as const, evidence })
   const signal = AbortSignal.timeout(2500)
   if (operation.worktreeId) return unresolved('isolated_worktree_requires_manual_review')
   if (operation.tool.startsWith('git_')) {
+    if (access !== 'trusted') return unresolved('git_probe_requires_trusted_workspace')
     const git = workspace.tools('root', 'trusted').find(tool => tool.name === 'git_status')!
     const result = await git.execute('reconciliation', {}, signal).catch(() => undefined)
     if (result && typeof result === 'object' && 'ok' in result && result.ok &&

@@ -63,9 +63,12 @@ export async function evaluationEvidence(history: { task: TaskSnapshot; attempts
           }
           const excerpt = clean(text, 4_000)
           const diffs = []
-          for (const staged of [true, false]) {
-            const diff = await workspace.gitDiffSnapshot(path, staged, signal).catch(() => undefined)
-            if (diff?.ok && 'stdout' in diff && diff.stdout) diffs.push(diff.stdout)
+          const trustedGit = task.workspaceAccess === 'trusted' && (!node || node.access === 'trusted')
+          if (trustedGit) {
+            for (const staged of [true, false]) {
+              const diff = await workspace.gitDiffSnapshot(path, staged, signal).catch(() => undefined)
+              if (diff?.ok && 'stdout' in diff && diff.stdout) diffs.push(diff.stdout)
+            }
           }
           const diff = clean(diffs.join('\n'), 4_000)
           artifacts.push({ path, digest: telemetryDigest(text), bytes: Buffer.byteLength(text), excerpt, ...(diff ? { diff } : {}) })

@@ -5,6 +5,7 @@ import { containsPath } from './workspace-process.ts'
 import type { CodingWorkspace, WorkspaceTool } from './workspace.ts'
 
 const maxBytes = 32 * 1024 * 1024
+const reservedArtifactName = /^(?:con|prn|aux|nul|conin\$|conout\$|(?:com|lpt)[0-9¹²³])(?: *\.|$)/iu
 
 export function createArtifactTools(workspace: CodingWorkspace, privateDirectory: string): WorkspaceTool[] {
   return [{
@@ -30,7 +31,7 @@ export function createArtifactTools(workspace: CodingWorkspace, privateDirectory
         const directory = await realpath(dirname(destination))
         target = resolve(directory, basename(destination))
         if (relative(resolve(destination), target) || containsPath(workspace.root, target) ||
-          containsPath(privateDirectory, target) || /^(?:con|prn|aux|nul|com[0-9¹²³]|lpt[0-9¹²³])(?:\.|$)/iu.test(basename(target))) {
+          containsPath(privateDirectory, target) || /[ .]$/u.test(basename(target)) || reservedArtifactName.test(basename(target))) {
           return { ok: false, error: 'The selected destination is not eligible for export' }
         }
         const original = await lstat(source)

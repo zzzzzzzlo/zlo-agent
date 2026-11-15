@@ -195,3 +195,107 @@ test('reconciliation verifies a recorded file postcondition after restart and re
     assert.equal(restarted.getHistory(taskId).operations.length, 1)
   } finally { await restarted.close() }
 })
+
+test('evaluation evidence and reconciliation never invoke Git unless workspace access is currently trusted', async (t) => {
+  const { directory, workspace } = await fixture(t)
+  const { execFileSync } = await import('node:child_process')
+  const { CodingWorkspace } = await import('../src/workspace.ts')
+  const { evaluationEvidence } = await import('../src/telemetry-evidence.ts')
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: workspace, stdio: 'ignore', windowsHide: true })
+  git('init', '-q')
+  await writeFile(join(workspace, 'note.txt'), 'initial\n')
+  git('add', '--', 'note.txt')
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'init')
+  await writeFile(join(workspace, 'note.txt'), 'changed\n')
+
+  let gitDiffCalls = 0
+  const originalDiff = CodingWorkspace.prototype.gitDiffSnapshot
+  t.mock.method(CodingWorkspace.prototype, 'gitDiffSnapshot', async function (this: InstanceType<typeof CodingWorkspace>, ...args: Parameters<typeof originalDiff>) {
+    gitDiffCalls++
+    return originalDiff.apply(this, args)
+  })
+
+  const registry = new ExtensionRegistry([{ id: 'git-fault', tools(root, role, access) {
+    return [
+      ...root.tools(role, access).filter(tool => tool.name === 'read_text_file'),
+      ...(access === 'trusted' ? [{
+        name: 'git_commit', description: 'Faulting git commit', effect: 'write' as const,
+        parameters: { type: 'object', additionalProperties: false, properties: {} },
+        async execute() { throw new Error('Simulated crash during git commit') },
+      }] : []),
+    ]
+  } }])
+  registry.registerProfile({ id: 'git-fault', plugins: ['git-fault'], workflow: 'coding', delegation: false, workspaceWrites: true })
+
+  let runMode: 'read_only' | 'git_crash' = 'read_only'
+  const fake = new FakeExecution()
+  const execution: AgentExecution = {
+    validateRoute: route => fake.validateRoute(route),
+    async open(config) {
+      const session = await fake.open(config)
+      return {
+        ...session,
+        async run() {
+          if (runMode === 'git_crash') {
+            await config.tools.find(tool => tool.name === 'git_commit')!.execute('commit-1', {})
+          } else {
+            await config.tools.find(tool => tool.name === 'read_text_file')!.execute('read-1', { path: 'note.txt' })
+          }
+          return { status: 'completed', text: 'Inspected' }
+        },
+      }
+    },
+  }
+
+  const host = new LocalAgentHost({ directory, execution, extensions: registry, profileId: 'git-fault' })
+  try {
+    // 1. Low-privilege ('read' and 'write') evaluationEvidence must not call Git
+    for (const access of ['read', 'write'] as const) {
+      const conv = host.createConversation({ requestId: 'conv-' + access, workspace, workspaceAccess: access })
+      const { taskId } = await host.sendMessage({ requestId: 'msg-' + access, conversationId: conv.id, text: 'Inspect note' })
+      await host.idle()
+      const evidence = await evaluationEvidence(host.getHistory(taskId), undefined, ['note.txt'], AbortSignal.timeout(5_000))
+      assert.equal(evidence.artifacts.length, 1)
+      assert.equal(evidence.artifacts[0]!.diff, undefined)
+    }
+    assert.equal(gitDiffCalls, 0)
+
+    // Trusted task DOES collect Git diff
+    const trustedConv = host.createConversation({ requestId: 'conv-trusted', workspace, workspaceAccess: 'trusted' })
+    const { taskId: trustedTaskId } = await host.sendMessage({ requestId: 'msg-trusted', conversationId: trustedConv.id, text: 'Inspect trusted' })
+    await host.idle()
+    const trustedEvidence = await evaluationEvidence(host.getHistory(trustedTaskId), undefined, ['note.txt'], AbortSignal.timeout(5_000))
+    assert.ok(gitDiffCalls > 0)
+    assert.match(trustedEvidence.artifacts[0]!.diff ?? '', /\+changed/u)
+
+    // 2. Downgrading conversation permission before reconcileOperation must skip Git probe
+    runMode = 'git_crash'
+    const { taskId: crashedTaskId } = await host.sendMessage({ requestId: 'msg-crash', conversationId: trustedConv.id, text: 'Commit note' })
+    await host.idle()
+    assert.equal(host.getTask(crashedTaskId).status, 'needs_reconciliation')
+    const crashedSnapshot = await host.managementSnapshot(trustedConv.id)
+    const opId = crashedSnapshot.tasks[0]!.operations.find(op => op.tool === 'git_commit')!.id
+
+    let gitStatusCalls = 0
+    const originalTools = CodingWorkspace.prototype.tools
+    t.mock.method(CodingWorkspace.prototype, 'tools', function (this: InstanceType<typeof CodingWorkspace>, ...args: Parameters<typeof originalTools>) {
+      return originalTools.apply(this, args).map(tool => tool.name !== 'git_status' ? tool : {
+        ...tool,
+        async execute(...execArgs: Parameters<typeof tool.execute>) {
+          gitStatusCalls++
+          return tool.execute(...execArgs)
+        },
+      })
+    })
+
+    host.setConversationWorkspaceAccess(trustedConv.id, 'write', 'trusted')
+    const downgradedProbe = await host.managementCommand({
+      schemaVersion: 1, type: 'reconcileOperation', conversationId: trustedConv.id, taskId: crashedTaskId, operationId: opId,
+    }) as ManagedOperation
+    assert.equal(downgradedProbe.reconciliation?.status, 'unresolved')
+    assert.equal(downgradedProbe.reconciliation?.evidence, 'git_probe_requires_trusted_workspace')
+    assert.equal(gitStatusCalls, 0)
+  } finally {
+    await host.close()
+  }
+})

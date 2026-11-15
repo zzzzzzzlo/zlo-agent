@@ -29,6 +29,7 @@ const operations: Record<string, string> = {
 }
 const probeLabels: Record<string, string> = {
   isolated_worktree_requires_manual_review: '此操作发生在独立工作树，需要人工检查。',
+  git_probe_requires_trusted_workspace: '当前工作区未授予受信任执行权限，已跳过 Git 状态读取。',
   git_status_observed_without_expected_revision: '已读取 Git 状态，缺少原操作的预期版本。',
   git_status_unavailable: '无法读取 Git 状态。',
   original_process_identity_not_available: '已无法确认原进程身份与执行结果。',

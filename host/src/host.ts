@@ -691,7 +691,10 @@ export class LocalAgentHost {
     let workspace: CodingWorkspace
     try { workspace = this.#workspace(task.cwd) }
     catch { throw new ConversationError('INVALID_INPUT', 'The workspace is unavailable') }
-    const observation = await probeOperation(workspace, operation)
+    const conversation = this.#conversations.get(conversationId)
+    const currentAccess = this.#conversationAccess(conversation) === 'trusted' && task.workspaceAccess === 'trusted'
+      ? 'trusted' : 'read'
+    const observation = await probeOperation(workspace, operation, currentAccess)
     this.#assertOpen()
     if (this.#active) throw new ConversationError('CONFLICT', 'Retry after the active run has stopped')
     return management.managedOperation(this.#engine.recordReconciliation(taskId, id, observation))

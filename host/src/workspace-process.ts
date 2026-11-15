@@ -107,7 +107,7 @@ export function gitInvocation(workspace: string, args: string[]): Invocation | u
     args: [
       '--no-pager', '--no-optional-locks', '--literal-pathspecs',
       '--git-dir', join(workspace, '.git'), '--work-tree', workspace,
-      '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=' + (windows ? 'NUL' : '/dev/null'),
+      '-c', 'core.fsmonitor=false', '-c', 'core.hooksPath=/dev/null',
       ...args,
     ],
   }
@@ -118,8 +118,8 @@ export function processEnvironment(workspace: string, invocation?: Invocation): 
     PATH: trustedPath(workspace).join(delimiter),
     CI: '1',
     NO_COLOR: '1',
-    NPM_CONFIG_USERCONFIG: windows ? 'NUL.txt' : '/dev/stdin',
-    NPM_CONFIG_GLOBALCONFIG: windows ? 'NUL' : '/dev/null',
+    NPM_CONFIG_USERCONFIG: windows ? '\\\\.\\NUL' : '/dev/stdin',
+    NPM_CONFIG_GLOBALCONFIG: windows ? '\\\\?\\NUL' : '/dev/null',
     NPM_CONFIG_LOGS_MAX: '0',
     NPM_CONFIG_UPDATE_NOTIFIER: 'false',
   }
