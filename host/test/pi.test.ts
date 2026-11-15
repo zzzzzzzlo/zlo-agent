@@ -425,3 +425,117 @@ test('default Pi runtime validates an environment route without discovery or a c
   assert.deepEqual(await readdir(piDirectory), [])
   assert.equal(fetch.mock.callCount(), 0)
 })
+
+test('P0-4: Pi pre-compaction treats Already compacted and Nothing to compact as benign no-ops while preserving user stop and real failure diagnostics', async t => {
+  const diagnostics: string[] = []
+  const originalStderrWrite = process.stderr.write.bind(process.stderr)
+  process.stderr.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
+    const text = typeof chunk === 'string' ? chunk : Buffer.from(chunk).toString('utf8')
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue
+      try {
+        const parsed = JSON.parse(line) as { code?: string }
+        if (parsed.code) diagnostics.push(parsed.code)
+      } catch { /* ignore non-json */ }
+    }
+    return (originalStderrWrite as (...args: unknown[]) => boolean)(chunk, ...rest)
+  }) as typeof process.stderr.write
+  t.after(() => { process.stderr.write = originalStderrWrite })
+
+  // 1 & 2: CJK transcript with contextWindow=2000 triggers pi.ts byte-based pre-compaction (>6 messages & >70% window)
+  // while Pi SDK's char-based prepareCompaction (< keepRecentTokens=500) natively throws "Nothing to compact (session too small)",
+  // and appending a tail compaction entry natively throws "Already compacted".
+  const small = await fixture(t, 2000)
+  small.faux.setResponses(Array.from({ length: 6 }, (_item, index) => fauxAssistantMessage(`回复${index}:` + '中文上下文细节'.repeat(32))))
+  const smallSession = await small.execution.open(small.config)
+  try {
+    for (let turn = 0; turn < 5; turn++) {
+      const res = await smallSession.run(`提问${turn}:` + '中文测试输入'.repeat(35))
+      assert.equal(res.status, 'completed')
+    }
+    await smallSession.checkpoint()
+  } finally {
+    await smallSession.dispose()
+  }
+  assert.ok(!diagnostics.includes('host.runtime_failed'))
+
+  const lines = (await readFile(smallSession.ref.path, 'utf8')).trimEnd().split('\n')
+  const lastEntry = JSON.parse(lines.at(-1)!) as { id: string }
+  await appendFile(smallSession.ref.path, JSON.stringify({
+    type: 'compaction', id: 'comp-tail-1', parentId: lastEntry.id,
+    timestamp: new Date().toISOString(), summary: '历史摘要：' + '保留的中文关键结论'.repeat(60),
+    firstKeptEntryId: JSON.parse(lines[1]!).id, tokensBefore: 1600,
+  }) + '\n')
+  small.faux.setResponses([fauxAssistantMessage('Handled after existing compaction')])
+  const alreadyCompactedSession = await small.execution.open({ ...small.config, session: smallSession.ref })
+  try {
+    const res = await alreadyCompactedSession.run('Next prompt after compaction')
+    assert.deepEqual(res, { status: 'completed', text: 'Handled after existing compaction' })
+  } finally {
+    await alreadyCompactedSession.dispose()
+  }
+  assert.ok(!diagnostics.includes('host.runtime_failed'))
+
+  // 3 & 4: Large transcript (>20k tokens with contextWindow=4096) triggers real summarization compaction:
+  // test user stop -> interrupted, provider failure -> model_error + host.model_failed, and SDK reserve failure -> runtime_error + host.runtime_failed
+  const full = await fixture(t, 4096)
+  full.faux.setResponses(Array.from({ length: 16 }, () => fauxAssistantMessage('seed ' + 'evidence '.repeat(130))))
+  const seeded = await full.execution.open(full.config)
+  try {
+    for (let turn = 0; turn < 5; turn++) {
+      assert.equal((await seeded.run('seed prompt ' + turn + ' ' + 'input '.repeat(130))).status, 'completed')
+    }
+    await seeded.checkpoint()
+  } finally {
+    await seeded.dispose()
+  }
+
+  // (a) User stop during compaction
+  const enteredCompact = Promise.withResolvers<void>()
+  full.faux.setResponses([
+    async (_context, options) => {
+      enteredCompact.resolve()
+      await new Promise<void>(resolve => {
+        options?.signal?.addEventListener('abort', () => resolve(), { once: true })
+      })
+      return fauxAssistantMessage('', { stopReason: 'aborted' })
+    },
+  ])
+  const stopSession = await full.execution.open({ ...full.config, session: seeded.ref })
+  try {
+    const running = stopSession.run('Should be interrupted during compaction')
+    await enteredCompact.promise
+    await stopSession.requestStop()
+    assert.deepEqual(await running, { status: 'interrupted' })
+  } finally {
+    await stopSession.dispose()
+  }
+  assert.ok(diagnostics.includes('host.model_interrupted'))
+
+  // (b) Real provider failure during compaction -> model_error + host.model_failed
+  diagnostics.length = 0
+  full.faux.setResponses([() => { throw new Error('Provider 503 during compaction') }])
+  const modelErrSession = await full.execution.open({ ...full.config, session: seeded.ref })
+  try {
+    assert.deepEqual(await modelErrSession.run('Provider fails compaction'), { status: 'model_error' })
+  } finally {
+    await modelErrSession.dispose()
+  }
+  assert.ok(diagnostics.includes('host.model_failed'))
+
+  // (c) Real SDK / pre-stream failure during compaction -> runtime_error + host.runtime_failed
+  diagnostics.length = 0
+  const sdkErrSession = await full.execution.open({
+    ...full.config,
+    session: seeded.ref,
+    reserveRequest({ kind }) {
+      if (kind === 'compaction') throw new Error('Unexpected SDK compaction failure')
+    },
+  })
+  try {
+    assert.deepEqual(await sdkErrSession.run('SDK fails compaction'), { status: 'runtime_error' })
+  } finally {
+    await sdkErrSession.dispose()
+  }
+  assert.ok(diagnostics.includes('host.runtime_failed'))
+})

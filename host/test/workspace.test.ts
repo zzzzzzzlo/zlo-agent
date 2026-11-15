@@ -148,3 +148,57 @@ test('binary, malformed and oversized text cannot pass tools or verification', a
     ok: false, error: 'Expected bounded UTF-8 text',
   })
 })
+
+test('P0-1: allows auth source modules and safe engineering dotfiles while still blocking real secrets and hidden metadata', async (t) => {
+  const { root, workspace } = await fixture(t)
+  const mkdirTool = tool(workspace, 'create_directory')
+  const create = tool(workspace, 'create_text_file')
+  const read = tool(workspace, 'read_text_file')
+  const edit = tool(workspace, 'edit_text_file')
+  const list = tool(workspace, 'list_directory')
+
+  for (const dir of ['src', 'src/auth', '.github', '.github/workflows']) {
+    assert.deepEqual(await mkdirTool({ path: dir }), { ok: true }, dir)
+  }
+
+  const allowedFiles: [string, string][] = [
+    ['src/auth/login.ts', 'export const login = () => true\n'],
+    ['auth.test.ts', 'import "./src/auth/login.ts"\n'],
+    ['.gitignore', 'node_modules/\n'],
+    ['.github/workflows/desktop-ci.yml', 'name: Desktop CI\n'],
+    ['.env.example', 'PUBLIC_PORT=3000\n'],
+    ['.prettierrc.json', '{"semi":false}\n'],
+  ]
+  for (const [path, content] of allowedFiles) {
+    assert.deepEqual(await create({ path, content }), { ok: true }, path)
+    assert.deepEqual(await read({ path }), { ok: true, text: content }, path)
+    assert.equal((await workspace.verify({ path })).passed, true, path)
+  }
+  assert.deepEqual(await edit({ path: 'src/auth/login.ts', oldText: 'true', newText: 'false' }), { ok: true, changed: true })
+
+  // Seed real secrets & dangerous dot-metadata directly on disk and ensure list_directory hides them and tools reject them
+  await mkdir(join(root, '.git'))
+  await writeFile(join(root, '.git', 'config'), 'secret')
+  await mkdir(join(root, '.husky'))
+  await writeFile(join(root, '.husky', 'pre-commit'), 'evil')
+  await mkdir(join(root, '.vscode'))
+  await writeFile(join(root, '.vscode', 'tasks.json'), '{}')
+  await writeFile(join(root, '.env'), 'OPENAI_API_KEY=real')
+  await writeFile(join(root, '.env.local'), 'OPENAI_API_KEY=local')
+  await writeFile(join(root, '.npmrc'), '//registry.npmjs.org/:_authToken=secret')
+  await writeFile(join(root, 'auth.json'), '{"token":"secret"}')
+
+  const rootList = await list({ path: '.' }) as { ok: boolean; entries: { name: string; kind: string }[] }
+  assert.equal(rootList.ok, true)
+  const names = rootList.entries.map(entry => entry.name).sort()
+  assert.deepEqual(names, ['.env.example', '.github', '.gitignore', '.prettierrc.json', 'auth.test.ts', 'src'])
+
+  for (const blocked of [
+    '.env', '.env.local', '.env.production', '.npmrc', 'auth.json', 'credentials.json', 'secrets.yaml',
+    'id_ed25519', '.git/config', '.husky/pre-commit', '.vscode/tasks.json', '.gitignore/nested.txt',
+  ]) {
+    assert.deepEqual(await read({ path: blocked }), { ok: false, error: 'Path denied by workspace policy' }, blocked)
+    assert.deepEqual(await create({ path: blocked, content: 'x' }), { ok: false, error: 'Path denied by workspace policy' }, blocked)
+  }
+  assert.deepEqual(await mkdirTool({ path: '.husky/hooks' }), { ok: false, error: 'Path denied by workspace policy' })
+})

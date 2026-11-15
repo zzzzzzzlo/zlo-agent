@@ -66,7 +66,9 @@ const maxReadLines = 200
 const maxPathLength = 512
 const maxEntries = 200
 const maxScannedEntries = 1000
-const forbiddenName = /^(?:node_modules|credentials?|secrets?|auth|id_(?:rsa|dsa|ecdsa|ed25519))(?:\.|$)/iu
+const forbiddenName = /^(?:node_modules|(?:credentials?|secrets?)(?:\.(?:jsonc?|ya?ml|toml|ini|cfg|conf|txt|xml|env)|$)|auth\.(?:jsonc?|ya?ml|toml|ini|cfg|conf|env)$|id_(?:rsa|dsa|ecdsa|ed25519|ecdsa_sk|ed25519_sk)(?:\.|$))/iu
+const allowedDotDirectory = /^(?:\.github|\.changeset|\.storybook|\.well-known)$/iu
+const allowedDotFile = /^(?:\.(?:gitignore|gitkeep|dockerignore|npmignore|eslintignore|prettierignore|stylelintignore|vercelignore|cfignore|editorconfig|nvmrc|node-version|python-version|ruby-version|tool-versions|browserslistrc|swcrc|yamllint)|\.env\.(?:example|sample|template)|\.npmrc\.(?:example|sample|template)|\.(?:prettierrc|eslintrc|stylelintrc|babelrc|lintstagedrc)(?:\.(?:json5?|ya?ml|toml|[cm]?js))?|\.(?:markdownlint|commitlintrc)\.(?:jsonc?|ya?ml)|\.yamllint\.ya?ml)$/iu
 const reservedName = /^(?:con|prn|aux|nul|conin\$|conout\$|(?:com|lpt)[0-9¹²³])(?: *\.|$)/iu
 const sensitiveExtension = /\.(?:key|pem|pfx|p12|ppk|sqlite|db)(?:[-.]|$)/iu
 const invalidPathCharacter = /[\u0000-\u001f\u007f<>:"|?*]/u
@@ -97,17 +99,26 @@ export function editRecovery(text: string, oldText: string, firstMatch: number) 
   return { code: 'text_not_found' as const, readRange: { startLine: lineAt(normalized, match), lineCount: lines.length } }
 }
 
-function allowedSegment(name: string): boolean {
-  return name.length > 0 && !name.startsWith('.') && !/[ .]$/u.test(name) &&
-    !invalidPathCharacter.test(name) && !forbiddenName.test(name) &&
+function allowedDotSegment(name: string, kind: 'file' | 'directory' | 'any'): boolean {
+  if (kind === 'directory') return allowedDotDirectory.test(name)
+  if (kind === 'file') return allowedDotFile.test(name)
+  return allowedDotDirectory.test(name) || allowedDotFile.test(name)
+}
+
+function allowedSegment(name: string, kind: 'file' | 'directory' | 'any' = 'any'): boolean {
+  if (name.length === 0 || name === '.' || name === '..' || /[ .]$/u.test(name)) return false
+  if (name.startsWith('.') && !allowedDotSegment(name, kind)) return false
+  return !invalidPathCharacter.test(name) && !forbiddenName.test(name) &&
     !reservedName.test(name) && !sensitiveExtension.test(name)
 }
 
-function segments(value: unknown, allowRoot = false): string[] {
+function segments(value: unknown, allowRoot = false, leafKind: 'file' | 'directory' | 'any' = allowRoot ? 'directory' : 'any'): string[] {
   if (allowRoot && value === '.') return []
   if (typeof value !== 'string' || value.length > maxPathLength) throw new WorkspaceDenied('Invalid relative path')
   const parts = value.split(/[\\/]/u)
-  if (!parts.every(allowedSegment)) throw new WorkspaceDenied('Path denied by workspace policy')
+  if (!parts.every((part, index) => allowedSegment(part, index < parts.length - 1 ? 'directory' : leafKind))) {
+    throw new WorkspaceDenied('Path denied by workspace policy')
+  }
   return parts
 }
 
@@ -164,7 +175,7 @@ export class CodingWorkspace implements Verifier {
   }
 
   async checkedTarget(value: unknown, kind: 'file' | 'directory' | 'new'): Promise<string> {
-    const parts = segments(value, kind === 'directory')
+    const parts = segments(value, kind === 'directory', kind === 'directory' ? 'directory' : 'file')
     if (kind !== 'new') return (await this.#checkedPath(parts, kind === 'directory')).path
     const { path: parent } = await this.#checkedPath(parts.slice(0, -1), true)
     const target = join(parent, parts.at(-1)!)
@@ -178,19 +189,19 @@ export class CodingWorkspace implements Verifier {
   }
 
   readTextSnapshot(value: unknown, signal?: AbortSignal) {
-    return this.#read(segments(value), signal)
+    return this.#read(segments(value, false, 'file'), signal)
   }
 
   async readPreviewAsset(value: unknown, signal?: AbortSignal): Promise<Buffer> {
-    return (await this.#readBytes(segments(value), 512 * 1024, signal)).bytes
+    return (await this.#readBytes(segments(value, false, 'file'), 512 * 1024, signal)).bytes
   }
 
   async readImageAsset(value: unknown, signal?: AbortSignal): Promise<Buffer> {
-    return (await this.#readBytes(segments(value), 4 * 1024 * 1024, signal)).bytes
+    return (await this.#readBytes(segments(value, false, 'file'), 4 * 1024 * 1024, signal)).bytes
   }
 
   async gitDiffSnapshot(value: unknown, staged: boolean, signal?: AbortSignal) {
-    const parts = segments(value)
+    const parts = segments(value, false, 'file')
     await this.#checkedPath(parts, false)
     return this.#gitText([
       'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=all',
@@ -241,7 +252,7 @@ export class CodingWorkspace implements Verifier {
             typeof lineCount !== 'number' || !Number.isSafeInteger(lineCount) || lineCount < 1 || lineCount > maxReadLines) {
             return { ok: false, error: 'Invalid line range' }
           }
-          const { text } = await this.#read(segments(args.path), signal)
+          const { text } = await this.#read(segments(args.path, false, 'file'), signal)
           if (args.startLine === undefined && args.lineCount === undefined) return { ok: true, text }
           const starts = [0, ...Array.from(text.matchAll(/\r\n|\n|\r/gu), match => match.index + match[0].length)]
           if (starts.at(-1) === text.length && text.length > 0) starts.pop()
@@ -314,7 +325,7 @@ export class CodingWorkspace implements Verifier {
       }
     }
     try {
-      const { text } = await this.#read(segments(check.path), signal)
+      const { text } = await this.#read(segments(check.path, false, 'file'), signal)
       if (check.contains !== undefined && !text.includes(textValue(check.contains))) {
         return { passed: false, evidence: 'workspace_file_missing_expected_text' }
       }
@@ -469,7 +480,7 @@ export class CodingWorkspace implements Verifier {
       if (++scanned > maxScannedEntries || entries.length >= maxEntries) {
         return { ok: true, entries, truncated: true }
       }
-      if (allowedSegment(entry.name) && (entry.isDirectory() || entry.isFile())) {
+      if (entry.isDirectory() ? allowedSegment(entry.name, 'directory') : entry.isFile() && allowedSegment(entry.name, 'file')) {
         entries.push({ name: entry.name, kind: entry.isDirectory() ? 'directory' : 'file' })
       }
     }
@@ -515,7 +526,7 @@ export class CodingWorkspace implements Verifier {
   }
 
   async #create(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
-    const parts = segments(args.path)
+    const parts = segments(args.path, false, 'file')
     const content = textValue(args.content)
     const { path: parent } = await this.#checkedPath(parts.slice(0, -1), true)
     const target = join(parent, parts.at(-1)!)
@@ -537,7 +548,7 @@ export class CodingWorkspace implements Verifier {
   }
 
   async #edit(args: Record<string, unknown>, signal?: AbortSignal): Promise<unknown> {
-    const parts = segments(args.path)
+    const parts = segments(args.path, false, 'file')
     const oldText = textValue(args.oldText)
     const newText = textValue(args.newText)
     if (!oldText) throw new WorkspaceDenied('oldText must be nonempty')

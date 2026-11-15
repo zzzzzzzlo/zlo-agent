@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { Stats } from 'node:fs'
 import { link, lstat, open, opendir, rename, unlink } from 'node:fs/promises'
-import { dirname, join, matchesGlob } from 'node:path'
+import { dirname, join } from 'node:path'
 import { Worker } from 'node:worker_threads'
 import { redactProcessOutput } from './workspace-process.ts'
 import { editRecovery, workspaceTarget } from './workspace.ts'
@@ -36,9 +36,29 @@ function globValue(value: unknown): string | undefined {
   return parts.join('/')
 }
 
+function segmentMatch(segment: string, pattern: string): boolean {
+  let expression = '^'
+  for (const char of pattern) {
+    if (char === '*') expression += '.*'
+    else if (char === '?') expression += '.'
+    else expression += char.replace(/[\\^$.|+()[\]{}]/gu, '\\$&')
+  }
+  return new RegExp(expression + '$', 'u').test(segment)
+}
+
 function globMatch(path: string, pattern: string): boolean {
-  const subject = pattern.includes('/') ? path : path.split('/').at(-1)!
-  return matchesGlob(subject, pattern)
+  const subject = (pattern.includes('/') ? path : path.split('/').at(-1)!).split('/')
+  const parts = pattern.split('/')
+  const seen = new Set<number>()
+  function match(si: number, pi: number): boolean {
+    if (pi === parts.length) return si === subject.length
+    const key = si * (parts.length + 1) + pi
+    if (seen.has(key)) return false
+    seen.add(key)
+    if (parts[pi] === '**') return match(si, pi + 1) || (si < subject.length && match(si + 1, pi))
+    return si < subject.length && segmentMatch(subject[si]!, parts[pi]!) && match(si + 1, pi + 1)
+  }
+  return match(0, 0)
 }
 
 async function filePaths(workspace: CodingWorkspace, root: string, pattern: string, signal: AbortSignal) {

@@ -335,6 +335,8 @@ export class PiExecution implements AgentExecution {
     let stop: Promise<void> | undefined
     let lastAssistant: AssistantMessage | undefined
     let compacting = false
+    let compactStreamCalled = false
+    let compactModelFailed = false
     let recoveringOutput = false
     let outputRecoveryUsed = false
     let lastRequestHadFrames = false
@@ -398,10 +400,12 @@ export class PiExecution implements AgentExecution {
       const textBytes = Buffer.byteLength(JSON.stringify(textContext))
       const estimatedText = Math.ceil(textBytes / 3) + 512
       const maxTokens = reserve(estimatedText + estimatedImageTokens, requestedOutput, compacting ? 'compaction' : 'prompt')
+      if (compacting) compactStreamCalled = true
       lastRequestHadFrames = frames > 0
       if (frames) emit({ type: 'visual.frames_sent', frames, estimatedImageTokens })
       writeHostDiagnostic('host.model_started', traceId)
       const requestFailed = () => {
+        if (compacting && !options?.signal?.aborted) compactModelFailed = true
         emit({ type: 'model.request_unaccounted' })
         writeHostDiagnostic(options?.signal?.aborted ? 'host.model_interrupted' : 'host.model_failed', traceId)
       }
@@ -414,6 +418,7 @@ export class PiExecution implements AgentExecution {
         // Inspect only the completion category. Provider errors may contain request data.
         void response.result().then((message) => {
           providerMessages.add(message)
+          if (compacting && message.stopReason === 'error') compactModelFailed = true
           const { input, output, cacheRead, cacheWrite, cost } = message.usage
           // Keep pixels through a Pi request retry. A completed request consumes its images.
           if (message.stopReason !== 'error') for (const id of attached) pendingImages.delete(id)
@@ -422,7 +427,7 @@ export class PiExecution implements AgentExecution {
             emit({ type: 'model.usage', input, output, cacheRead, cacheWrite,
               ...(estimate !== undefined && Number.isFinite(estimate) && estimate > 0 ? { estimatedCostUsd: estimate } : {}) })
           } else emit({ type: 'model.request_unaccounted' })
-          writeHostDiagnostic(message.stopReason === 'aborted' ? 'host.model_interrupted'
+          writeHostDiagnostic(message.stopReason === 'aborted' || options?.signal?.aborted ? 'host.model_interrupted'
             : message.stopReason === 'length' ? 'host.model_output_limit'
               : message.stopReason === 'error' ? 'host.model_failed' : 'host.model_completed', traceId)
         }, requestFailed)
@@ -493,7 +498,19 @@ export class PiExecution implements AgentExecution {
           try {
             const contextTokens = session.messages.reduce((sum, message) => sum + estimateTokens(message), 0)
             if (session.messages.length > 6 && contextTokens > model.contextWindow * 0.7) {
-              await session.compact('Keep task constraints, verified changes, and pending work with their references.')
+              compactStreamCalled = false
+              compactModelFailed = false
+              try {
+                await session.compact('Keep task constraints, verified changes, and pending work with their references.')
+              } catch (error) {
+                if (stopping) return { status: 'interrupted' }
+                if (!isBenignCompactionNoop(error)) {
+                  if (!compactStreamCalled) writeHostDiagnostic('host.runtime_failed', traceId)
+                  return { status: compactModelFailed ? 'model_error' : 'runtime_error' }
+                }
+              } finally {
+                compacting = false
+              }
             }
             if (stopping) return { status: 'interrupted' }
             if (resumeOutputRecovery && canRecoverOutput()) {
@@ -593,6 +610,11 @@ function runResult(message: AssistantMessage | undefined, fromProvider: boolean)
   if (message.stopReason === 'length' && fromProvider) return { status: 'model_output_limit' }
   if (message.stopReason !== 'stop') return { status: fromProvider ? 'model_error' : 'runtime_error' }
   return { status: 'completed', text: message.content.filter(part => part.type === 'text').map(part => part.text).join('\n') }
+}
+
+function isBenignCompactionNoop(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  return error.message === 'Already compacted' || error.message.startsWith('Nothing to compact')
 }
 
 function isThinkingOnlyTruncation(message: AssistantMessage | undefined): boolean {

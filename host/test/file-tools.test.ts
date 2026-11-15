@@ -151,3 +151,59 @@ test('move, rename and delete affect only checked regular files and never overwr
   assert.deepEqual(await run('delete_file', { path: 'src/renamed.txt' }), { ok: true })
   await assert.rejects(readFile(join(root, 'src', 'renamed.txt')), { code: 'ENOENT' })
 })
+
+test('P0-1: search and multi-file apply_patch support auth paths and allowlisted dotfiles while rejecting real secrets', async context => {
+  const { root, run } = await fixture(context)
+  await mkdir(join(root, 'src', 'auth'), { recursive: true })
+  await mkdir(join(root, '.github', 'workflows'), { recursive: true })
+  await mkdir(join(root, '.git'), { recursive: true })
+  await writeFile(join(root, 'src', 'auth', 'login.ts'), 'export const mode = "v1"\n')
+  await writeFile(join(root, 'auth.test.ts'), 'export const check = "v1"\n')
+  await writeFile(join(root, '.gitignore'), 'dist/\n')
+  await writeFile(join(root, '.github', 'workflows', 'desktop-ci.yml'), 'name: v1\n')
+  await writeFile(join(root, '.env.example'), 'FEATURE_FLAG=v1\n')
+  await writeFile(join(root, '.env'), 'REAL_SECRET=v1\n')
+  await writeFile(join(root, '.git', 'config'), '[core]\n')
+
+  const found = await run('search_files', { glob: '**/*' }) as { ok: boolean; paths: string[] }
+  assert.equal(found.ok, true)
+  assert.deepEqual(found.paths.sort(), [
+    '.env.example',
+    '.github/workflows/desktop-ci.yml',
+    '.gitignore',
+    'auth.test.ts',
+    'src/auth/login.ts',
+  ])
+
+  const contentHits = await run('search_content', { query: 'v1' }) as { ok: boolean; matches: { path: string }[] }
+  assert.equal(contentHits.ok, true)
+  assert.deepEqual(contentHits.matches.map(item => item.path).sort(), [
+    '.env.example',
+    '.github/workflows/desktop-ci.yml',
+    'auth.test.ts',
+    'src/auth/login.ts',
+  ])
+
+  const rejectedSecretPatch = await run('apply_patch', {
+    edits: [
+      { path: 'src/auth/login.ts', oldText: '"v1"', newText: '"v2"' },
+      { path: '.env', oldText: 'v1', newText: 'v2' },
+    ],
+  }) as { ok: boolean }
+  assert.equal(rejectedSecretPatch.ok, false)
+  assert.equal(await readFile(join(root, 'src', 'auth', 'login.ts'), 'utf8'), 'export const mode = "v1"\n')
+
+  const patched = await run('apply_patch', {
+    edits: [
+      { path: 'src/auth/login.ts', oldText: '"v1"', newText: '"v2"' },
+      { path: 'auth.test.ts', oldText: '"v1"', newText: '"v2"' },
+      { path: '.gitignore', oldText: 'dist/\n', newText: 'dist/\nout/\n' },
+      { path: '.github/workflows/desktop-ci.yml', oldText: 'name: v1', newText: 'name: v2' },
+      { path: '.env.example', oldText: 'FEATURE_FLAG=v1', newText: 'FEATURE_FLAG=v2' },
+    ],
+  })
+  assert.deepEqual(patched, {
+    ok: true,
+    changed: ['src/auth/login.ts', 'auth.test.ts', '.gitignore', '.github/workflows/desktop-ci.yml', '.env.example'],
+  })
+})
