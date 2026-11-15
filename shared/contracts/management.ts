@@ -41,7 +41,13 @@ export interface ManagedOperation {
   target?: string
   nodeId?: string
   approval?: string
-  reconciliation?: { status: 'verified' | 'unresolved'; evidence: string; changedEntries?: number; truncated?: boolean }
+  reconciliation?: {
+    status: 'verified' | 'unresolved' | 'acknowledged'
+    evidence: string
+    previousEvidence?: string
+    changedEntries?: number
+    truncated?: boolean
+  }
 }
 
 export interface ManagedTask {
@@ -125,7 +131,8 @@ export interface DesktopManagementApi {
   removeJevKey(): Promise<JevStatus>
   testJevConnection(): Promise<JevStatus>
   deleteMemory(input: { conversationId: string; ids: string[] }): Promise<number>
-  reconcile(input: { conversationId: string; taskId: string; operationId: string }): Promise<ManagedOperation>
+  reconcile(input: { conversationId: string; taskId: string; operationId: string; disposition?: 'probe' | 'acknowledge' }): Promise<ManagedOperation>
+  resolveTaskReconciliation?(input: { conversationId: string; taskId: string }): Promise<{ status: TaskStatus }>
 }
 
 type ManagementRequest<T extends string, I = object> = { schemaVersion: 1; type: T } & I
@@ -138,7 +145,8 @@ export type ManagementCommand =
   | ManagementRequest<'setWorkspaceAccess', { conversationId: string; access: WorkspaceAccess; expected: WorkspaceAccess;
     toolApprovalMode?: ToolApprovalMode; expectedApprovalMode?: ToolApprovalMode }>
   | ManagementRequest<'deleteConversationMemory', { conversationId: string; ids: string[] }>
-  | ManagementRequest<'reconcileOperation', { conversationId: string; taskId: string; operationId: string }>
+  | ManagementRequest<'reconcileOperation', { conversationId: string; taskId: string; operationId: string; disposition?: 'probe' | 'acknowledge' }>
+  | ManagementRequest<'resolveTaskReconciliation', { conversationId: string; taskId: string }>
   | ManagementRequest<'testProviderAccount', { provider: ProviderId; model?: string }>
 
 /** Private transport between Electron Main and its own Host child. Never exposed in Preload. */

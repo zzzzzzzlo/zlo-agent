@@ -221,6 +221,17 @@ async function patchFiles(workspace: CodingWorkspace, input: unknown, signal?: A
       staged.delete(temporary)
     }
     return { ok: true, changed: pending.map(({ relative }) => redactProcessOutput(relative)) }
+  } catch (error) {
+    if (!mutationStarted) {
+      for (const temporary of staged) {
+        await unlink(temporary).catch((unlinkError: NodeJS.ErrnoException) => {
+          if (unlinkError.code !== 'ENOENT') throw unlinkError
+        })
+        staged.delete(temporary)
+      }
+      return rejected('Could not stage patch')
+    }
+    throw error
   } finally {
     for (const temporary of staged) {
       await unlink(temporary).catch((error: NodeJS.ErrnoException) => {
@@ -252,6 +263,10 @@ async function moveFile(workspace: CodingWorkspace, targets: [string, string] | 
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code
     if (code === 'EEXIST' || code === 'EXDEV') return rejected('Move destination exists or is on another volume')
+    if (code === 'EACCES' || code === 'EPERM' || code === 'ENOENT' || code === 'ENOTDIR' || code === 'EROFS' ||
+      code === 'EINVAL' || code === 'ENAMETOOLONG' || code === 'ENOSPC') {
+      return rejected('Move operation denied or unavailable')
+    }
     throw error
   }
   const current = await lstat(existing)
@@ -341,7 +356,15 @@ export function createFileTools(workspace: CodingWorkspace): WorkspaceTool[] {
       { path: pathSchema }, ['path'], async (input, signal) => {
         const path = await workspace.checkedTarget(input.path, 'file').catch(() => undefined)
         if (!path || signal?.aborted) return rejected('File unavailable or deletion interrupted')
-        await unlink(path)
+        const before = await lstat(path).catch(() => undefined)
+        if (!before?.isFile() || signal?.aborted) return rejected('File unavailable or deletion interrupted')
+        try {
+          await unlink(path)
+        } catch (error) {
+          const after = await lstat(path).catch(() => undefined)
+          if (after && unchanged(before, after)) return rejected('File could not be deleted')
+          throw error
+        }
         return { ok: true }
       }, input => [pathValue(object(input)?.path) ?? ''], 'destructive'),
   ]

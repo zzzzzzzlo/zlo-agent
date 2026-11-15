@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { writeHostDiagnostic } from '../../shared/diagnostics.ts'
+import { readFileSync, realpathSync } from 'node:fs'
 import { mkdir, open, readFile, realpath } from 'node:fs/promises'
 import { dirname, join, relative } from 'node:path'
 import { InMemoryCredentialStore, type AssistantMessage, type ImageContent } from '@earendil-works/pi-ai'
@@ -270,6 +271,15 @@ export class PiExecution implements AgentExecution {
     const auth = await runtime.checkAuth(model.provider).catch(() => undefined)
     if (!auth) throw modelUnavailable('Pi model provider has no configured authentication')
     return model
+  }
+
+  verifySession(ref: SessionRef, cwd: string): boolean {
+    try {
+      checkTranscriptText(readFileSync(ref.path, 'utf8'), ref, realpathSync(cwd))
+      return true
+    } catch {
+      return false
+    }
   }
 
   async open(config: ExecutionConfig): Promise<ExecutionSession> {
@@ -590,10 +600,9 @@ function isThinkingOnlyTruncation(message: AssistantMessage | undefined): boolea
     message.content.every(block => block.type === 'thinking')
 }
 
-async function checkTranscript(ref: SessionRef, cwd: string): Promise<void> {
-  const transcript = await readFile(ref.path, 'utf8')
+function checkTranscriptText(transcript: string, ref: SessionRef, cwd: string): void {
   // Pi can skip malformed JSONL lines for interactive use. Recovery must detect lost entries.
-  if (!transcript.endsWith('\n')) throw new Error('Pi session transcript is incomplete')
+  if (!transcript || !transcript.endsWith('\n')) throw new Error('Pi session transcript is incomplete')
   const lines = transcript.trimEnd().split('\n')
   const header = JSON.parse(lines[0])
   if (header?.type !== 'session' || header.id !== ref.id || header.version !== 3 || relative(cwd, header.cwd) !== '') {
@@ -608,6 +617,10 @@ async function checkTranscript(ref: SessionRef, cwd: string): Promise<void> {
     }
     seen.add(entry.id)
   }
+}
+
+async function checkTranscript(ref: SessionRef, cwd: string): Promise<void> {
+  checkTranscriptText(await readFile(ref.path, 'utf8'), ref, cwd)
 }
 
 async function syncTranscript(ref: SessionRef, cwd: string): Promise<void> {

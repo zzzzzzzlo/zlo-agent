@@ -140,6 +140,12 @@ export class ToolRun {
           approvalKind = tool.policy?.approvalFor?.(input) ?? tool.policy?.approval
         } catch { deny('policy'); return unavailable }
         if (!authorize(input)) { deny('policy'); return unavailable }
+        const fingerprint = callFingerprint(tool.name, input)
+        const target = workspaceTarget(input)
+        if (effect === 'write' && this.#tasks.hasUnconfirmedReplay(ref.taskId, tool.name, target, fingerprint)) {
+          deny('policy')
+          return { ok: false, code: 'REPLAY_BLOCKED', error: 'A previous invocation of this write operation had an unconfirmed effect and cannot be replayed automatically. Inspect current workspace state first or ask the user before making a new change.' }
+        }
         const blocked = this.#tasks.toolWorkBlock(ref, tool.name, effect, tool.policy)
         if (blocked) {
           deny('policy')
@@ -148,7 +154,6 @@ export class ToolRun {
             : { ok: false, code: 'ACTIVE_WRITE', error: 'A workspace operation is in progress. For your shell command, read its process status or output before making another change.' }
         }
         const operationId = ref.agentRunId + ':' + callId
-        const target = workspaceTarget(input)
         let destination: string | undefined
         if (approvalKind) {
           const mode = this.#approvalMode()
@@ -177,11 +182,16 @@ export class ToolRun {
           }
         }
         try {
-          const filePostcondition = tool.name === 'create_text_file'
-            ? await prepareFilePostcondition(tool.name, workspace, target, input) : undefined
+          const taskSnapshot = this.#tasks.get(ref.taskId)
+          const node = [...(taskSnapshot.worker ? [taskSnapshot.worker] : []), ...(taskSnapshot.nodes ?? [])]
+            .find(item => item.id === ref.taskNodeId)
+          const postconditionAccess = taskSnapshot.workspaceAccess === 'trusted' && (!node || node.access === 'trusted')
+            ? 'trusted' : (node?.access ?? taskSnapshot.workspaceAccess ?? 'read')
+          const filePostcondition = effect === 'write'
+            ? await prepareFilePostcondition(tool.name, workspace, target, input, postconditionAccess) : undefined
           if (this.#closed || combined.aborted || !authorize(input)) return unavailable
           this.#tasks.beginTool(ref.taskId, ref, operationId, tool.name, effect,
-            effect === 'write' ? target : undefined, undefined, tool.policy, filePostcondition)
+            effect === 'write' ? target : undefined, undefined, tool.policy, filePostcondition, fingerprint)
         } catch {
           return unavailable
         }

@@ -83,6 +83,7 @@ export interface AgentExecution {
   open(config: ExecutionConfig): Promise<ExecutionSession>
   validateRoute(route: ModelRoute): Promise<void>
   discoverModels?(provider?: string): Promise<readonly ModelCandidate[]>
+  verifySession?(ref: SessionRef, cwd: string): boolean
 }
 
 export class ModelUnavailableError extends Error {}

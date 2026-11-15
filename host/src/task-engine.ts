@@ -93,15 +93,18 @@ export interface Attempt {
   status: 'running' | 'succeeded' | 'failed' | 'interrupted' | 'unknown_effect'
   reason?: EndReason
 }
-export interface FilePostcondition {
-  kind: 'created_text'
-  workspaceIdentity: string
-  digest: string
-}
+export type FilePostcondition =
+  | { kind: 'created_text'; workspaceIdentity: string; digest: string }
+  | { kind: 'edited_text'; workspaceIdentity: string; beforeDigest: string; afterDigest: string }
+  | { kind: 'deleted_file'; workspaceIdentity: string; fileIdentity: string }
+  | { kind: 'patched_files'; workspaceIdentity: string; files: { path: string; beforeDigest: string; afterDigest: string }[] }
+  | { kind: 'git_branch'; workspaceIdentity: string; branch: string; expectedCommit: string }
+  | { kind: 'git_commit'; workspaceIdentity: string; headBefore?: string }
 
 interface OperationReconciliation {
-  status: 'verified' | 'unresolved'
+  status: 'verified' | 'unresolved' | 'acknowledged'
   evidence: string
+  previousEvidence?: string
   changedEntries?: number
   truncated?: boolean
 }
@@ -120,6 +123,7 @@ export interface Operation {
   tool: string
   effect: 'read' | 'write'
   target?: string
+  callFingerprint?: string
   changedPaths?: string[]
   managed?: boolean
   processId?: number
@@ -155,7 +159,7 @@ const edges: Record<TaskStatus, TaskStatus[]> = {
   stop_requested: ['stopping', 'needs_reconciliation'],
   stopping: ['stopped', 'needs_reconciliation'],
   stopped: ['ready', 'needs_reconciliation'],
-  needs_reconciliation: ['stopped'],
+  needs_reconciliation: ['stopped', 'failed'],
 }
 export function canTransition(from: TaskStatus, to: TaskStatus): boolean {
   return edges[from].includes(to)
@@ -264,10 +268,13 @@ function assertCheckInScope(check: VerificationCheck | undefined, scope: string 
     throw new Error('Verification target is outside the node scope')
   }
 }
+export function isUnresolvedEffect(operation: Operation): boolean {
+  return operation.status === 'unknown_effect' && operation.reconciliation?.status !== 'acknowledged'
+}
 function interruptedWrite(operations: Operation[]) {
   const writes = operations.filter(({ effect }) => effect === 'write')
   if (!writes.length) return undefined
-  const unknown = writes.some(({ status }) => status === 'started' || status === 'unknown_effect')
+  const unknown = writes.some(operation => operation.status === 'started' || isUnresolvedEffect(operation))
   const evidence = unknown ? 'node_unknown_effect' : 'node_interrupted_after_write'
   const result: WorkerResult = {
     resultStatus: 'failed',
@@ -538,7 +545,7 @@ export class TaskEngine {
   #assertPlanning(task: TaskSnapshot, expectedVersion: number): void {
     if (!PLANNING_STATES.includes(task.status)) throw new Error('Task is not accepting work')
     if (task.planVersion !== expectedVersion) throw new Error('Plan version changed')
-    if (this.operations(task.id).some((operation) => operation.status === 'unknown_effect')) {
+    if (this.operations(task.id).some(isUnresolvedEffect)) {
       throw new Error('Unresolved tool effects prevent planning')
     }
   }
@@ -690,12 +697,21 @@ export class TaskEngine {
     return this.#toolWorkBlock(task.id, policy?.whileActive ? event.agentRunId : undefined, worktreeId, tool, effect)
   }
 
+  hasUnconfirmedReplay(taskId: string, tool: string, target: string | undefined, callFingerprint: string | undefined): boolean {
+    return this.operations(taskId).some(operation => operation.effect === 'write' && operation.status === 'unknown_effect' && (
+      callFingerprint !== undefined && operation.callFingerprint !== undefined
+        ? operation.callFingerprint === callFingerprint
+        : operation.tool === tool && operation.target === target
+    ))
+  }
+
   #toolWorkBlock(taskId: string, managedOwner?: string, worktreeId?: string, tool?: string, effect?: Operation['effect']) {
     const writes = this.operations(taskId).filter(operation => operation.effect === 'write')
-    // Only scoped local reads and the owning run's process probes may inspect uncertain effects.
+    // Only scoped local reads, authorized Git reads, and the owning run's process probes may inspect uncertain effects.
     const inspection = effect === 'read' && (tool === 'list_directory' || tool === 'read_text_file' ||
-      tool === 'search_files' || tool === 'search_content' || tool === 'process_status' || tool === 'process_output')
-    if (!inspection && writes.some(operation => operation.status === 'unknown_effect')) return 'unconfirmed_write' as const
+      tool === 'search_files' || tool === 'search_content' || tool === 'process_status' || tool === 'process_output' ||
+      tool === 'git_status' || tool === 'git_diff' || tool === 'git_log')
+    if (!inspection && writes.some(isUnresolvedEffect)) return 'unconfirmed_write' as const
     if (writes.some(({ status, managed, agentRunId, worktreeId: operationWorktree }) =>
       status === 'started' && !separateWorktrees(worktreeId, operationWorktree) &&
       !(managed && managedOwner && agentRunId === managedOwner))) return 'active_write' as const
@@ -789,7 +805,7 @@ export class TaskEngine {
       let accepted = result ?? interruption?.result
       if (interruption) verification = interruption.verification
       if (result?.resultStatus === 'succeeded') {
-        const finished = receipts.every(({ status }) => status !== 'started' && status !== 'unknown_effect')
+        const finished = receipts.every(operation => operation.status !== 'started' && !isUnresolvedEffect(operation))
         const hasReceipt = receipts.some(({ id, status }) => status === 'succeeded' && result.evidenceRefs.includes(id))
         const childrenCompleted = children.every(({ status }) => status === 'succeeded')
         const hasHandoff = node.check ? confirmedCheck(verification) : hasReceipt || (children.length > 0 && childrenCompleted)
@@ -846,27 +862,80 @@ export class TaskEngine {
     })
   }
 
-  recordReconciliation(taskId: string, id: string, observation: NonNullable<Operation['reconciliation']>): Operation {
+  #settleReconciledTask(task: TaskSnapshot, checkpointReady: boolean): void {
+    if (this.operations(task.id).some(item => isUnresolvedEffect(item) || item.status === 'started')) return
+    if (!checkpointReady) {
+      if (task.reconciliationBlock !== 'checkpoint_error' || task.reason !== 'checkpoint_error') {
+        const updated: TaskSnapshot = { ...task, reconciliationBlock: 'checkpoint_error', reason: 'checkpoint_error' }
+        this.#save(updated)
+        this.#event(updated, 'operation.reconciliation_required', { operationIds: [], reason: 'checkpoint_error' })
+      }
+      return
+    }
+    if (!task.reconciliationBlock) {
+      this.#transition({ ...task, reason: undefined }, 'stopped', 'task.stopped')
+    }
+  }
+
+  recordReconciliation(taskId: string, id: string, observation: NonNullable<Operation['reconciliation']>, checkpointReady = true): Operation {
     return this.#db.transaction(() => {
       const task = this.get(taskId)
       const operation = this.#db.get<Operation>('operations', id)
       if (!operation || operation.taskId !== taskId) throw new Error('Operation does not belong to this task')
       if (operation.reconciliation?.status === 'verified') return operation
-      if (task.status !== 'needs_reconciliation' || operation.status !== 'unknown_effect') throw new Error('Operation is not awaiting reconciliation')
+      if (task.status !== 'needs_reconciliation' || !isUnresolvedEffect(operation)) throw new Error('Operation is not awaiting reconciliation')
       const next: Operation = { ...operation, reconciliation: observation,
         status: observation.status === 'verified' ? 'interrupted' : 'unknown_effect' }
       this.#db.put('operations', id, next)
       this.#event(task, 'operation.reconciliation_checked', { operationId: id, ...observation })
-      if (observation.status === 'verified' && task.reason === 'unknown_effect' && !task.reconciliationBlock &&
-        !this.operations(taskId).some(item => item.status === 'unknown_effect' || item.status === 'started')) {
-        this.#transition({ ...task, reason: undefined }, 'stopped', 'task.stopped')
-      }
+      if (observation.status === 'verified') this.#settleReconciledTask(task, checkpointReady)
       return next
     })
   }
 
+  acknowledgeReconciliation(taskId: string, id: string, checkpointReady = true): Operation {
+    return this.#db.transaction(() => {
+      const task = this.get(taskId)
+      const operation = this.#db.get<Operation>('operations', id)
+      if (!operation || operation.taskId !== taskId) throw new Error('Operation does not belong to this task')
+      if (operation.reconciliation?.status === 'verified' || operation.reconciliation?.status === 'acknowledged') return operation
+      if (task.status !== 'needs_reconciliation' || operation.status !== 'unknown_effect') {
+        throw new Error('Operation is not awaiting reconciliation')
+      }
+      const reconciliation: NonNullable<Operation['reconciliation']> = {
+        status: 'acknowledged',
+        evidence: 'user_acknowledged_after_inspection',
+        ...(operation.reconciliation?.evidence ? { previousEvidence: operation.reconciliation.evidence } : {}),
+      }
+      const next: Operation = { ...operation, status: 'unknown_effect', reconciliation }
+      this.#db.put('operations', id, next)
+      this.#event(task, 'operation.reconciliation_acknowledged', { operationId: id, ...reconciliation })
+      this.#settleReconciledTask(task, checkpointReady)
+      return next
+    })
+  }
+
+  resolveTaskReconciliation(taskId: string, checkpointReady: boolean): TaskSnapshot {
+    return this.#db.transaction(() => {
+      const task = this.get(taskId)
+      if (task.status !== 'needs_reconciliation') throw new Error('Task is not awaiting reconciliation')
+      if (this.operations(taskId).some(item => isUnresolvedEffect(item) || item.status === 'started')) {
+        throw new Error('Pending operations require reconciliation before resolving the task')
+      }
+      this.#event(task, 'task.reconciliation_resolved', {
+        reason: task.reconciliationBlock ?? task.reason,
+        checkpointReady,
+      })
+      if (checkpointReady) {
+        return this.#transition({ ...task, reason: undefined, reconciliationBlock: undefined }, 'stopped', 'task.stopped')
+      }
+      return this.#finish({ ...task, reconciliationBlock: undefined }, 'failed', 'checkpoint_error')
+    })
+  }
+
   beginTool(taskId: string, event: EventDraft, id: string, tool: string, effect: Operation['effect'], target?: string,
-    phase?: 'verification', policy?: { deferred?: boolean; whileActive?: boolean }, filePostcondition?: FilePostcondition): void {
+    phase?: 'verification', policy?: { deferred?: boolean; whileActive?: boolean }, filePostcondition?: FilePostcondition,
+    callFingerprint?: string): void {
     this.#db.transaction(() => {
       const task = this.get(taskId)
       const expected = phase === 'verification' ? 'verifying' : 'running'
@@ -898,6 +967,7 @@ export class TaskEngine {
         agentRunId: event.agentRunId, agentId: event.agentId, sessionId: event.sessionId,
         taskNodeId: nodeId, parentAgentRunId: event.parentAgentRunId,
         tool, effect, target, status: 'started', ...(policy?.deferred ? { managed: true } : {}),
+        ...(callFingerprint ? { callFingerprint } : {}),
         ...(filePostcondition ? { filePostcondition } : {}),
         ...(node?.worktreeId ? { worktreeId: node.worktreeId } : {}),
       }
@@ -973,7 +1043,7 @@ export class TaskEngine {
         (!completed && task.worker?.status === 'ready')) {
         throw new Error('Worker outcome prevents task acceptance')
       }
-      if (this.operations(taskId).some((operation) => operation.status === 'started' || operation.status === 'unknown_effect')) {
+      if (this.operations(taskId).some(operation => operation.status === 'started' || isUnresolvedEffect(operation))) {
         throw new Error('Tool receipts prevent task acceptance')
       }
       this.#event(task, 'verification.finished', { ...result, executionStatus: 'completed' })
@@ -987,8 +1057,8 @@ export class TaskEngine {
       let task = this.get(taskId)
       if (task.status === 'needs_reconciliation') return task
       const operations = this.operations(taskId)
-      const unknown = operations.filter((operation) =>
-        operation.effect === 'write' && (operation.status === 'started' || operation.status === 'unknown_effect'))
+      const unknown = operations.filter(operation =>
+        operation.effect === 'write' && (operation.status === 'started' || isUnresolvedEffect(operation)))
       for (const operation of operations) {
         if (operation.status !== 'started') continue
         const status = operation.effect === 'write' ? 'unknown_effect' : 'interrupted'

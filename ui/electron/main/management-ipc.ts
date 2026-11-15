@@ -232,11 +232,36 @@ export function registerManagementIpc(options: {
     return host.request({ schemaVersion: 1, type: 'deleteConversationMemory', conversationId: id, ids })
   }))
 
-  register('reconcile', async (_window, value) => {
-    const { conversationId, taskId, operationId } = object(value, ['conversationId', 'taskId', 'operationId'])
+  register('reconcile', async (window, value) => {
+    const { conversationId, taskId, operationId, disposition } = object(value, ['conversationId', 'taskId', 'operationId', 'disposition'])
     if (typeof operationId !== 'string' || operationId.length < 1 || operationId.length > 1024 ||
       /[\p{Cc}\p{Cf}]/u.test(operationId)) return invalid()
-    return host.request({ schemaVersion: 1, type: 'reconcileOperation', conversationId: entityId(conversationId),
-      taskId: entityId(taskId), operationId })
+    if (disposition !== undefined && disposition !== 'probe' && disposition !== 'acknowledge') return invalid()
+    const checkedConversationId = entityId(conversationId)
+    const checkedTaskId = entityId(taskId)
+    if (disposition === 'acknowledge') {
+      return mutate(async () => {
+        await confirm(window, '确认人工核对结果', '确认您已检查当前工作区状态并记录人工核查回执？',
+          '无法自动证实的历史操作将继续保留「结果未知（人工已核查）」状态，后续恢复流程会阻止自动重放。')
+        return host.request({
+          schemaVersion: 1, type: 'reconcileOperation', conversationId: checkedConversationId,
+          taskId: checkedTaskId, operationId, disposition: 'acknowledge',
+        })
+      })
+    }
+    return host.request({ schemaVersion: 1, type: 'reconcileOperation', conversationId: checkedConversationId,
+      taskId: checkedTaskId, operationId, ...(disposition ? { disposition } : {}) })
   })
+
+  register('resolveTaskReconciliation', (window, value) => mutate(async () => {
+    const { conversationId, taskId } = object(value, ['conversationId', 'taskId'])
+    const checkedConversationId = entityId(conversationId)
+    const checkedTaskId = entityId(taskId)
+    await confirm(window, '确认解除任务核对阻塞', '确认您已检查工作区与会话状态并继续处理此任务？',
+      '若保存的会话检查点有效，任务将回到已停止状态；若检查点已损坏，该任务将标记失败以防不安全重放。')
+    return host.request({
+      schemaVersion: 1, type: 'resolveTaskReconciliation',
+      conversationId: checkedConversationId, taskId: checkedTaskId,
+    })
+  }))
 }

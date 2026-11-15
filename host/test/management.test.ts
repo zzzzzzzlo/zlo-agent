@@ -299,3 +299,243 @@ test('evaluation evidence and reconciliation never invoke Git unless workspace a
     await host.close()
   }
 })
+
+test('P0-2: interrupted Git reads and pre-write errors stay structured, postconditions verify edits/patches/deletes, and acknowledged unknown effects block automatic replay', async (t) => {
+  const { directory, workspace } = await fixture(t)
+  const { execFileSync } = await import('node:child_process')
+  const { rm } = await import('node:fs/promises')
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: workspace, stdio: 'ignore', windowsHide: true })
+  git('init', '-q')
+  await writeFile(join(workspace, 'edit.txt'), 'before-edit\n')
+  await writeFile(join(workspace, 'patch-a.txt'), 'alpha-1\n')
+  await writeFile(join(workspace, 'patch-b.txt'), 'beta-1\n')
+  await writeFile(join(workspace, 'remove.txt'), 'to-delete\n')
+  git('add', '--', 'edit.txt', 'patch-a.txt', 'patch-b.txt', 'remove.txt')
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'init')
+
+  // 1. Pre-write errors return { ok: false } instead of throwing into unknown_effect
+  const { CodingWorkspace } = await import('../src/workspace.ts')
+  const fsPromises = await import('node:fs/promises')
+  const cw = new CodingWorkspace(workspace)
+  const createTool = cw.tools('root', 'write').find(item => item.name === 'create_text_file')!
+  const originalOpen = fsPromises.open
+  // Verify normal duplicate error is structured
+  assert.equal((await createTool.execute('dup', { path: 'edit.txt', content: 'dup' }) as { ok: boolean }).ok, false)
+  void originalOpen
+
+  // 2. Postcondition verification for edit_text_file, apply_patch, delete_file, plus user acknowledgement & replay blocking
+  const { createFileTools } = await import('../src/file-tools.ts')
+  let scenario: 'git_read_abort' | 'edit_crash' | 'patch_crash' | 'delete_crash' | 'unknown_cmd' | 'resume_replay' = 'git_read_abort'
+  let replayResult: unknown
+  let safeNewWriteResult: unknown
+  const registry = new ExtensionRegistry([{
+    id: 'p02-suite',
+    tools(root, role, access) {
+      const base = [
+        ...root.tools(role, access).filter(tool => ['read_text_file', 'create_text_file', 'edit_text_file', 'git_diff', 'git_status'].includes(tool.name)),
+        ...createFileTools(root).filter(tool => ['apply_patch', 'delete_file'].includes(tool.name)),
+      ]
+      return base.map(tool => {
+        if (tool.name === 'edit_text_file') {
+          return {
+            ...tool,
+            async execute(...args: Parameters<typeof tool.execute>) {
+              if (scenario === 'edit_crash') {
+                await writeFile(join(workspace, 'edit.txt'), 'after-edit\n')
+                throw new Error('Crash after rename')
+              }
+              return tool.execute(...args)
+            },
+          }
+        }
+        if (tool.name === 'apply_patch') {
+          return {
+            ...tool,
+            async execute(...args: Parameters<typeof tool.execute>) {
+              if (scenario === 'patch_crash') {
+                await writeFile(join(workspace, 'patch-a.txt'), 'alpha-2\n')
+                throw new Error('Crash mid-patch')
+              }
+              return tool.execute(...args)
+            },
+          }
+        }
+        if (tool.name === 'delete_file') {
+          return {
+            ...tool,
+            async execute(...args: Parameters<typeof tool.execute>) {
+              if (scenario === 'delete_crash') {
+                await rm(join(workspace, 'remove.txt'))
+                throw new Error('Crash after unlink')
+              }
+              return tool.execute(...args)
+            },
+          }
+        }
+        return tool
+      }).concat(access === 'trusted' ? [{
+        name: 'custom_mutation',
+        description: 'Unverifiable external write',
+        effect: 'write' as const,
+        parameters: { type: 'object', additionalProperties: false, properties: { tag: { type: 'string' } }, required: ['tag'] },
+        async execute(_id, input) {
+          if (scenario === 'unknown_cmd') throw new Error('Process vanished')
+          return { ok: true, input }
+        },
+      }] : [])
+    },
+  }])
+  registry.registerProfile({ id: 'p02', plugins: ['p02-suite'], workflow: 'coding', delegation: false, workspaceWrites: true })
+
+  const fake = new FakeExecution()
+  const execution: AgentExecution = {
+    verifySession: (ref) => fake.verifySession(ref),
+    validateRoute: route => fake.validateRoute(route),
+    async open(config) {
+      const session = await fake.open(config)
+      return {
+        ...session,
+        async run(prompt) {
+          await session.run('fast')
+          if (scenario === 'git_read_abort') {
+            const abort = new AbortController()
+            abort.abort()
+            const res = await config.tools.find(item => item.name === 'git_diff')!.execute('gd-1', { path: 'edit.txt' }, abort.signal) as { ok: boolean }
+            assert.equal(res.ok, false)
+            return { status: 'interrupted' }
+          }
+          if (scenario === 'edit_crash') {
+            await config.tools.find(item => item.name === 'edit_text_file')!.execute('ed-1', {
+              path: 'edit.txt', oldText: 'before-edit', newText: 'after-edit',
+            })
+          }
+          if (scenario === 'patch_crash') {
+            await config.tools.find(item => item.name === 'apply_patch')!.execute('pa-1', {
+              edits: [
+                { path: 'patch-a.txt', oldText: 'alpha-1', newText: 'alpha-2' },
+                { path: 'patch-b.txt', oldText: 'beta-1', newText: 'beta-2' },
+              ],
+            })
+          }
+          if (scenario === 'delete_crash') {
+            await config.tools.find(item => item.name === 'delete_file')!.execute('del-1', { path: 'remove.txt' })
+          }
+          if (scenario === 'unknown_cmd') {
+            await config.tools.find(item => item.name === 'custom_mutation')!.execute('cm-1', { tag: 'risky-1' })
+          }
+          if (scenario === 'resume_replay') {
+            assert.match(prompt, /Resume the task using the saved conversation/u)
+            replayResult = await config.tools.find(item => item.name === 'custom_mutation')!.execute('cm-replay', { tag: 'risky-1' })
+            safeNewWriteResult = await config.tools.find(item => item.name === 'create_text_file')!.execute('new-safe', {
+              path: 'fresh-after-resume.txt', content: 'ok\n',
+            })
+          }
+          return { status: 'completed', text: 'Done' }
+        },
+      }
+    },
+  }
+
+  const host = new LocalAgentHost({
+    directory, execution, extensions: registry, profileId: 'p02',
+    approveTool: async () => ({ approved: true }),
+  })
+  try {
+    const conv = host.createConversation({ requestId: 'c-p02', workspace, workspaceAccess: 'read' })
+    host.setConversationWorkspaceAccess(conv.id, 'trusted', 'read')
+
+    // (a) Interrupted git_diff settles to 'stopped' (read accounting), never 'needs_reconciliation'
+    scenario = 'git_read_abort'
+    const { taskId: gitReadTask } = await host.sendMessage({ requestId: 'm-git-read', conversationId: conv.id, text: 'Inspect diff' })
+    await host.idle()
+    assert.equal(host.getTask(gitReadTask).status, 'stopped')
+
+    // (b) edit_text_file postcondition verifies cleanly -> task transitions to 'stopped'
+    scenario = 'edit_crash'
+    const { taskId: editTask } = await host.sendMessage({ requestId: 'm-edit', conversationId: conv.id, text: 'Edit file' })
+    await host.idle()
+    assert.equal(host.getTask(editTask).status, 'needs_reconciliation')
+    const editOpId = (await host.managementSnapshot(conv.id)).tasks[0]!.operations.find(op => op.tool === 'edit_text_file')!.id
+    const editChecked = await host.managementCommand({
+      schemaVersion: 1, type: 'reconcileOperation', conversationId: conv.id, taskId: editTask, operationId: editOpId,
+    }) as ManagedOperation
+    assert.equal(editChecked.reconciliation?.status, 'verified')
+    assert.equal(editChecked.reconciliation?.evidence, 'file_content_matches_recorded_postcondition')
+    assert.equal(host.getTask(editTask).status, 'stopped')
+
+    // (c) apply_patch partial state stays unresolved, then full postcondition verifies
+    scenario = 'patch_crash'
+    const { taskId: patchTask } = await host.sendMessage({ requestId: 'm-patch', conversationId: conv.id, text: 'Patch files' })
+    await host.idle()
+    assert.equal(host.getTask(patchTask).status, 'needs_reconciliation')
+    const patchOpId = (await host.managementSnapshot(conv.id)).tasks[0]!.operations.find(op => op.tool === 'apply_patch')!.id
+    const partialPatch = await host.managementCommand({
+      schemaVersion: 1, type: 'reconcileOperation', conversationId: conv.id, taskId: patchTask, operationId: patchOpId,
+    }) as ManagedOperation
+    assert.equal(partialPatch.reconciliation?.status, 'unresolved')
+    assert.equal(partialPatch.reconciliation?.evidence, 'patch_partially_applied_or_modified')
+    await writeFile(join(workspace, 'patch-b.txt'), 'beta-2\n')
+    const fullPatch = await host.managementCommand({
+      schemaVersion: 1, type: 'reconcileOperation', conversationId: conv.id, taskId: patchTask, operationId: patchOpId,
+    }) as ManagedOperation
+    assert.equal(fullPatch.reconciliation?.status, 'verified')
+    assert.equal(fullPatch.reconciliation?.evidence, 'patch_matches_recorded_postcondition')
+    assert.equal(host.getTask(patchTask).status, 'stopped')
+
+    // (d) delete_file postcondition verifies deletion -> 'stopped'
+    scenario = 'delete_crash'
+    const { taskId: delTask } = await host.sendMessage({ requestId: 'm-del', conversationId: conv.id, text: 'Delete file' })
+    await host.idle()
+    assert.equal(host.getTask(delTask).status, 'needs_reconciliation')
+    const delOpId = (await host.managementSnapshot(conv.id)).tasks[0]!.operations.find(op => op.tool === 'delete_file')!.id
+    const delChecked = await host.managementCommand({
+      schemaVersion: 1, type: 'reconcileOperation', conversationId: conv.id, taskId: delTask, operationId: delOpId,
+    }) as ManagedOperation
+    assert.equal(delChecked.reconciliation?.status, 'verified')
+    assert.equal(delChecked.reconciliation?.evidence, 'file_deleted_matches_postcondition')
+    assert.equal(host.getTask(delTask).status, 'stopped')
+
+    // (e) Unprovable write: probe stays unresolved; user acknowledgement binds conversation/task/op, preserves unknown_effect history, and blocks replay on resume
+    scenario = 'unknown_cmd'
+    const { taskId: unknownTask } = await host.sendMessage({ requestId: 'm-unk', conversationId: conv.id, text: 'Run custom mutation' })
+    await host.idle()
+    assert.equal(host.getTask(unknownTask).status, 'needs_reconciliation')
+    const unkOpId = (await host.managementSnapshot(conv.id)).tasks[0]!.operations.find(op => op.tool === 'custom_mutation')!.id
+    const probed = await host.managementCommand({
+      schemaVersion: 1, type: 'reconcileOperation', conversationId: conv.id, taskId: unknownTask, operationId: unkOpId,
+    }) as ManagedOperation
+    assert.equal(probed.reconciliation?.status, 'unresolved')
+
+    const otherConv = host.createConversation({ requestId: 'c-other', workspace })
+    await assert.rejects(host.managementCommand({
+      schemaVersion: 1, type: 'reconcileOperation', conversationId: otherConv.id, taskId: unknownTask, operationId: unkOpId, disposition: 'acknowledge',
+    }), /does not belong/u)
+
+    const acknowledged = await host.managementCommand({
+      schemaVersion: 1, type: 'reconcileOperation', conversationId: conv.id, taskId: unknownTask, operationId: unkOpId, disposition: 'acknowledge',
+    }) as ManagedOperation
+    assert.equal(acknowledged.status, 'unknown_effect')
+    assert.equal(acknowledged.reconciliation?.status, 'acknowledged')
+    assert.equal(acknowledged.reconciliation?.evidence, 'user_acknowledged_after_inspection')
+    assert.equal(host.getTask(unknownTask).status, 'stopped')
+
+    scenario = 'resume_replay'
+    const resumed = host.resumeConversation({ requestId: 'r-unk', conversationId: conv.id, taskId: unknownTask })
+    assert.equal(resumed.accepted, true)
+    await host.idle()
+    assert.equal(host.getTask(unknownTask).status, 'succeeded')
+    assert.deepEqual(replayResult, {
+      ok: false,
+      code: 'REPLAY_BLOCKED',
+      error: 'A previous invocation of this write operation had an unconfirmed effect and cannot be replayed automatically. Inspect current workspace state first or ask the user before making a new change.',
+    })
+    assert.deepEqual(safeNewWriteResult, { ok: true })
+    // Historical unprovable operation still retains unknown_effect status after task completion
+    const historyOps = host.getHistory(unknownTask).operations
+    const historical = historyOps.find(op => op.id === unkOpId)!
+    assert.equal(historical.status, 'unknown_effect')
+    assert.equal(historical.reconciliation?.status, 'acknowledged')
+  } finally {
+    await host.close()
+  }
+})

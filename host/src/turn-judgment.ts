@@ -1,5 +1,6 @@
 import type { EventDraft } from './contracts/domain.ts'
 import type { LocalJudgment } from './judgment.ts'
+import { isUnresolvedEffect } from './task-engine.ts'
 import type { Operation } from './task-engine.ts'
 
 export type TurnFollowUp = { id: 'turn.completion' | 'turn.continue'; nudge: string }
@@ -26,7 +27,7 @@ export async function reviewTurn(judgment: LocalJudgment, event: EventDraft, evi
   if (evidence.signal.aborted) return
   const operations = evidence.operations.filter(operation => operation.taskNodeId === event.taskNodeId &&
     operation.attemptId === event.taskAttemptId)
-  if (operations.some(operation => operation.status === 'started' || operation.status === 'unknown_effect')) return
+  if (operations.some(operation => operation.status === 'started' || isUnresolvedEffect(operation))) return
   const isWorkspaceWrite = (operation: Operation) => operation.effect === 'write' && operation.status === 'succeeded' &&
     Boolean(operation.target || ['apply_patch', 'rename_file', 'move_file', 'delete_file'].includes(operation.tool))
   const byId = new Map(operations.map(operation => [operation.id, operation]))

@@ -35,6 +35,7 @@ export const managementChannels = {
   testJevConnection: 'agent-management:test-jev-connection',
   deleteMemory: 'agent-management:delete-memory',
   reconcile: 'agent-management:reconcile',
+  resolveTaskReconciliation: 'agent-management:resolve-task-reconciliation',
 } as const
 
 export const toolApprovalChannels = {

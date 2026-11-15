@@ -165,6 +165,11 @@ export class LocalStore {
     `).run(namespace, id, encode(value));
   }
 
+  delete(namespace: string, id: string): void {
+    this.#requireTransaction();
+    this.#db.prepare('DELETE FROM records WHERE namespace = ? AND id = ?').run(namespace, id);
+  }
+
   append(draft: EventDraft, streamId = draft.taskId): AgentEvent {
     const changedTasks = this.#requireTransaction();
     const event: AgentEvent = {

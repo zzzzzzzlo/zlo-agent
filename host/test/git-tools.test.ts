@@ -98,3 +98,34 @@ test('Git commit neither touches nor includes pre-existing staged changes', asyn
   assert.equal(git(root, ['rev-parse', 'HEAD']), before)
   assert.equal(git(root, ['diff', '--cached', '--name-only']), 'user.txt')
 })
+
+test('Git inspection tools use read accounting and Windows case-variant commit paths stage cleanly', async context => {
+  const { root, workspace, tools, run } = await fixture(context)
+  const inspectionTools = workspace.tools('root', 'trusted').filter(tool => ['git_status', 'git_diff', 'git_log'].includes(tool.name))
+  assert.equal(inspectionTools.length, 3)
+  assert.ok(inspectionTools.every(tool => tool.effect === 'read' && tool.policy?.minimumAccess === 'trusted'))
+
+  const aborted = new AbortController()
+  aborted.abort()
+  const toolContext: ToolInvocationContext = { taskId: 'task-one', agentRunId: 'root-run', defer() {}, onCleanup() {} }
+  const preInterrupted = await tools.find(tool => tool.name === 'git_commit')!
+    .execute('git_commit', { message: 'Interrupted', paths: ['base.txt'] }, aborted.signal, toolContext) as { ok: boolean }
+  assert.equal(preInterrupted.ok, false)
+
+  await mkdir(join(root, 'Src'))
+  await writeFile(join(root, 'Src', 'Foo.ts'), 'export const foo = 1\n')
+  await writeFile(join(root, 'Src', 'Old.ts'), 'export const old = 1\n')
+  git(root, ['add', '--', 'Src/Foo.ts', 'Src/Old.ts'])
+  git(root, ['commit', '-m', 'add mixed case files'])
+
+  await writeFile(join(root, 'Src', 'Foo.ts'), 'export const foo = 2\n')
+  await writeFile(join(root, 'Src', 'Bar.ts'), 'export const bar = 1\n')
+  await rm(join(root, 'Src', 'Old.ts'))
+
+  const commitPaths = process.platform === 'win32'
+    ? ['src/foo.ts', 'src/bar.ts', 'src/old.ts']
+    : ['Src/Foo.ts', 'Src/Bar.ts', 'Src/Old.ts']
+  const committed = await run('git_commit', { message: 'Case variant commit', paths: commitPaths })
+  assert.equal(committed.ok, true)
+  assert.equal(git(root, ['status', '--porcelain']), '')
+})

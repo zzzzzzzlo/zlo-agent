@@ -81,6 +81,7 @@ const agentManagement: DesktopManagementApi = {
   testJevConnection: () => ipcRenderer.invoke(managementChannels.testJevConnection, undefined),
   deleteMemory: input => ipcRenderer.invoke(managementChannels.deleteMemory, input),
   reconcile: input => ipcRenderer.invoke(managementChannels.reconcile, input),
+  resolveTaskReconciliation: input => ipcRenderer.invoke(managementChannels.resolveTaskReconciliation, input),
 }
 contextBridge.exposeInMainWorld('agentManagement', agentManagement)
 

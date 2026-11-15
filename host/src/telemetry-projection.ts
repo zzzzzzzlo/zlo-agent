@@ -8,7 +8,7 @@ import type { AgentEvent } from './contracts/domain.ts'
 import type { Attempt, TaskSnapshot } from './task-engine.ts'
 import { redactProcessOutput } from './workspace-process.ts'
 
-const states = 'ready running verifying succeeded failed blocked stop_requested stopping stopped needs_reconciliation interrupted unknown_effect started completed active idle released settled uncertain verified unresolved'.split(' ')
+const states = 'ready running verifying succeeded failed blocked stop_requested stopping stopped needs_reconciliation interrupted unknown_effect started completed active idle released settled uncertain verified unresolved acknowledged'.split(' ')
 const reasons = 'user_stop host_shutdown process_interrupted model_error model_interrupted runtime_error verification_failed unknown_effect checkpoint_error stop_timeout budget_exhausted model_output_limit tool_retry_loop'.split(' ')
 const roles = ['root', 'team', 'worker'] as const
 const accessLevels = ['read', 'write', 'trusted'] as const
@@ -143,8 +143,10 @@ function safePayload(type: string, p: Record<string, unknown>): Record<string, u
         reason: oneOf(p.reason, ['policy', 'approval_safety', 'repeated_failure', 'approval_unattended', 'tool_result_failed', 'tool_exception', 'nonzero_exit', 'tool_cancelled']),
         approvalKind: oneOf(p.approvalKind, approvalKinds), automatic: bool(p.automatic) }
     case 'task.permissions_changed': return { access: oneOf(p.access, accessLevels), previousAccess: oneOf(p.previousAccess, accessLevels) }
-    case 'operation.reconciliation_required': case 'operation.reconciliation_checked': return { status, reason,
-      operationId: ref(p.operationId), operationIds: refs(p.operationIds), changedEntries: num(p.changedEntries), truncated: bool(p.truncated) }
+    case 'operation.reconciliation_required': case 'operation.reconciliation_checked':
+    case 'operation.reconciliation_acknowledged': case 'task.reconciliation_resolved': return { status, reason,
+      operationId: ref(p.operationId), operationIds: refs(p.operationIds), changedEntries: num(p.changedEntries),
+      truncated: bool(p.truncated), checkpointReady: bool(p.checkpointReady) }
     case 'verification.finished': return { ...telemetryVerification(p), executionStatus: oneOf(p.executionStatus, ['completed', 'failed']) }
     case 'context.compacted': return { tokensBefore: num(p.tokensBefore), estimatedTokensAfter: num(p.estimatedTokensAfter) }
     case 'memory.captured': case 'memory.recalled': return { count: num(p.count), elapsedMs: num(p.elapsedMs),

@@ -572,6 +572,16 @@ export class ConversationService {
         for (const tool of turn.tools) if (ids.includes(tool.id)) tool.status = 'unknown_effect'
       }
       this.#saveTurn(binding, turn)
+    } else if (type === 'operation.reconciliation_checked' && source.payload.status === 'verified' && typeof source.payload.operationId === 'string') {
+      const turn = this.#turn(binding)
+      for (const tool of turn.tools) if (tool.id === source.payload.operationId) tool.status = 'interrupted'
+      this.#saveTurn(binding, turn)
+    } else if (type === 'task.reconciliation_resolved' && source.payload.checkpointReady === false) {
+      const conversation = this.#record(conversationId)
+      if (conversation.piSessionId) {
+        const { piSessionId: _retired, ...rest } = conversation
+        this.#saveConversation(rest)
+      }
     } else if (transitions.has(type)) {
       this.#projectStatus(binding, source)
     } else if (type === 'model.route_changed') {

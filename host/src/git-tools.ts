@@ -1,9 +1,9 @@
 import { randomUUID } from 'node:crypto'
-import { lstat, mkdir, open, readdir, realpath } from 'node:fs/promises'
-import { dirname, join, relative, resolve } from 'node:path'
+import { lstat, mkdir, open, readdir, realpath, unlink } from 'node:fs/promises'
+import { basename, dirname, join, relative, resolve } from 'node:path'
 import { workspaceTarget, CodingWorkspace } from './workspace.ts'
 import type { ToolInvocationContext, WorkspaceTool } from './workspace.ts'
-import { containsPath, gitInvocation, redactProcessOutput, runWorkspaceProcess } from './workspace-process.ts'
+import { containsPath, gitInvocation, redactProcessOutput, runWorkspaceProcess, UnknownProcessEffect } from './workspace-process.ts'
 
 const maxWorktrees = 8
 const taskPattern = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/u
@@ -47,23 +47,38 @@ async function git(workspace: string, args: string[], signal?: AbortSignal) {
   return result.state === 'exited' ? result : undefined
 }
 
-async function validBranch(workspace: string, name: string, signal?: AbortSignal): Promise<boolean> {
-  return (await git(workspace, ['check-ref-format', '--branch', name], signal))?.code === 0
+async function gitRead(workspace: string, args: string[], signal?: AbortSignal) {
+  try {
+    return await git(workspace, args, signal)
+  } catch (error) {
+    if (error instanceof UnknownProcessEffect) return undefined
+    throw error
+  }
 }
 
-async function commitId(workspace: string, rev: string, signal?: AbortSignal): Promise<string | undefined> {
-  const result = await git(workspace, ['rev-parse', '--verify', rev], signal)
+async function validBranch(workspace: string, name: string, signal?: AbortSignal): Promise<boolean> {
+  return (await gitRead(workspace, ['check-ref-format', '--branch', name], signal))?.code === 0
+}
+
+async function commitId(workspace: string, rev: string, signal?: AbortSignal, readOnly = false): Promise<string | undefined> {
+  const result = await (readOnly ? gitRead : git)(workspace, ['rev-parse', '--verify', rev], signal)
   const id = result?.stdout.trim()
   return result?.code === 0 && id && commitPattern.test(id) ? id : undefined
 }
 
+async function branchAbsent(workspace: string, branch: string, signal?: AbortSignal): Promise<boolean | undefined> {
+  const result = await gitRead(workspace, ['show-ref', '--verify', '--quiet', 'refs/heads/' + branch], signal)
+  if (!result) return undefined
+  return result.code !== 0
+}
+
 async function cleanIndex(workspace: string, signal?: AbortSignal): Promise<boolean> {
-  const result = await git(workspace, ['diff', '--cached', '--name-only', '--no-ext-diff', '--no-textconv', '-z'], signal)
+  const result = await gitRead(workspace, ['diff', '--cached', '--name-only', '--no-ext-diff', '--no-textconv', '-z'], signal)
   return result?.code === 0 && !result.truncated && result.stdout === ''
 }
 
 async function operationInProgress(workspace: string, signal?: AbortSignal): Promise<boolean> {
-  const dir = await git(workspace, ['rev-parse', '--path-format=absolute', '--absolute-git-dir'], signal)
+  const dir = await gitRead(workspace, ['rev-parse', '--path-format=absolute', '--absolute-git-dir'], signal)
   if (dir?.code !== 0 || dir.truncated || !dir.stdout.trim()) return true
   for (const name of ['MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'rebase-merge', 'rebase-apply', 'sequencer', 'BISECT_START']) {
     try { await lstat(join(dir.stdout.trim(), name)); return true } catch (error) {
@@ -74,8 +89,8 @@ async function operationInProgress(workspace: string, signal?: AbortSignal): Pro
 }
 
 async function commitIdentity(workspace: string, signal?: AbortSignal): Promise<boolean> {
-  return (await git(workspace, ['var', 'GIT_AUTHOR_IDENT'], signal))?.code === 0 &&
-    (await git(workspace, ['var', 'GIT_COMMITTER_IDENT'], signal))?.code === 0
+  return (await gitRead(workspace, ['var', 'GIT_AUTHOR_IDENT'], signal))?.code === 0 &&
+    (await gitRead(workspace, ['var', 'GIT_COMMITTER_IDENT'], signal))?.code === 0
 }
 
 /** Manages worktrees created by an approved task under the Host's private data directory. */
@@ -107,12 +122,15 @@ export class ManagedGitWorktrees {
       !await validBranch(workspace.root, branch, signal)) {
       return rejected('A valid branch and local primary Git repository are required')
     }
-    const head = await commitId(workspace.root, 'HEAD^{commit}', signal)
+    const head = await commitId(workspace.root, 'HEAD^{commit}', signal, true)
     if (!head || signal?.aborted) return rejected('No confirmed commit for the worktree')
-    if (await commitId(workspace.root, 'refs/heads/' + branch, signal)) return rejected('The local branch already exists')
-    const taskDirectory = await this.#taskDirectory(taskId, true)
+    const absentBranch = await branchAbsent(workspace.root, branch, signal)
+    if (absentBranch === undefined) return rejected('Worktree branch check was interrupted')
+    if (!absentBranch) return rejected('The local branch already exists')
+    const taskDirectory = await this.#taskDirectory(taskId, true).catch(() => undefined)
     if (!taskDirectory) return rejected('Worktree storage is unavailable')
-    const names = await readdir(taskDirectory)
+    const names = await readdir(taskDirectory).catch(() => undefined)
+    if (!names) return rejected('Worktree storage is unavailable')
     if (names.filter(name => worktreePattern.test(name.slice(0, -5)) && name.endsWith('.json')).length >= maxWorktrees) {
       return rejected('The task worktree limit was reached')
     }
@@ -122,8 +140,30 @@ export class ManagedGitWorktrees {
     const metadata = join(taskDirectory, worktreeId + '.json')
     const record: WorktreeRecord = { version: 1, taskId, worktreeId, repository: workspace.root, branch }
     // Save ownership before Git can create a branch or populate a worktree.
-    const file = await open(metadata, 'wx', 0o600)
-    try { await file.writeFile(JSON.stringify(record), 'utf8'); await file.sync() } finally { await file.close() }
+    let file
+    try {
+      file = await open(metadata, 'wx', 0o600)
+    } catch {
+      return rejected('Worktree storage is unavailable')
+    }
+    try {
+      await file.writeFile(JSON.stringify(record), 'utf8')
+      await file.sync()
+    } catch {
+      await file.close().catch(() => undefined)
+      await unlink(metadata).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT') throw error
+      })
+      return rejected('Worktree storage is unavailable')
+    } finally {
+      await file.close().catch(() => undefined)
+    }
+    if (signal?.aborted) {
+      await unlink(metadata).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT') throw error
+      })
+      return rejected('Worktree creation was interrupted')
+    }
     const result = await git(workspace.root, ['worktree', 'add', '--no-guess-remote', '-b', branch, '--', path, head], signal)
     if (result?.code !== 0 || !await this.resolve(workspace, taskId, worktreeId, signal)) {
       throw new Error('Worktree creation requires reconciliation')
@@ -205,27 +245,65 @@ async function commitFiles(workspace: CodingWorkspace, input: Record<string, unk
     return rejected('Complete pending Git operations and clear existing staged changes before committing')
   }
   if (!await commitIdentity(workspace.root, signal)) return rejected('Configure Git author identity in the local repository')
+  const changedIndex = process.platform === 'win32'
+    ? await gitRead(workspace.root, ['ls-files', '--modified', '--deleted', '-z'], signal)
+    : undefined
+  if (process.platform === 'win32' && (!changedIndex || changedIndex.code !== 0)) {
+    return rejected('Git index inspection failed or was interrupted')
+  }
+  const trackedChanged = changedIndex && !changedIndex.truncated
+    ? [...new Set(changedIndex.stdout.split('\0').filter(Boolean))]
+    : []
+  const resolvedPaths: string[] = []
   for (const path of paths) {
     const existing = await workspace.checkedTarget(path, 'file').catch(() => undefined)
-    if (existing) continue
-    const absent = await workspace.checkedTarget(path, 'new').catch(() => undefined)
-    if (!absent || (await git(workspace.root, ['ls-files', '--error-unmatch', '--', path], signal))?.code !== 0) {
-      return rejected('A commit path is missing, unsupported, or outside the workspace policy')
+    if (existing) {
+      const canonicalExisting = await realpath(existing).catch(() => undefined)
+      if (!canonicalExisting) return rejected('A commit path is missing, unsupported, or outside the workspace policy')
+      const diskPath = relative(workspace.root, canonicalExisting).replaceAll('\\', '/')
+      let resolved = diskPath
+      if (process.platform === 'win32' && !trackedChanged.includes(diskPath)) {
+        const matches = trackedChanged.filter(entry => entry.toLowerCase() === diskPath.toLowerCase())
+        if (matches.length > 1) return rejected('Ambiguous case-variant tracked paths in Git index')
+        if (matches.length === 1) resolved = matches[0]!
+      }
+      if (!workspaceTarget({ path: resolved })) return rejected('A commit path is missing, unsupported, or outside the workspace policy')
+      resolvedPaths.push(resolved)
+      continue
     }
+    const absent = await workspace.checkedTarget(path, 'new').catch(() => undefined)
+    if (!absent) return rejected('A commit path is missing, unsupported, or outside the workspace policy')
+    const canonicalParent = await realpath(dirname(absent)).catch(() => undefined)
+    if (!canonicalParent) return rejected('A commit path is missing, unsupported, or outside the workspace policy')
+    const canonicalAbsent = relative(workspace.root, join(canonicalParent, basename(absent))).replaceAll('\\', '/')
+    let resolved = canonicalAbsent
+    const exactTracked = await gitRead(workspace.root, ['ls-files', '--error-unmatch', '--', canonicalAbsent], signal)
+    if (exactTracked?.code !== 0) {
+      if (process.platform !== 'win32' || changedIndex?.truncated) {
+        return rejected('A commit path is missing, unsupported, or outside the workspace policy')
+      }
+      const matches = trackedChanged.filter(entry => entry.toLowerCase() === canonicalAbsent.toLowerCase())
+      if (matches.length !== 1 || !await workspace.checkedTarget(matches[0]!, 'new').catch(() => undefined)) {
+        return rejected('A commit path is missing, unsupported, or outside the workspace policy')
+      }
+      resolved = matches[0]!
+    }
+    if (!workspaceTarget({ path: resolved })) return rejected('A commit path is missing, unsupported, or outside the workspace policy')
+    resolvedPaths.push(resolved)
   }
   if (signal?.aborted) return rejected('Commit was interrupted before staging')
-  const staged = await git(workspace.root, ['add', '--', ...paths], signal)
+  const staged = await git(workspace.root, ['add', '--', ...resolvedPaths], signal)
   if (staged?.code !== 0) throw new Error('Git staging result requires reconciliation')
   const diff = await git(workspace.root, ['diff', '--cached', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv', '-z'], signal)
-  if (diff?.code !== 0 || diff.truncated || !diff.stdout.split('\0').filter(Boolean).every(path => paths.includes(path))) {
+  if (diff?.code !== 0 || diff.truncated || !diff.stdout.split('\0').filter(Boolean).every(path => resolvedPaths.includes(path))) {
     throw new Error('Git index changed while preparing the commit')
   }
   if (!diff.stdout) return rejected('The selected files have no changes to commit')
   // --only re-reads the selected files, so reject edits that appeared after staging.
-  const refreshed = await git(workspace.root, ['diff', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv', '-z', '--', ...paths], signal)
+  const refreshed = await git(workspace.root, ['diff', '--name-only', '--no-renames', '--no-ext-diff', '--no-textconv', '-z', '--', ...resolvedPaths], signal)
   if (refreshed?.code !== 0 || refreshed.truncated || refreshed.stdout) throw new Error('Selected files changed after staging')
   if (signal?.aborted) throw new Error('Git staging completed before interruption')
-  const result = await git(workspace.root, ['commit', '--no-gpg-sign', '--no-verify', '--only', '-m', message, '--', ...paths], signal)
+  const result = await git(workspace.root, ['commit', '--no-gpg-sign', '--no-verify', '--only', '-m', message, '--', ...resolvedPaths], signal)
   const id = result?.code === 0 ? await commitId(workspace.root, 'HEAD^{commit}', signal) : undefined
   if (!id) throw new Error('Git commit result requires reconciliation')
   return { ok: true, commit: id }
@@ -265,9 +343,11 @@ export function createGitTools(workspace: CodingWorkspace, worktrees?: ManagedGi
     tool('git_branch', 'Create a new local branch at HEAD without switching branches.', { branch: branchSchema }, ['branch'], async (input, signal) => {
       const branch = branchName(input.branch)
       if (!branch || !await validBranch(workspace.root, branch, signal)) return rejected('Invalid local Git branch')
-      const head = await commitId(workspace.root, 'HEAD^{commit}', signal)
+      const head = await commitId(workspace.root, 'HEAD^{commit}', signal, true)
       if (!head || signal?.aborted) return rejected('No confirmed commit for the branch')
-      if (await commitId(workspace.root, 'refs/heads/' + branch, signal)) return rejected('The local branch already exists')
+      const absentBranch = await branchAbsent(workspace.root, branch, signal)
+      if (absentBranch === undefined) return rejected('Branch creation was interrupted')
+      if (!absentBranch) return rejected('The local branch already exists')
       if (signal?.aborted) return rejected('Branch creation was interrupted')
       const result = await git(workspace.root, ['branch', '--no-track', '--', branch, head], signal)
       if (result?.code !== 0) throw new Error('Git branch creation requires reconciliation')
@@ -290,9 +370,9 @@ export function createGitTools(workspace: CodingWorkspace, worktrees?: ManagedGi
       { branch: branchSchema }, ['branch'], async (input, signal) => {
         const branch = branchName(input.branch)
         if (!branch || !await validBranch(workspace.root, branch, signal)) return rejected('Invalid local Git branch')
-        const id = await commitId(workspace.root, 'refs/heads/' + branch + '^{commit}', signal)
+        const id = await commitId(workspace.root, 'refs/heads/' + branch + '^{commit}', signal, true)
         if (!id) return rejected('No such local Git branch')
-        const status = await git(workspace.root, ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--no-renames', '--ignore-submodules=none'], signal)
+        const status = await gitRead(workspace.root, ['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--no-renames', '--ignore-submodules=none'], signal)
         if (status?.code !== 0 || status.truncated || status.stdout || await operationInProgress(workspace.root, signal)) {
           return rejected('Merge requires a clean worktree and no unfinished Git operation')
         }

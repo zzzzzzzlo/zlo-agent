@@ -11,6 +11,7 @@ import { ModelBudgetError } from './model-scheduler.ts'
 import type { LocalModelScheduler } from './model-scheduler.ts'
 import type { AgentRole, CapabilityScope, CodingCapabilities, CodingProfile, ExtensionRegistry } from './policies.ts'
 import type { LocalStore } from './store.ts'
+import { isUnresolvedEffect } from './task-engine.ts'
 import type { NodeProposal, TaskEngine, TaskSnapshot, WorkerNode, WorkerResult } from './task-engine.ts'
 import type { ToolApprovalBroker } from './tool-approval.ts'
 import type { ToolApprovalMode } from '../../shared/contracts/tool-approval.ts'
@@ -166,7 +167,18 @@ export class MultiAgentOrchestrator {
   }
 
   session(taskId: string): SessionRef | undefined {
-    return this.#db.get<SessionRef>('task-sessions', taskId) ?? this.#db.get<AgentRecord>('agents', taskId)?.session
+    const task = this.#tasks.get(taskId)
+    return this.#db.get<SessionRef>('task-sessions', taskId)
+      ?? this.#db.get<AgentRecord>('agents', task.conversationId ?? taskId)?.session
+  }
+
+  clearBrokenSession(taskId: string): void {
+    this.#db.transaction(() => {
+      const task = this.#tasks.get(taskId)
+      const agentKey = task.conversationId ?? taskId
+      this.#db.delete('task-sessions', taskId)
+      this.#db.delete('agents', agentKey)
+    })
   }
 
   recover(): void {
@@ -727,7 +739,8 @@ export class MultiAgentOrchestrator {
       ...this.#runtimePolicy(workspace, rootScope),
       ...(this.#mode === 'quality' && advice.reasoningEffort ? { reasoningEffort: advice.reasoningEffort } : {}),
       selectSkills: skillDisclosure(this.#judgment, event, task.goal, signal),
-      resumeAfterOutputLimit: saved?.taskId === task.id && previousAttempt?.reason === 'model_output_limit',
+      resumeAfterOutputLimit: saved?.taskId === task.id && previousAttempt?.reason === 'model_output_limit' &&
+        !this.#tasks.operations(task.id).some(operation => isUnresolvedEffect(operation)),
       canRecoverModelOutput: () => !signal.aborted && !hasUnknownWrite(),
       reserveRequest: (request) => {
         signal.throwIfAborted()
@@ -846,11 +859,18 @@ export class MultiAgentOrchestrator {
           this.#db.transaction(() => { this.#db.append({ ...event, type: 'model.route_changed', payload: { route } }) })
         }
         unlockRoute()
+        const priorTaskId = saved?.taskId
+        const priorUnconfirmed = priorTaskId ? this.#tasks.operations(priorTaskId)
+          .filter(operation => operation.effect === 'write' && operation.status === 'unknown_effect') : []
         const previousGoal = saved && saved.taskId !== task.id && this.#judgment.mode('task.frame', task.id) !== 'off'
           ? this.#tasks.get(saved.taskId).goal : ''
         let nextPrompt = saved?.taskId === task.id
           ? 'Resume the task using the saved conversation. Recheck current workspace state before new edits and avoid repeating confirmed changes.\n\nOriginal task goal: ' + task.goal
           : await frameInstruction(this.#judgment, event, previousGoal, task.goal, signal, true)
+        if (priorUnconfirmed.length) {
+          const items = priorUnconfirmed.slice(0, 8).map(item => item.target ? `${item.tool} (${item.target})` : item.tool).join(', ')
+          nextPrompt += `\n\nReconciliation safety note: Previous write operation(s) [${items}] still have uncertain historical effects. Inspect current workspace state first and never automatically replay them.`
+        }
         if (advice.hint) nextPrompt += '\n\n' + advice.hint
         while (!signal.aborted) {
           const current = this.#tasks.get(task.id)

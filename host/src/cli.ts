@@ -128,7 +128,8 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode, desktop: boo
     'setConversationModel', 'subscribeConversation', 'unsubscribeConversation',
   ])
   const managementTypes = new Set([
-    'managementSnapshot', 'conversationObservatory', 'saveAgentPreferences', 'setWorkspaceAccess', 'deleteConversationMemory', 'reconcileOperation',
+    'managementSnapshot', 'conversationObservatory', 'saveAgentPreferences', 'setWorkspaceAccess', 'deleteConversationMemory',
+    'reconcileOperation', 'resolveTaskReconciliation',
     'testProviderAccount', 'validateProviderKey', 'applyProviderKey', 'applyChatGptSession', 'initializeProviderKeys',
     'getJevStatus', 'saveJevSettings', 'testJevConnection', 'applyJevKey',
     'applyCustomProvider', 'testCustomProvider', 'applyGrokSession', 'startGrokLogin', 'pollGrokLogin', 'cancelGrokLogin', 'refreshGrokLogin',

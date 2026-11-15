@@ -1,12 +1,27 @@
 import { randomUUID } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 import { mkdir, open, readFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
-import type { AgentExecution, ExecutionConfig, ExecutionSession, ModelRoute } from './execution.ts'
+import type { AgentExecution, ExecutionConfig, ExecutionSession, ModelRoute, SessionRef } from './execution.ts'
 
 const defaultRoute = { provider: 'fake', model: 'coding' }
 
 export class FakeExecution implements AgentExecution {
+  verifySession(ref: SessionRef): boolean {
+    try {
+      const transcript = readFileSync(ref.path, 'utf8')
+      if (!transcript || !transcript.endsWith('\n')) return false
+      const lines = transcript.trimEnd().split('\n')
+      const header = JSON.parse(lines[0]!)
+      if (!header || header.id !== ref.id) return false
+      for (const line of lines.slice(1)) JSON.parse(line)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   async validateRoute(route: ModelRoute): Promise<void> {
     if (route.provider !== 'fake' || !['coding', 'alternate'].includes(route.model)) {
       throw new Error('Fake routes are fake/coding and fake/alternate')

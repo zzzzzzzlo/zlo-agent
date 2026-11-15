@@ -62,7 +62,7 @@ export function createArtifactTools(workspace: CodingWorkspace, privateDirectory
         output = await open(target, 'wx', 0o600)
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code === 'EEXIST') return { ok: false, error: 'The save file already exists' }
-        throw error
+        return { ok: false, error: 'Could not create the save file' }
       }
       try {
         await output.writeFile(data)

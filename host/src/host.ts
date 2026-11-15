@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { writeHostDiagnostic } from '../../shared/diagnostics.ts'
-import { existsSync, mkdirSync, realpathSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs'
 import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import type { AgentExecution } from './execution.ts'
 import { createArtifactTools } from './artifact-tools.ts'
@@ -41,7 +41,7 @@ import { accessRank, CodingCapabilities, ExtensionRegistry } from './policies.ts
 import { probeOperation } from './reconciliation.ts'
 import type { CodingProfile } from './policies.ts'
 import { LocalStore } from './store.ts'
-import { isStopping, TaskEngine } from './task-engine.ts'
+import { isStopping, isUnresolvedEffect, TaskEngine } from './task-engine.ts'
 import type { CreateTask, NodeProposal, NodeReplan, TaskSnapshot } from './task-engine.ts'
 import { ToolApprovalBroker } from './tool-approval.ts'
 import type { ToolApprover } from './tool-approval.ts'
@@ -121,6 +121,7 @@ function desktopRequestId(id: string): string {
 
 export class LocalAgentHost {
   readonly #directory: string
+  readonly #execution: AgentExecution
   readonly #store: LocalStore
   readonly #engine: TaskEngine
   readonly #conversations: ConversationService
@@ -146,6 +147,7 @@ export class LocalAgentHost {
   constructor(options: HostOptions) {
     mkdirSync(options.directory, { recursive: true, mode: 0o700 })
     this.#directory = realpathSync(options.directory)
+    this.#execution = options.execution
     this.#stopTimeoutMs = options.stopTimeoutMs ?? defaultStopTimeoutMs
     this.#providerRuntime = options.providerRuntime
     this.#agentPreferences = {
@@ -210,12 +212,26 @@ export class LocalAgentHost {
     queueMicrotask(() => this.#dispatch())
   }
 
+  #isSessionValid(session: { id: string; path: string } | undefined, cwd: string): boolean {
+    if (!session) return true
+    if (this.#execution.verifySession) return this.#execution.verifySession(session, cwd)
+    try {
+      if (!existsSync(session.path)) return false
+      const content = readFileSync(session.path, 'utf8')
+      if (!content || !content.endsWith('\n')) return false
+      for (const line of content.trimEnd().split('\n')) JSON.parse(line)
+      return true
+    } catch {
+      return false
+    }
+  }
+
   #recover(): void {
     this.#orchestrator.recover()
     for (const task of this.#engine.list()) {
       if (!recoverableAfterCrash.has(task.status)) continue
       const session = this.#orchestrator.session(task.id)
-      const reason = session && !existsSync(session.path) ? 'checkpoint_error' : 'process_interrupted'
+      const reason = !this.#isSessionValid(session, task.cwd) ? 'checkpoint_error' : 'process_interrupted'
       this.#engine.end(task.id, reason)
     }
   }
@@ -523,8 +539,9 @@ export class LocalAgentHost {
   }
 
   #resume(taskId: string, requestId: string): ActionResult {
+    const task = this.#engine.get(taskId)
     const session = this.#orchestrator.session(taskId)
-    const result = this.#engine.resume(taskId, requestId, !session || existsSync(session.path))
+    const result = this.#engine.resume(taskId, requestId, this.#isSessionValid(session, task.cwd))
     this.#dispatch()
     return result
   }
@@ -680,13 +697,25 @@ export class LocalAgentHost {
     const conversationId = management.id(command.conversationId)
     const taskId = management.id(command.taskId)
     const id = management.operationId(command.operationId)
+    const disposition = command.disposition ?? 'probe'
+    if (disposition !== 'probe' && disposition !== 'acknowledge') {
+      throw new ConversationError('INVALID_INPUT', 'Invalid reconciliation disposition')
+    }
     this.#conversations.assertTaskOwner({ conversationId, taskId, requestId: 'reconciliation' })
     const task = this.#engine.get(taskId)
     const operation = this.#engine.operations(taskId).find(item => item.id === id)
     if (!operation) throw new ConversationError('NOT_FOUND', 'Unknown operation')
-    if (operation.reconciliation?.status === 'verified') return management.managedOperation(operation)
-    if (this.#active || task.status !== 'needs_reconciliation' || operation.status !== 'unknown_effect') {
+    if (operation.reconciliation?.status === 'verified' ||
+      (disposition === 'acknowledge' && operation.reconciliation?.status === 'acknowledged')) {
+      return management.managedOperation(operation)
+    }
+    if (this.#active || task.status !== 'needs_reconciliation' || operation.status !== 'unknown_effect' ||
+      operation.reconciliation?.status === 'acknowledged') {
       throw new ConversationError('CONFLICT', 'Operation is not ready to be checked')
+    }
+    const checkpointReady = this.#isSessionValid(this.#orchestrator.session(taskId), task.cwd)
+    if (disposition === 'acknowledge') {
+      return management.managedOperation(this.#engine.acknowledgeReconciliation(taskId, id, checkpointReady))
     }
     let workspace: CodingWorkspace
     try { workspace = this.#workspace(task.cwd) }
@@ -697,7 +726,28 @@ export class LocalAgentHost {
     const observation = await probeOperation(workspace, operation, currentAccess)
     this.#assertOpen()
     if (this.#active) throw new ConversationError('CONFLICT', 'Retry after the active run has stopped')
-    return management.managedOperation(this.#engine.recordReconciliation(taskId, id, observation))
+    const latestCheckpointReady = this.#isSessionValid(this.#orchestrator.session(taskId), task.cwd)
+    return management.managedOperation(this.#engine.recordReconciliation(taskId, id, observation, latestCheckpointReady))
+  }
+
+  #resolveTaskReconciliation(command: Extract<ManagementCommand, { type: 'resolveTaskReconciliation' }>): { status: TaskStatus } {
+    const conversationId = management.id(command.conversationId)
+    const taskId = management.id(command.taskId)
+    this.#conversations.assertTaskOwner({ conversationId, taskId, requestId: 'reconciliation' })
+    const task = this.#engine.get(taskId)
+    if (task.status === 'stopped' || task.status === 'failed') return { status: task.status }
+    if (this.#active || task.status !== 'needs_reconciliation') {
+      throw new ConversationError('CONFLICT', 'Task is not ready to be resolved')
+    }
+    const pendingOperation = this.#engine.operations(taskId).some(item =>
+      item.status === 'started' || isUnresolvedEffect(item))
+    if (pendingOperation) {
+      throw new ConversationError('CONFLICT', 'Check or acknowledge pending operations before resolving the task')
+    }
+    const checkpointReady = this.#isSessionValid(this.#orchestrator.session(taskId), task.cwd)
+    if (!checkpointReady) this.#orchestrator.clearBrokenSession(taskId)
+    const next = this.#engine.resolveTaskReconciliation(taskId, checkpointReady)
+    return { status: next.status }
   }
 
   #requireProviderRuntime(): ProviderRuntime {
@@ -761,6 +811,7 @@ export class LocalAgentHost {
         command.toolApprovalMode, command.expectedApprovalMode)
       case 'deleteConversationMemory': return this.#removeMemory(command.conversationId, command.ids)
       case 'reconcileOperation': return this.#reconcile(command)
+      case 'resolveTaskReconciliation': return this.#resolveTaskReconciliation(command)
       case 'testProviderAccount': {
         const provider = management.providerId(command.provider)
         const model = command.model === undefined ? undefined : parseRoute({ provider, model: command.model }).model
@@ -898,7 +949,7 @@ export class LocalAgentHost {
         this.#engine.end(task.id, executionFailure(result.status))
         return
       }
-      if (signal.aborted || this.#engine.operations(task.id).some(item => item.status === 'unknown_effect' || item.status === 'started')) {
+      if (signal.aborted || this.#engine.operations(task.id).some(item => isUnresolvedEffect(item) || item.status === 'started')) {
         this.#engine.end(task.id, signal.aborted ? 'model_interrupted' : 'unknown_effect')
         return
       }
@@ -921,7 +972,7 @@ export class LocalAgentHost {
               : result.textProduced ? 'assistant_response_present' : confirmedOperation ? 'confirmed_tool_operation'
                 : operations.some(item => item.status === 'failed') ? 'tool_execution_failed' : 'assistant_response_missing',
           }
-      if (signal.aborted || this.#engine.operations(task.id).some(item => item.status === 'unknown_effect' || item.status === 'started')) {
+      if (signal.aborted || this.#engine.operations(task.id).some(item => isUnresolvedEffect(item) || item.status === 'started')) {
         this.#engine.end(task.id, signal.aborted ? 'model_interrupted' : 'unknown_effect')
         return
       }

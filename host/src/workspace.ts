@@ -198,6 +198,27 @@ export class CodingWorkspace implements Verifier {
     ], signal)
   }
 
+  async gitRevisionSnapshot(ref: string, signal?: AbortSignal): Promise<string | undefined> {
+    if (!ref || ref.startsWith('-') || ref.includes('..') || /[\u0000-\u0020:?*[\\\u007f]/u.test(ref)) return undefined
+    try {
+      const result = await this.#git(['rev-parse', '--verify', ref], signal)
+      const commit = result.state === 'exited' && result.code === 0 ? result.stdout.trim() : ''
+      return /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u.test(commit) ? commit : undefined
+    } catch {
+      return undefined
+    }
+  }
+
+  async gitIndexCleanSnapshot(signal?: AbortSignal): Promise<boolean | undefined> {
+    try {
+      const result = await this.#git(['diff', '--cached', '--name-only', '--no-ext-diff', '--no-textconv', '-z'], signal)
+      if (result.state !== 'exited' || result.code !== 0 || result.truncated) return undefined
+      return result.stdout === ''
+    } catch {
+      return undefined
+    }
+  }
+
   acquireWrite(): (() => void) | undefined {
     if (!this.#startWrite()) return undefined
     let held = true
@@ -260,16 +281,16 @@ export class CodingWorkspace implements Verifier {
             truncated: result.truncated,
           }
         }, ['args'], { delegation: 'explicit', wholeWorkspace: true }),
-      this.#tool('git_status', 'Inspect local Git status for allowed workspace paths.', 'write', {},
-        async (_args, signal) => this.#gitStatus(signal), [], { delegation: 'explicit', wholeWorkspace: true }),
+      this.#tool('git_status', 'Inspect local Git status for allowed workspace paths.', 'read', {},
+        async (_args, signal) => this.#gitStatus(signal), [], { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true }),
       this.#tool('git_diff', 'Inspect the unstaged or staged Git diff for a single allowed text file.',
-        'write', { path: pathProperty, staged: { type: 'boolean' } }, async (args, signal) => {
+        'read', { path: pathProperty, staged: { type: 'boolean' } }, async (args, signal) => {
           if (args.staged !== undefined && typeof args.staged !== 'boolean') throw new WorkspaceDenied('Invalid staged flag')
           return this.gitDiffSnapshot(args.path, args.staged === true, signal)
-        }, ['staged'], { delegation: 'explicit', wholeWorkspace: true }),
-      this.#tool('git_log', 'Inspect the last ten local commits as abbreviated IDs and dates.', 'write', {},
+        }, ['staged'], { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true }),
+      this.#tool('git_log', 'Inspect the last ten local commits as abbreviated IDs and dates.', 'read', {},
         async (_args, signal) => this.#gitText(['log', '-n', '10', '--format=%h%x09%cs'], signal), [],
-        { delegation: 'explicit', wholeWorkspace: true }),
+        { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true }),
     ]
   }
 
@@ -342,7 +363,10 @@ export class CodingWorkspace implements Verifier {
           return await execute(input as Record<string, unknown>, signal)
         } catch (error) {
           if (error instanceof WorkspaceDenied) return { ok: false, error: error.message }
-          if (effect === 'read') return { ok: false, error: 'Workspace entry unavailable' }
+          if (effect === 'read') {
+            if (error instanceof UnknownProcessEffect) return { ok: false, error: 'Git inspection interrupted' }
+            return { ok: false, error: 'Workspace entry unavailable' }
+          }
           if (error instanceof UnknownProcessEffect) throw error
           throw new Error('Workspace write could not be confirmed')
         } finally {
@@ -360,7 +384,12 @@ export class CodingWorkspace implements Verifier {
       await mkdir(join(parent, parts.at(-1)!))
       return { ok: true }
     } catch (error) {
-      if (errorCode(error) === 'EEXIST') throw new WorkspaceDenied('Workspace entry already exists')
+      const code = errorCode(error)
+      if (code === 'EEXIST') throw new WorkspaceDenied('Workspace entry already exists')
+      if (code === 'EACCES' || code === 'EPERM' || code === 'ENOENT' || code === 'ENOTDIR' || code === 'EROFS' ||
+        code === 'EINVAL' || code === 'ENAMETOOLONG' || code === 'ENOSPC') {
+        return { ok: false, error: 'Could not create directory' }
+      }
       throw error
     }
   }
@@ -495,7 +524,12 @@ export class CodingWorkspace implements Verifier {
     try {
       file = await open(target, 'wx')
     } catch (error) {
-      if (errorCode(error) === 'EEXIST') return { ok: false, error: 'Workspace entry already exists' }
+      const code = errorCode(error)
+      if (code === 'EEXIST') return { ok: false, error: 'Workspace entry already exists' }
+      if (code === 'EACCES' || code === 'EPERM' || code === 'ENOENT' || code === 'ENOTDIR' || code === 'EROFS' ||
+        code === 'EISDIR' || code === 'EINVAL' || code === 'ENAMETOOLONG' || code === 'ENOSPC') {
+        return { ok: false, error: 'Could not create workspace file' }
+      }
       throw error
     }
     await writeAndSync(file, content)
@@ -517,7 +551,13 @@ export class CodingWorkspace implements Verifier {
     if (content === text) return { ok: true, changed: false }
     if (signal?.aborted) return { ok: false, error: 'Tool interrupted before writing' }
     const staged = join(dirname(path), `.zlo-edit-${randomUUID()}.tmp`)
-    const file = await open(staged, 'wx', stat.mode & 0o777)
+    let file
+    try {
+      file = await open(staged, 'wx', stat.mode & 0o777)
+    } catch {
+      return { ok: false, error: 'Could not stage workspace edit' }
+    }
+    let renameStarted = false
     let committed = false
     try {
       await writeAndSync(file, content)
@@ -526,11 +566,25 @@ export class CodingWorkspace implements Verifier {
         throw new WorkspaceDenied('Workspace file changed before edit')
       }
       if (signal?.aborted) return { ok: false, error: 'Tool interrupted before writing' }
+      renameStarted = true
       await rename(staged, path)
       committed = true
       return { ok: true, changed: true }
+    } catch (error) {
+      if (!renameStarted) {
+        await unlink(staged).catch((unlinkError) => {
+          if (errorCode(unlinkError) !== 'ENOENT') throw unlinkError
+        })
+        if (error instanceof WorkspaceDenied) throw error
+        return { ok: false, error: 'Could not stage workspace edit' }
+      }
+      throw error
     } finally {
-      if (!committed) await unlink(staged)
+      if (!committed) {
+        await unlink(staged).catch((unlinkError) => {
+          if (errorCode(unlinkError) !== 'ENOENT') throw unlinkError
+        })
+      }
     }
   }
 }

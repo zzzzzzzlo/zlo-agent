@@ -32,6 +32,10 @@ const probeLabels: Record<string, string> = {
   git_probe_requires_trusted_workspace: '当前工作区未授予受信任执行权限，已跳过 Git 状态读取。',
   git_status_observed_without_expected_revision: '已读取 Git 状态，缺少原操作的预期版本。',
   git_status_unavailable: '无法读取 Git 状态。',
+  git_branch_matches_recorded_postcondition: '目标分支已按操作前记录的提交创建。',
+  git_branch_absent_matches_precondition: '目标分支未创建且当前 HEAD 未变化。',
+  git_head_unchanged_and_index_clean: 'Git HEAD 未变化且暂存区干净。',
+  git_commit_matches_recorded_postcondition: 'Git 提交与暂存区状态符合预期记录。',
   original_process_identity_not_available: '已无法确认原进程身份与执行结果。',
   recorded_pid_exists_identity_unconfirmed: '记录的进程号仍存在，无法确认是否为原进程。',
   recorded_pid_absent_effect_unconfirmed: '记录的进程号已不存在，执行效果仍无法确认。',
@@ -41,7 +45,15 @@ const probeLabels: Record<string, string> = {
   file_observed_without_expected_digest: '已读取文件，缺少原操作的预期内容记录。',
   file_content_differs: '文件内容与原操作的预期记录不符。',
   file_content_matches_recorded_postcondition: '当前文件内容与操作前保存的预期摘要一致。',
+  file_content_matches_recorded_precondition: '当前文件内容仍保持操作前状态（未发生修改）。',
+  file_absent_matches_precondition: '目标文件尚未创建（保持操作前状态）。',
+  file_deleted_matches_postcondition: '目标文件已按预期删除。',
+  file_intact_matches_precondition: '目标文件未删除且保持操作前状态。',
+  patch_matches_recorded_postcondition: '批量修改的所有文件均与预期修改后摘要一致。',
+  patch_matches_recorded_precondition: '批量修改的所有文件均保持修改前状态。',
+  patch_partially_applied_or_modified: '批量修改仅部分生效或已被外部更改，请人工检查。',
   file_missing_or_unreadable: '未找到文件或无法读取。',
+  user_acknowledged_after_inspection: '已由用户人工核查工作区状态（历史回执保留不确定标记）。',
 }
 
 export function TaskManagement({ snapshot, busy, perform }: {
@@ -169,39 +181,67 @@ export function OperationReview({ snapshot, busy, api, perform }: {
   const conversationId = snapshot.conversation?.id
   const pending = snapshot.tasks.flatMap((task) => task.operations
     .filter((operation) => operation.reconciliation || ['unknown', 'unknown_effect', 'needs_reconciliation'].includes(operation.status))
-    .map((operation) => ({ taskId: task.taskId, operation })))
+    .map((operation) => ({ taskId: task.taskId, taskStatus: task.status, operation })))
   const blocked = snapshot.tasks.filter(task => task.status === 'needs_reconciliation' &&
-    !pending.some(item => item.taskId === task.taskId && item.operation.status === 'unknown_effect'))
+    !pending.some(item => item.taskId === task.taskId && item.operation.status === 'unknown_effect' &&
+      item.operation.reconciliation?.status !== 'acknowledged'))
   return (
     <section className="management-group">
       <h4>异常核对</h4>
       {!pending.length && !blocked.length && <p className="management-note">{conversationId ? '此会话暂无待核对的操作。' : '请选择一个会话查看异常操作。'}</p>}
-      {blocked.map(task => <p key={task.taskId} className="management-note">
-        任务 {task.taskId.slice(0, 8)} 仍需人工核对。{task.reason === 'checkpoint_error' ? '会话检查点不可用。'
-          : task.reason === 'stop_timeout' ? '先前的停止操作超时。' : '缺少可自动核对的回执。'}
-      </p>)}
-      {pending.map(({ taskId, operation }) => {
+      {blocked.map(task => (
+        <div className="management-row" key={task.taskId}>
+          <div>
+            <strong>任务 {task.taskId.slice(0, 8)} 仍需人工核对</strong>
+            <small>{task.reason === 'checkpoint_error' ? '会话检查点不可用或待验证。'
+              : task.reason === 'stop_timeout' ? '先前的停止操作超时。' : '缺少可自动核对的回执。'}</small>
+          </div>
+          {api.resolveTaskReconciliation && (
+            <button type="button" className="button-neutral" disabled={busy || !conversationId} onClick={() => {
+              if (!conversationId || !api.resolveTaskReconciliation) return
+              perform(async () => {
+                await api.resolveTaskReconciliation!({ conversationId, taskId: task.taskId })
+              })
+            }}>确认已核查并解除阻塞</button>
+          )}
+        </div>
+      ))}
+      {pending.map(({ taskId, taskStatus, operation }) => {
         const key = taskId + '/' + operation.id
-        const result = operation.reconciliation?.status === 'verified' ? operation : results[key] ?? operation
+        const result = operation.reconciliation?.status === 'verified' || operation.reconciliation?.status === 'acknowledged'
+          ? operation : results[key] ?? operation
         const verified = result.reconciliation?.status === 'verified'
+        const acknowledged = result.reconciliation?.status === 'acknowledged'
+        const settled = verified || acknowledged || taskStatus !== 'needs_reconciliation'
         return (
           <div className="management-row" key={key}>
             <div>
               <strong>{operation.tool}</strong>
               {operation.target && <small>{operation.target}</small>}
-              <small>{verified ? '状态核对通过' : (operations[operation.status] ?? operation.status)}</small>
+              <small>{verified ? '状态核对通过' : acknowledged ? '结果未知（人工已核查）' : (operations[operation.status] ?? operation.status)}</small>
               {result.reconciliation && <small>{probeLabels[result.reconciliation.evidence] ?? result.reconciliation.evidence}</small>}
               {result.reconciliation?.changedEntries !== undefined && (
                 <small>Git 变更 {result.reconciliation.changedEntries} 项{result.reconciliation.truncated && '（输出已截断）'}</small>
               )}
             </div>
-            <button type="button" className="button-neutral" disabled={busy || !conversationId || verified} onClick={() => {
-              if (!conversationId) return
-              perform(async () => {
-                const checked = await api.reconcile({ conversationId, taskId, operationId: operation.id })
-                setResults((previous) => ({ ...previous, [key]: checked }))
-              })
-            }}>核对实际状态</button>
+            <div className="management-actions">
+              <button type="button" className="button-neutral" disabled={busy || !conversationId || settled} onClick={() => {
+                if (!conversationId) return
+                perform(async () => {
+                  const checked = await api.reconcile({ conversationId, taskId, operationId: operation.id })
+                  setResults((previous) => ({ ...previous, [key]: checked }))
+                })
+              }}>核对实际状态</button>
+              {!settled && (
+                <button type="button" className="button-neutral" disabled={busy || !conversationId} onClick={() => {
+                  if (!conversationId) return
+                  perform(async () => {
+                    const checked = await api.reconcile({ conversationId, taskId, operationId: operation.id, disposition: 'acknowledge' })
+                    setResults((previous) => ({ ...previous, [key]: checked }))
+                  })
+                }}>人工确认已核查</button>
+              )}
+            </div>
           </div>
         )
       })}
