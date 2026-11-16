@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { jevModel, jevReasons } from '../../shared/contracts/jev.ts'
+import { jevModel, jevReasons, publicBatchLabels } from '../../shared/contracts/jev.ts'
 import type { DecisionPoint, JevDecisionStatus, JevReason, JudgmentMode } from '../../shared/contracts/jev.ts'
 import type { EventDraft } from './contracts/domain.ts'
 import type { LocalStore } from './store.ts'
@@ -154,10 +154,18 @@ function publicFeatures(point: DecisionPoint, input: Record<string, unknown>): R
       status: category(input.status, ['missing', 'ready', 'running', 'failed', 'succeeded']), requested: flag(input.requested),
       hasWrite: flag(input.hasWrite), replanCount: count(input.replanCount), isRootChild: flag(input.isRootChild),
     }
+    case 'swarm.patch': return {
+      writeCount: count(input.writeCount), targetCount: count(input.targetCount),
+      hasScopePath: flag(typeof input.proposedGoal === 'string' && input.proposedGoal.length > 0),
+    }
+    case 'memory.capture': return {
+      evidenceCount: count(input.evidenceCount), factCount: count(input.factCount), experienceCount: count(input.experienceCount),
+    }
     default: return {
       evidenceCount: count(input.evidenceCount), failedCount: count(input.failedCount),
-      writeCount: count(input.writeCount), checkConfigured: flag(input.checkConfigured),
-      checkPassed: flag(input.checkPassed), toolCount: count(input.toolCount),
+      writeCount: count(input.writeCount), targetCount: count(input.targetCount),
+      bytes: count(input.bytes), candidateCount: count(input.candidateCount),
+      checkConfigured: flag(input.checkConfigured), checkPassed: flag(input.checkPassed), toolCount: count(input.toolCount),
       length: count(input.length), initial: flag(input.initial),
       tool: category(input.tool, ['web_search', 'web_fetch', 'browser_snapshot', 'process_output',
         'run_project_command', 'search_files', 'search_content', 'read_text_file', 'git_diff']),
@@ -309,8 +317,12 @@ export class LocalJudgment {
     const judgeOutput = baseline.map((_, index) => candidate.items?.[index]?.output ?? null)
     const fallbackReasons = baseline.map((_, index) => candidate.items?.[index]?.reason ?? candidate.reason ?? null)
     const output = baseline.map((value, index) => mode === 'active' ? judgeOutput[index] ?? value : value)
+    const safeLabels = items.map(item => category(item.label, publicBatchLabels) ?? null)
     this.#publish(event, point, mode, input, refs, links, candidate, started, Boolean(policy), {
-      batch: { baseline, output, judgeOutput, fallbackReasons },
+      batch: {
+        baseline, output, judgeOutput, fallbackReasons,
+        ...(safeLabels.some(item => item !== null) ? { labels: safeLabels } : {}),
+      },
       ...(judgeOutput.some(value => value !== null)
         ? { disagreement: judgeOutput.some((value, index) => value !== null && value !== baseline[index]) } : {}),
     })

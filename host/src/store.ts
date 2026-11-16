@@ -216,7 +216,18 @@ export class LocalStore {
       firstPassVerified: boolean; selfRepaired: boolean; steered: boolean;
       input: number; output: number; cacheRead: number; cacheWrite: number;
       estimatedCostUsd: number | null; toolCalls: number; toolFailed: number; durationMs: number | null;
+      judgmentCalls: number; judgmentInterventions: number;
     }[] = [];
+
+    const judgmentRows = this.#db.prepare(`
+      SELECT json_extract(r.value, '$.taskId') AS taskId, e.event AS eventJson
+      FROM records r
+      JOIN events e ON e.task_id = json_extract(r.value, '$.taskId')
+      WHERE r.namespace = ?
+        AND json_extract(e.event, '$.type') IN ('judgment.evaluated', 'tool.evidence_replayed')
+      ORDER BY r.id, e.seq
+    `).all(namespace) as { taskId: string; eventJson: string }[];
+    const judgments = summarizeConversationJudgments(judgmentRows);
 
     for (const row of rows) {
       const turn = JSON.parse(row.turnJson as string) as {
@@ -289,6 +300,7 @@ export class LocalStore {
       const endIso = ended ? (typeof row.terminalAt === 'string' ? row.terminalAt : row.lastAt) : row.lastAt;
       const endMs = typeof endIso === 'string' ? Date.parse(endIso) : NaN;
       const durationMs = Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs ? endMs - startMs : null;
+      const perTurnJev = judgments.byTask.get(turn.taskId);
 
       turnMetrics.push({
         taskId: turn.taskId,
@@ -308,6 +320,8 @@ export class LocalStore {
         toolCalls,
         toolFailed,
         durationMs,
+        judgmentCalls: perTurnJev?.calls ?? 0,
+        judgmentInterventions: perTurnJev?.interventions ?? 0,
       });
     }
 
@@ -320,7 +334,7 @@ export class LocalStore {
     return {
       modelRequests, usageReports, pricedReports,
       estimatedCostUsd: totalCost, usage, tools,
-      completion, turnMetrics: turnMetrics.slice(-30),
+      completion, turnMetrics: turnMetrics.slice(-30), judgments: judgments.summary,
     };
   }
 
@@ -578,4 +592,169 @@ function validateCursor(cursor: number): void {
 
 function isThenable(value: unknown): value is PromiseLike<unknown> {
   return value != null && typeof (value as { then?: unknown }).then === 'function';
+}
+
+const coreJudgmentOrder = ['tool.injection', 'turn.completion', 'swarm.patch', 'tool.admission', 'model.task_fit', 'memory.capture'];
+
+function summarizeConversationJudgments(rows: readonly { taskId: string; eventJson: string }[]) {
+  const replayedTasks = new Set<string>();
+  const parsedRows: { taskId: string; payload: Record<string, unknown> }[] = [];
+  for (const row of rows) {
+    const parsed = JSON.parse(row.eventJson) as { type?: string; payload?: Record<string, unknown> };
+    if (parsed.type === 'tool.evidence_replayed') {
+      replayedTasks.add(row.taskId);
+    } else if (parsed.type === 'judgment.evaluated' && parsed.payload) {
+      parsedRows.push({ taskId: row.taskId, payload: parsed.payload });
+    }
+  }
+  const byTask = new Map<string, { calls: number; interventions: number }>();
+  const pointMap = new Map<string, { point: string; total: number; activeInterventions: number; shadowDisagreements: number; fallbacks: number }>();
+  const recent: {
+    taskId: string; point: string; mode: 'off' | 'shadow' | 'active';
+    impactKind: 'intervened' | 'shadow_diff' | 'fallback' | 'aligned' | 'baseline_only';
+    whatSummary: string; verdictSummary: string; impactSummary: string;
+    judgeModel?: string; elapsedMs?: number; fallbackReason?: string;
+  }[] = [];
+  let total = 0, externalCalls = 0, activeInterventions = 0, shadowDisagreements = 0, fallbacks = 0;
+  let injectionBlocks = 0, completionFollowUps = 0, admissionOmissions = 0, patchFlags = 0, memoryFiltered = 0;
+  let estimatedCostUsd: number | null = null;
+
+  for (const { taskId, payload } of parsedRows) {
+    const mode = payload.mode === 'active' || payload.mode === 'shadow' ? payload.mode : 'off';
+    if (mode === 'off') continue;
+    const point = typeof payload.id === 'string' ? payload.id : 'unknown';
+    const judgeStatus = typeof payload.judgeStatus === 'string' ? payload.judgeStatus : undefined;
+    const fallbackReason = typeof payload.fallbackReason === 'string' ? payload.fallbackReason : undefined;
+    const judgeModel = typeof payload.judgeModel === 'string' ? payload.judgeModel : undefined;
+    const elapsedMs = typeof payload.elapsedMs === 'number' && Number.isFinite(payload.elapsedMs) ? payload.elapsedMs : undefined;
+    const features = (payload.features && typeof payload.features === 'object' ? payload.features : {}) as Record<string, unknown>;
+    const batch = (payload.batch && typeof payload.batch === 'object' ? payload.batch : undefined) as {
+      baseline?: unknown[]; output?: unknown[]; judgeOutput?: unknown[];
+    } | undefined;
+    const baseArr = Array.isArray(batch?.baseline) ? batch.baseline.map(v => v === true) : undefined;
+    const outArr = Array.isArray(batch?.output) ? batch.output.map(v => v === true) : undefined;
+    const judgeArr = Array.isArray(batch?.judgeOutput) ? batch.judgeOutput : undefined;
+    const disagree = payload.disagreement === true ||
+      (baseArr && outArr ? baseArr.some((val, idx) => val !== outArr[idx]) : payload.output !== payload.baseline);
+
+    total++;
+    const requested = payload.requestSent === true ||
+      (judgeStatus !== undefined && judgeStatus !== 'baseline' && fallbackReason !== 'no_choice');
+    if (requested) externalCalls++;
+    const usage = payload.usage as { estimatedCostUsd?: unknown } | undefined;
+    if (typeof usage?.estimatedCostUsd === 'number' && Number.isFinite(usage.estimatedCostUsd) && usage.estimatedCostUsd >= 0) {
+      estimatedCostUsd = (estimatedCostUsd ?? 0) + usage.estimatedCostUsd;
+    }
+
+    const isFallback = judgeStatus !== undefined && judgeStatus !== 'baseline' && judgeStatus !== 'valid' && fallbackReason !== 'no_choice';
+    const impactKind = isFallback ? 'fallback'
+      : mode === 'active' && disagree ? 'intervened'
+        : mode === 'shadow' && disagree ? 'shadow_diff' : 'aligned';
+    if (impactKind === 'intervened') activeInterventions++;
+    if (impactKind === 'shadow_diff' || (mode === 'shadow' && disagree)) shadowDisagreements++;
+    if (isFallback) fallbacks++;
+
+    const taskStat = byTask.get(taskId) ?? { calls: 0, interventions: 0 };
+    taskStat.calls++;
+    if (impactKind === 'intervened') taskStat.interventions++;
+    byTask.set(taskId, taskStat);
+
+    const pStat = pointMap.get(point) ?? { point, total: 0, activeInterventions: 0, shadowDisagreements: 0, fallbacks: 0 };
+    pStat.total++;
+    if (impactKind === 'intervened') pStat.activeInterventions++;
+    if (mode === 'shadow' && disagree) pStat.shadowDisagreements++;
+    if (isFallback) pStat.fallbacks++;
+    pointMap.set(point, pStat);
+
+    const batchLen = outArr?.length ?? baseArr?.length ?? 0;
+    const baseTrue = baseArr?.filter(Boolean).length ?? 0;
+    const outTrue = outArr?.filter(Boolean).length ?? 0;
+    let whatSummary = `评估 ${point}`;
+    let verdictSummary = '';
+    let impactSummary = '';
+
+    if (point === 'tool.injection') {
+      const toolName = typeof features.tool === 'string' ? features.tool : '工具输出';
+      whatSummary = `扫描 ${toolName} 安全片段 (${batchLen} 段)`;
+      verdictSummary = `基线 ${baseTrue}/${batchLen} → 实际拦截 ${outTrue}/${batchLen}`;
+      if (mode === 'active') injectionBlocks += outTrue;
+      impactSummary = mode === 'active' && outTrue > baseTrue
+        ? `额外隔离 ${outTrue - baseTrue} 段可疑注入指令`
+        : outTrue > 0 ? `基线已隔离 ${outTrue} 段注入`
+          : isFallback ? `回退规则基线 (${fallbackReason ?? judgeStatus})` : '未发现注入威胁，原文放行';
+    } else if (point === 'tool.admission') {
+      const toolName = typeof features.tool === 'string' ? features.tool : '外部工具';
+      const omitted = batchLen - outTrue;
+      whatSummary = `筛选 ${toolName} 输出片段 (${batchLen} 段)`;
+      verdictSummary = `保留 ${outTrue}/${batchLen} 段 · 折叠 ${omitted} 段`;
+      if (mode === 'active') admissionOmissions += omitted;
+      impactSummary = mode === 'active' && omitted > 0
+        ? `已折叠 ${omitted} 段低相关文本${replayedTasks.has(taskId) ? '（后续按需回放）' : '并归档原文'}`
+        : isFallback ? `回退全量保留 (${fallbackReason ?? judgeStatus})` : '全量保留进入上下文';
+    } else if (point === 'turn.completion') {
+      const role = typeof features.role === 'string' ? features.role : 'root';
+      const writes = typeof features.writeCount === 'number' ? features.writeCount : 0;
+      whatSummary = `审查 ${role} 交付完整度 (写入 ${writes} 次)`;
+      const out = payload.output === true;
+      verdictSummary = `基线=${payload.baseline === true ? '不足' : '放行'} → 实际=${out ? '补充验证' : '放行'}`;
+      if (mode === 'active' && out) completionFollowUps++;
+      impactSummary = mode === 'active' && out ? '拦截过早收尾，触发补充自检轮次'
+        : impactKind === 'shadow_diff' ? 'Shadow 建议补充检查（未拦截）'
+          : isFallback ? `回退基线放行 (${fallbackReason ?? judgeStatus})` : '允许回合正常收尾';
+    } else if (point === 'swarm.patch') {
+      const writes = typeof features.writeCount === 'number' ? features.writeCount : 0;
+      const targets = typeof features.targetCount === 'number' ? features.targetCount : 0;
+      whatSummary = `审查子 Agent 补丁范围 (写入 ${writes} · 路径 ${targets})`;
+      const out = payload.output === true;
+      verdictSummary = `实际=${out ? '标记越界提醒' : '范围合规'}`;
+      if (mode === 'active' && out) patchFlags++;
+      impactSummary = mode === 'active' && out ? '已标记 patch_scope_review 提醒主 Agent 复核'
+        : isFallback ? `回退基线放行 (${fallbackReason ?? judgeStatus})` : '补丁范围符合子目标约束';
+    } else if (point === 'model.task_fit') {
+      const count = Array.isArray(features.candidates) ? features.candidates.length : 0;
+      whatSummary = `评估 ${count} 个候选模型路由适配度`;
+      verdictSummary = `基线 #${String(payload.baseline ?? 0)} → 实际 #${String(payload.output ?? 0)}`;
+      impactSummary = mode === 'active' && disagree ? `已切换至候选模型 #${String(payload.output)}`
+        : impactKind === 'shadow_diff' ? `Shadow 推荐 #${String(payload.shadow ?? payload.judgeOutput)}（未切换）`
+          : '沿用基线模型路由';
+    } else if (point === 'memory.capture') {
+      const dropped = batchLen - outTrue;
+      whatSummary = `筛选长期记忆候选 (${batchLen} 条)`;
+      verdictSummary = `保留 ${outTrue}/${batchLen} 条（过滤 ${dropped} 条）`;
+      if (mode === 'active') memoryFiltered += dropped;
+      impactSummary = mode === 'active' && dropped > 0 ? `已过滤 ${dropped} 条低价值记忆`
+        : `保留 ${outTrue} 条进入持久化`;
+    } else {
+      verdictSummary = batch ? `保留 ${outTrue}/${batchLen} (Jev ${judgeArr?.filter(v => v === true).length ?? 0})`
+        : `基线 ${String(payload.baseline ?? '—')} → 实际 ${String(payload.output ?? '—')}`;
+      impactSummary = impactKind === 'intervened' ? 'Active 模式改写了规则基线'
+        : impactKind === 'shadow_diff' ? 'Shadow 与基线存在分歧'
+          : isFallback ? `回退基线 (${fallbackReason ?? judgeStatus})` : '与基线一致';
+    }
+
+    recent.push({
+      taskId, point, mode, impactKind, whatSummary, verdictSummary, impactSummary,
+      ...(judgeModel ? { judgeModel } : {}),
+      ...(elapsedMs !== undefined ? { elapsedMs } : {}),
+      ...(fallbackReason ? { fallbackReason } : {}),
+    });
+  }
+
+  const byPoint = [...pointMap.values()].sort((left, right) => {
+    const li = coreJudgmentOrder.indexOf(left.point);
+    const ri = coreJudgmentOrder.indexOf(right.point);
+    if (li >= 0 && ri >= 0) return li - ri;
+    if (li >= 0) return -1;
+    if (ri >= 0) return 1;
+    return left.point.localeCompare(right.point);
+  });
+
+  return {
+    byTask,
+    summary: {
+      total, externalCalls, activeInterventions, shadowDisagreements, fallbacks,
+      injectionBlocks, completionFollowUps, admissionOmissions, patchFlags, memoryFiltered,
+      estimatedCostUsd, byPoint, recent: recent.slice(-24).reverse(),
+    },
+  };
 }

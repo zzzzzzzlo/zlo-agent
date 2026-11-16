@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { verificationVerdict } from '../../shared/contracts/domain.ts'
 import type { VerificationResult } from '../../shared/contracts/domain.ts'
-import { jevModel, jevReasons, judgmentPoints, retiredJudgmentPointIds } from '../../shared/contracts/jev.ts'
+import { jevModel, jevReasons, judgmentPoints, publicBatchLabels, retiredJudgmentPointIds } from '../../shared/contracts/jev.ts'
 import type { TelemetryEvent, TelemetryTask, TelemetryVerification } from '../../shared/contracts/observatory.ts'
 import { approvalKinds } from '../../shared/contracts/tool-approval.ts'
 import type { AgentEvent } from './contracts/domain.ts'
@@ -71,9 +71,11 @@ function judgment(p: Record<string, unknown>) {
   const input = obj(p.features)
   const features: Record<string, unknown> = {}
   for (const key of ['nodeCount', 'nodeOrdinal', 'goalLength', 'evidenceCount', 'artifactCount', 'completedChildren', 'replanCount',
-    'failedCount', 'writeCount', 'toolCount', 'length', 'attemptCount']) features[key] = num(input[key])
+    'failedCount', 'writeCount', 'targetCount', 'bytes', 'candidateCount', 'factCount', 'experienceCount', 'toolCount', 'length', 'attemptCount']) {
+    features[key] = num(input[key])
+  }
   for (const key of ['teamCandidate', 'hasDependencies', 'nonEmptyGoal', 'independent', 'requested', 'checked', 'checkPassed',
-    'checkConfigured', 'hasWrite', 'isRootChild', 'initial']) features[key] = bool(input[key])
+    'checkConfigured', 'hasWrite', 'isRootChild', 'hasScopePath', 'initial']) features[key] = bool(input[key])
   features.role = oneOf(input.role, roles)
   features.access = oneOf(input.access, accessLevels)
   features.status = oneOf(input.status, ['missing', ...states])
@@ -100,6 +102,7 @@ function judgment(p: Record<string, unknown>) {
       output: list(batch.output, 8).map(value => bool(value) ?? null),
       judgeOutput: list(batch.judgeOutput, 8).map(value => bool(value) ?? null),
       fallbackReasons: list(batch.fallbackReasons, 8).map(value => oneOf(value, jevReasons) ?? null),
+      ...(Array.isArray(batch.labels) ? { labels: list(batch.labels, 8).map(value => oneOf(value, publicBatchLabels) ?? null) } : {}),
     },
     usage: p.usage === undefined ? undefined : { input: num(usage.input), output: num(usage.output), estimatedCostUsd: num(usage.estimatedCostUsd) } }
 }
@@ -151,6 +154,7 @@ function safePayload(type: string, p: Record<string, unknown>): Record<string, u
         ...(type === 'tool.finished' && Array.isArray(p.targetDigests) ? {
           targetDigests: list(p.targetDigests, 12).filter(value => typeof value === 'string' && hashPattern.test(value)),
         } : {}) }
+    case 'tool.evidence_replayed': return { id: ref(p.id), tool: label(p.tool) }
     case 'task.permissions_changed': return { access: oneOf(p.access, accessLevels), previousAccess: oneOf(p.previousAccess, accessLevels) }
     case 'operation.reconciliation_required': case 'operation.reconciliation_checked':
     case 'operation.reconciliation_acknowledged': case 'task.reconciliation_resolved': return { status, reason,

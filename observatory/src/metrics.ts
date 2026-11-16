@@ -1,7 +1,7 @@
 import { resolveUsdToCnyRate, usdToCny } from '../../shared/contracts/currency.ts'
 import type { ModelRoute } from '../../shared/contracts/domain.ts'
 import type { TelemetryEvent, TelemetryTask } from '../../shared/contracts/observatory.ts'
-import { judgmentPoints } from '../../shared/contracts/jev.ts'
+import { coreJudgmentPoints } from '../../shared/contracts/jev.ts'
 import type { EvaluationJob } from './database.ts'
 import type { EvaluationResult } from './evaluation.ts'
 import { buildTrace, object, peakConfirmedAgents, providerUsage, quantity, text, unionDuration } from './trace.ts'
@@ -309,6 +309,23 @@ function judgmentMetrics(events: TelemetryEvent[], complete: boolean, usdToCnyRa
   const activeJudgeAttempts = events.filter(event => event.payload.mode !== 'off' && event.payload.judgeStatus && event.payload.judgeStatus !== 'baseline' && event.payload.fallbackReason !== 'no_choice').length
   const external = events.filter(event => event.payload.requestSent ??
     (event.payload.mode !== 'off' && event.payload.judgeStatus !== 'baseline'))
+  const activeEvents = events.filter(event => event.payload.mode === 'active')
+  const injectionBlocks = activeEvents.filter(event => event.payload.id === 'tool.injection')
+    .reduce((sum, event) => {
+      const output = object(event.payload.batch)?.output
+      return sum + (Array.isArray(output) ? output.filter(v => v === true).length : 0)
+    }, 0)
+  const completionFollowUps = activeEvents.filter(event => event.payload.id === 'turn.completion' && event.payload.output === true).length
+  const admissionOmissions = activeEvents.filter(event => event.payload.id === 'tool.admission')
+    .reduce((sum, event) => {
+      const output = object(event.payload.batch)?.output
+      return sum + (Array.isArray(output) ? output.filter(v => v === false).length : 0)
+    }, 0)
+  const memoryFiltered = activeEvents.filter(event => event.payload.id === 'memory.capture')
+    .reduce((sum, event) => {
+      const output = object(event.payload.batch)?.output
+      return sum + (Array.isArray(output) ? output.filter(v => v === false).length : 0)
+    }, 0)
   return [
     count('judgment.decisions', 'Judgment decisions', events.length, 'Recorded evaluations across all registered judgment points.', complete),
     rate('judgment.shadow_disagreement', 'Shadow disagreement', shadowDifferent, shadow.length,
@@ -317,6 +334,10 @@ function judgmentMetrics(events: TelemetryEvent[], complete: boolean, usdToCnyRa
       'Non-baseline Jev evaluations that timed out, failed, returned invalid output, or were throttled.', complete),
     count('judgment.active_changes', 'Active selection changes', events.filter(event => event.payload.mode === 'active' &&
       (event.payload.disagreement ?? event.payload.output !== event.payload.baseline)).length, 'Active selections different from the rule baseline.', complete),
+    count('judgment.injection_blocks', 'Prompt injection blocks', injectionBlocks, 'Segments isolated under Active tool.injection policy.', complete),
+    count('judgment.completion_followups', 'Premature completion intercepts', completionFollowUps, 'Turns intercepted by Active turn.completion for supplementary work.', complete),
+    count('judgment.admission_omissions', 'Low-signal excerpts omitted', admissionOmissions, 'External output segments collapsed under Active tool.admission (retained for replay).', complete),
+    count('judgment.memory_filtered', 'Low-value memories filtered', memoryFiltered, 'Memory candidates withheld by Active memory.capture.', complete),
     values('judgment.mean_latency', 'Mean judgment latency', 'ms', events.map(event => quantity(event.payload.elapsedMs)),
       'Mean elapsed time recorded by the Judgment Kernel, including local rules.', { complete, aggregate: 'mean' }),
     cnyValues('judgment.cost', 'Estimated judgment cost (CNY)', external.map(event => quantity(object(event.payload.usage)?.estimatedCostUsd)),
@@ -682,7 +703,7 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
     return { key, label: point ?? 'Unknown decision point', point, mode,
       featureSchemaVersion: quantity(group[0].payload.featureSchemaVersion), metrics: judgmentMetrics(group, complete, usdToCnyRate), references: eventReferences(group) }
   })
-  for (const { id: point } of judgmentPoints) {
+  for (const { id: point } of coreJudgmentPoints) {
     if (!judgments.some(group => group.point === point)) {
       judgments.push({ key: point, label: point, point, metrics: judgmentMetrics([], complete, usdToCnyRate), references: [] })
     }

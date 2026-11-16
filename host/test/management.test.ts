@@ -9,6 +9,7 @@ import type { ConversationObservatory, ManagedOperation } from '../../shared/con
 import { FakeExecution } from '../src/fake.ts'
 import type { AgentExecution, ExecutionConfig } from '../src/execution.ts'
 import { LocalAgentHost } from '../src/host.ts'
+import type { JudgmentOptions } from '../src/judgment.ts'
 import { ExtensionRegistry } from '../src/policies.ts'
 
 async function fixture(t: TestContext) {
@@ -559,5 +560,122 @@ test('saving trusted default workspaceAccess preserves trusted when creating new
     assert.equal(trustedConv.workspaceAccess, 'trusted')
   } finally {
     await host.close()
+  }
+})
+
+test('conversation observatory tracks causal Jev interventions across turns and preserves restart determinism without leaking private text', async (t) => {
+  const { directory, workspace } = await fixture(t)
+  const fake = new FakeExecution()
+  let completionCalls = 0
+  const extensions = new ExtensionRegistry([{
+    id: 'mockweb',
+    tools: () => [{
+      name: 'web_fetch',
+      effect: 'read',
+      description: 'Mock fetch',
+      parameters: {},
+      execute: async () => ({
+        ok: true, untrusted: true, title: 'Spec',
+        text: 'benign documentation PRIVATE_OBSERVATORY_PROMPT_SECRET',
+      }),
+    }],
+  }])
+  const execution: AgentExecution = {
+    validateRoute: route => fake.validateRoute(route),
+    async open(config) {
+      const session = await fake.open(config)
+      let turn = 0
+      return {
+        ...session,
+        async run() {
+          turn++
+          if (turn === 1) {
+            await config.tools.find(tool => tool.name === 'web_fetch')!.execute(randomUUID(), {})
+            await config.tools.find(tool => tool.name === 'create_text_file')!.execute(randomUUID(), {
+              path: 'one.txt', content: 'first file',
+            })
+            return { status: 'completed', text: 'First pass' }
+          }
+          await config.tools.find(tool => tool.name === 'create_text_file')!.execute(randomUUID(), {
+            path: 'two.txt', content: 'second file',
+          })
+          return { status: 'completed', text: 'Completed follow-up pass' }
+        },
+      }
+    },
+  }
+  const judgment: JudgmentOptions = {
+    policy: (point) => ({
+      mode: point === 'tool.injection' || point === 'turn.completion' || point === 'memory.capture' ? 'active' : 'off',
+      allowScopedEvidence: true,
+      judge: {
+        async evaluate(request) {
+          if (request.id === 'turn.completion') {
+            completionCalls++
+            return {
+              output: completionCalls === 1,
+              model: 'jev-test-1',
+              requestSent: true,
+              usage: { input: 20, output: 2, estimatedCostUsd: 0.005 },
+            }
+          }
+          return { output: false }
+        },
+        async evaluateBatch(request) {
+          return {
+            model: 'jev-test-1',
+            requestSent: true,
+            usage: { input: 30, output: 3, estimatedCostUsd: 0.005 },
+            items: request.items.map((_, index) => ({
+              output: request.id === 'tool.injection' ? index === 1 : index !== 0,
+            })),
+          }
+        },
+      },
+    }),
+  }
+  const options = { directory, execution, extensions, judgment }
+  const host = new LocalAgentHost(options)
+  let convId: string
+  let snapshotBeforeRestart: ConversationObservatory
+  try {
+    convId = host.createConversation({ requestId: 'jev-obs', workspace, workspaceAccess: 'write' }).id
+    await host.sendMessage({
+      requestId: 'msg-1', conversationId: convId, text: 'Inspect PRIVATE_OBSERVATORY_PROMPT_SECRET and write files',
+    })
+    await host.idle()
+    snapshotBeforeRestart = await host.managementCommand({
+      schemaVersion: 1, type: 'conversationObservatory', conversationId: convId,
+    }) as ConversationObservatory
+    const j = snapshotBeforeRestart.judgments!
+    assert.equal(j.total, 3)
+    assert.equal(j.injectionBlocks, 1)
+    assert.equal(j.completionFollowUps, 1)
+    assert.equal(j.memoryFiltered, 1)
+    assert.equal(j.activeInterventions, 3)
+    assert.equal(j.fallbacks, 0)
+    assert.equal(Number(j.estimatedCostUsd?.toFixed(4)), 0.015)
+    assert.equal(Number(j.estimatedCostCny?.toFixed(4)), 0.108)
+    assert.ok(j.byPoint.some(p => p.point === 'tool.injection' && p.activeInterventions === 1))
+    assert.ok(j.byPoint.some(p => p.point === 'turn.completion' && p.activeInterventions === 1))
+    assert.ok(j.byPoint.some(p => p.point === 'memory.capture' && p.activeInterventions === 1))
+    assert.ok(j.recent.some(item => item.point === 'tool.injection' && item.impactKind === 'intervened' && item.impactSummary.includes('隔离')))
+    assert.ok(j.recent.some(item => item.point === 'turn.completion' && item.impactKind === 'intervened' && item.impactSummary.includes('补充自检')))
+    assert.ok(j.recent.some(item => item.point === 'memory.capture' && item.impactKind === 'intervened' && item.impactSummary.includes('过滤 1 条')))
+    assert.equal(snapshotBeforeRestart.turnMetrics?.[0]?.judgmentCalls, j.total)
+    assert.equal(snapshotBeforeRestart.turnMetrics?.[0]?.judgmentInterventions, j.activeInterventions)
+    assert.equal(JSON.stringify(j).includes('PRIVATE_OBSERVATORY_PROMPT_SECRET'), false)
+  } finally {
+    await host.close()
+  }
+
+  const restarted = new LocalAgentHost(options)
+  try {
+    const afterRestart = await restarted.managementCommand({
+      schemaVersion: 1, type: 'conversationObservatory', conversationId: convId,
+    }) as ConversationObservatory
+    assert.deepEqual(afterRestart, snapshotBeforeRestart)
+  } finally {
+    await restarted.close()
   }
 })

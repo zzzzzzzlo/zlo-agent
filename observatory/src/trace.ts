@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto'
 import type { ModelRoute } from '../../shared/contracts/domain.ts'
+import { coreJudgmentPoints } from '../../shared/contracts/jev.ts'
 import type { TelemetryEvent, TelemetryNode, TelemetryTask } from '../../shared/contracts/observatory.ts'
 
 export interface TraceSpan {
@@ -310,21 +311,58 @@ function dependencyPath(nodes: TraceNode[], latest: Map<string, TelemetryTask['a
   return { ms: longest?.durationMs ?? null, ids: longest?.ids ?? [] }
 }
 
-function judgmentLinks(events: TelemetryEvent[]) {
+export interface JudgmentCausalDetail {
+  eventId: string
+  point: string
+  isCore: boolean
+  mode: string
+  judgeStatus?: string
+  judgeModel?: string
+  elapsedMs?: number
+  fallbackReason?: string
+  disagreement?: boolean
+  linkedEventIds: string[]
+  whatSummary: string
+  verdictSummary: string
+  impactKind: 'intervened' | 'shadow_diff' | 'fallback' | 'aligned' | 'baseline_only'
+  impactSummary: string
+}
+
+const corePointIds = new Set<string>(coreJudgmentPoints.map(({ id }) => id))
+const slotLabelNames: Record<string, string> = {
+  'page title': '页面标题', 'page content': '页面正文', 'element label': '交互控件',
+  'search title': '搜索标题', 'search snippet': '搜索摘要',
+  stdout: '标准输出', stderr: '错误输出', fact: '事实', experience: '经验', file: '文件', skill: '技能',
+}
+
+function receiptDigest(id: string): string {
+  return /^sha256:[0-9a-f]{64}$/u.test(id) ? id : `sha256:${createHash('sha256').update(id).digest('hex')}`
+}
+
+function judgmentLinks(task: TelemetryTask, events: TelemetryEvent[]) {
   const plans = new Map<string, TelemetryEvent>()
   const receipts = new Map<string, TelemetryEvent>()
+  const replays = new Map<string, TelemetryEvent[]>()
   const settlements = new Map<string, TelemetryEvent>()
   const related = new Map<string, TelemetryEvent[]>()
+  const verifications: TelemetryEvent[] = []
+  const stateChanges: TelemetryEvent[] = []
   for (const event of events) {
     if (event.type === 'task.plan_changed' && event.correlationId) plans.set(event.correlationId, event)
     if (event.type === 'tool.finished' && typeof event.payload.id === 'string') {
-      const id = event.payload.id
-      const receiptKey = /^sha256:[0-9a-f]{64}$/u.test(id) ? id : `sha256:${createHash('sha256').update(id).digest('hex')}`
-      receipts.set(receiptKey, event)
+      receipts.set(receiptDigest(event.payload.id), event)
+    }
+    if (event.type === 'tool.evidence_replayed' && typeof event.payload.id === 'string') {
+      const key = receiptDigest(event.payload.id)
+      const list = replays.get(key) ?? []
+      list.push(event)
+      replays.set(key, list)
     }
     if ((event.type === 'task.node_settled' || event.type === 'task.worker_settled') && event.taskNodeId && event.taskAttemptId) {
       settlements.set(`${event.taskNodeId}:${event.taskAttemptId}`, event)
     }
+    if (event.type === 'verification.finished') verifications.push(event)
+    if (event.type === 'task.state_changed') stateChanges.push(event)
     const source = event.type === 'judgment.evaluated' ? text(event.payload.id) : event.type
     if (event.agentRunId && source && ['agent.started', 'model.reserved', 'memory.recalled', 'memory.captured', 'model.task_fit'].includes(source)) {
       const key = `${event.agentRunId}:${source}`
@@ -342,12 +380,26 @@ function judgmentLinks(events: TelemetryEvent[]) {
     const node = text(link?.taskNodeId) ?? event.taskNodeId
     const attempt = text(link?.taskAttemptId) ?? event.taskAttemptId
     const candidates = [plan ? plans.get(plan) : undefined, receipt ? receipts.get(receipt) : undefined]
-    if ((point === 'handoff.sufficiency' || point === 'turn.completion' || point === 'swarm.patch') && node && attempt) candidates.push(settlements.get(`${node}:${attempt}`))
-    if (agent && point === 'memory.capture') candidates.push((related.get(`${agent}:memory.captured`) ?? [])
-      .find(candidate => candidate.seq > event.seq))
+    if ((point === 'handoff.sufficiency' || point === 'turn.completion' || point === 'swarm.patch') && node && attempt) {
+      candidates.push(settlements.get(`${node}:${attempt}`))
+    }
+    if (point === 'turn.completion' && node === task.rootNodeId) {
+      if (agent && event.payload.mode === 'active' && event.payload.output === true) {
+        candidates.push((related.get(`${agent}:model.reserved`) ?? []).find(candidate => candidate.seq > event.seq))
+      }
+      candidates.push(verifications.find(candidate => candidate.seq > event.seq && (!attempt || candidate.taskAttemptId === attempt)))
+      candidates.push(stateChanges.find(candidate => candidate.seq > event.seq && (!attempt || candidate.taskAttemptId === attempt)))
+    }
+    if (agent && point === 'memory.capture') {
+      candidates.push((related.get(`${agent}:memory.captured`) ?? []).find(candidate => candidate.seq > event.seq))
+    }
     const toolDecision = ['tool.admission', 'tool.injection', 'files.locate'].includes(point ?? '')
     if (toolDecision && Array.isArray(event.payload.evidenceRefs)) {
-      candidates.push(...event.payload.evidenceRefs.flatMap(key => typeof key === 'string' ? [receipts.get(key)] : []))
+      for (const key of event.payload.evidenceRefs) {
+        if (typeof key !== 'string') continue
+        candidates.push(receipts.get(key))
+        candidates.push(...(replays.get(key) ?? []))
+      }
     }
     if (agent && point === 'model.task_fit') {
       const nextDecision = related.get(`${agent}:model.task_fit`)?.find(candidate => candidate.seq > event.seq)
@@ -358,9 +410,149 @@ function judgmentLinks(events: TelemetryEvent[]) {
     if (agent && point === 'context.relevance') candidates.push((related.get(`${agent}:memory.recalled`) ?? [])
       .find(candidate => candidate.seq > event.seq))
     const linkedEventIds = [...new Set(candidates.filter((item): item is TelemetryEvent => Boolean(item &&
-      item.taskRunId === event.taskRunId && (toolDecision ? item.seq < event.seq && item.agentRunId === agent
+      item.taskRunId === event.taskRunId && (toolDecision
+        ? ((item.seq < event.seq || item.type === 'tool.evidence_replayed') && item.agentRunId === agent)
         : item.seq > event.seq))).map(item => item.id))]
     return { eventId: event.id, point, linkedEventIds }
+  })
+}
+
+function summarizeBatchSlots(batch: Record<string, unknown> | undefined): string {
+  if (!batch || !Array.isArray(batch.labels)) return ''
+  const labels = [...new Set(batch.labels.map(item => typeof item === 'string' ? slotLabelNames[item] ?? item : undefined)
+    .filter((item): item is string => Boolean(item)))]
+  return labels.length ? ` · ${labels.slice(0, 3).join('、')}` : ''
+}
+
+function judgmentCausalDetails(events: TelemetryEvent[], links: ReturnType<typeof judgmentLinks>): JudgmentCausalDetail[] {
+  const byId = new Map(events.map(event => [event.id, event]))
+  return links.map(link => {
+    const event = byId.get(link.eventId)!
+    const payload = event.payload
+    const point = link.point ?? text(payload.id) ?? 'unknown'
+    const mode = text(payload.mode) ?? 'off'
+    const judgeStatus = text(payload.judgeStatus)
+    const judgeModel = text(payload.judgeModel)
+    const elapsedMs = quantity(payload.elapsedMs)
+    const fallbackReason = text(payload.fallbackReason)
+    const features = object(payload.features) ?? {}
+    const batch = object(payload.batch)
+    const baseArr = Array.isArray(batch?.baseline) ? batch.baseline.map(v => v === true) : undefined
+    const outArr = Array.isArray(batch?.output) ? batch.output.map(v => v === true) : undefined
+    const judgeArr = Array.isArray(batch?.judgeOutput) ? batch.judgeOutput : undefined
+    const disagree = payload.disagreement === true ||
+      (baseArr && outArr ? baseArr.some((val, idx) => val !== outArr[idx]) : payload.output !== payload.baseline)
+    const linked = link.linkedEventIds.map(id => byId.get(id)).filter((item): item is TelemetryEvent => Boolean(item))
+
+    let impactKind: JudgmentCausalDetail['impactKind']
+    if (mode === 'off' || judgeStatus === 'baseline') impactKind = 'baseline_only'
+    else if (judgeStatus && judgeStatus !== 'valid') impactKind = 'fallback'
+    else if (mode === 'active' && disagree) impactKind = 'intervened'
+    else if (mode === 'shadow' && disagree) impactKind = 'shadow_diff'
+    else impactKind = 'aligned'
+
+    const slots = summarizeBatchSlots(batch)
+    const bytes = quantity(features.bytes)
+    const byteNote = bytes !== undefined ? ` (${bytes} B${slots})` : slots
+    const batchLen = outArr?.length ?? baseArr?.length ?? quantity(features.candidateCount) ?? 0
+    let whatSummary = `评估 ${point}`
+    let verdictSummary = ''
+    let impactSummary = ''
+
+    if (point === 'tool.injection') {
+      const toolName = text(features.tool) ?? '工具输出'
+      whatSummary = `扫描 ${toolName} 文本安全 · ${batchLen} 段${byteNote}`
+      const baseBlocks = baseArr?.filter(Boolean).length ?? 0
+      const outBlocks = outArr?.filter(Boolean).length ?? 0
+      const judgeBlocks = judgeArr?.filter(v => v === true).length ?? 0
+      verdictSummary = `基线拦 ${baseBlocks}/${batchLen} → 实际拦 ${outBlocks}/${batchLen}${judgeArr ? ` (Jev 判 ${judgeBlocks})` : ''}`
+      if (mode === 'active' && outBlocks > baseBlocks) impactSummary = `已额外隔离 ${outBlocks - baseBlocks} 段可疑指令注入（禁止模型直读，需经审核或保留隔离）`
+      else if (outBlocks > 0) impactSummary = `规则基线已隔离 ${outBlocks} 段已知注入文本`
+      else if (impactKind === 'shadow_diff') impactSummary = `Shadow 检出 ${judgeBlocks} 段疑似注入（当前仅观察未拦截）`
+      else if (impactKind === 'fallback') impactSummary = `回退规则基线放行（原因: ${fallbackReason ?? judgeStatus}）`
+      else impactSummary = '未发现注入威胁，原文放行进入上下文'
+    } else if (point === 'tool.admission') {
+      const toolName = text(features.tool) ?? '外部工具'
+      whatSummary = `筛选 ${toolName} 长输出片段 · ${batchLen} 段${byteNote}`
+      const outKeep = outArr?.filter(Boolean).length ?? 0
+      const omitted = batchLen - outKeep
+      const judgeOmit = judgeArr?.filter(v => v === false).length ?? 0
+      const replayed = linked.some(item => item.type === 'tool.evidence_replayed')
+      verdictSummary = `保留 ${outKeep}/${batchLen} 段 · 折叠 ${omitted} 段${judgeArr ? ` (Jev 建议折叠 ${judgeOmit})` : ''}`
+      if (mode === 'active' && omitted > 0) impactSummary = `已折叠 ${omitted} 段低相关片段并归档原文${replayed ? '；模型随后调用 read_tool_evidence 按需回放了完整证据' : '（节省首轮上下文空间）'}`
+      else if (impactKind === 'shadow_diff') impactSummary = `Shadow 认为可折叠 ${judgeOmit} 段（未生效）`
+      else if (impactKind === 'fallback') impactSummary = `回退基线全量保留（原因: ${fallbackReason ?? judgeStatus}）`
+      else impactSummary = '保留全部片段进入模型上下文'
+    } else if (point === 'turn.completion') {
+      const role = text(features.role) ?? 'root'
+      const writeCount = quantity(features.writeCount) ?? 0
+      const evidenceCount = quantity(features.evidenceCount) ?? 0
+      whatSummary = `审查 ${role} 回合交付完整性（写入 ${writeCount} 次 · 验后证据 ${evidenceCount}）`
+      const out = payload.output === true
+      const base = payload.baseline === true
+      const judge = payload.judgeOutput === true || payload.shadow === true
+      verdictSummary = `基线=${base ? '不足' : '放行'} → 实际=${out ? '要求补做' : '放行'}${payload.judgeOutput !== undefined || payload.shadow !== undefined ? ` (Jev=${judge ? '不足' : '放行'})` : ''}`
+      const followUpTriggered = linked.some(item => item.type === 'model.reserved')
+      if (mode === 'active' && out) impactSummary = followUpTriggered ? '判定未收尾，已拦截结束并触发补充自检轮次' : '判定未收尾，已拒绝不足交付'
+      else if (impactKind === 'shadow_diff') impactSummary = 'Shadow 认为证据尚不充分（仅记录未拦截）'
+      else if (impactKind === 'fallback') impactSummary = `回退规则基线放行（原因: ${fallbackReason ?? judgeStatus}）`
+      else impactSummary = '允许当前回合正常收尾'
+    } else if (point === 'swarm.patch') {
+      const writeCount = quantity(features.writeCount) ?? 0
+      const targetCount = quantity(features.targetCount) ?? 0
+      whatSummary = `审查子 Agent 补丁范围（写入 ${writeCount} 次 · 涉及 ${targetCount} 处路径）`
+      const out = payload.output === true
+      const judge = payload.judgeOutput === true || payload.shadow === true
+      verdictSummary = `实际=${out ? '标记越界复核' : '范围合规'}${payload.judgeOutput !== undefined || payload.shadow !== undefined ? ` (Jev=${judge ? '越界' : '合规'})` : ''}`
+      if (mode === 'active' && out) impactSummary = '已标注 patch_scope_review 风险并在子 Agent 摘要附上待复核路径提示'
+      else if (impactKind === 'shadow_diff') impactSummary = 'Shadow 怀疑存在范围外改动（未标记）'
+      else impactSummary = '变更范围符合委派约束，直接交付'
+    } else if (point === 'model.task_fit') {
+      const candidates = Array.isArray(features.candidates) ? features.candidates.length : 0
+      whatSummary = `对比 ${candidates} 个候选模型与当前任务适配度`
+      verdictSummary = `基线 #${String(payload.baseline ?? 0)} → 实际 #${String(payload.output ?? 0)}${payload.judgeOutput !== undefined ? ` (Jev #${String(payload.judgeOutput)})` : ''}`
+      const chosenRoute = linked.map(item => modelRoute(item.payload.route)).find(Boolean)
+      if (mode === 'active' && disagree) impactSummary = chosenRoute ? `已切换更适配路由 ${chosenRoute.provider}/${chosenRoute.model}` : `已切换至候选模型 #${String(payload.output)}`
+      else if (impactKind === 'shadow_diff') impactSummary = `Shadow 倾向候选 #${String(payload.shadow ?? payload.judgeOutput)}（未切换）`
+      else impactSummary = chosenRoute ? `沿用基线模型 ${chosenRoute.provider}/${chosenRoute.model}` : '沿用规则基线选型'
+    } else if (point === 'memory.capture') {
+      const facts = quantity(features.factCount)
+      const exps = quantity(features.experienceCount)
+      const countNote = facts !== undefined || exps !== undefined ? `（事实 ${facts ?? 0} / 经验 ${exps ?? 0}）` : ''
+      whatSummary = `筛选长期记忆候选 · ${batchLen} 条${countNote}`
+      const outKeep = outArr?.filter(Boolean).length ?? 0
+      const dropped = batchLen - outKeep
+      const capturedEvent = linked.find(item => item.type === 'memory.captured')
+      const persisted = capturedEvent ? quantity(capturedEvent.payload.count) : undefined
+      verdictSummary = `保留 ${outKeep}/${batchLen} 条（过滤 ${dropped} 条）`
+      if (mode === 'active' && dropped > 0) impactSummary = `已拦截 ${dropped} 条低价值记忆，实际落库 ${persisted ?? outKeep} 条`
+      else if (impactKind === 'shadow_diff') impactSummary = `Shadow 建议丢弃 ${judgeArr?.filter(v => v === false).length ?? 0} 条（当前全留）`
+      else impactSummary = `全部保留，实际落库 ${persisted ?? outKeep} 条`
+    } else {
+      verdictSummary = batch ? `基线 ${baseArr?.filter(Boolean).length ?? 0}/${batchLen} → 实际 ${outArr?.filter(Boolean).length ?? 0}/${batchLen}`
+        : `基线 ${String(payload.baseline ?? '—')} → 实际 ${String(payload.output ?? '—')}`
+      impactSummary = impactKind === 'intervened' ? 'Active 模式改写了规则基线决策'
+        : impactKind === 'shadow_diff' ? 'Shadow 与规则基线存在分歧（未改写）'
+          : impactKind === 'fallback' ? `Judge 异常回退至基线（${fallbackReason ?? judgeStatus}）`
+            : '与规则基线决策一致'
+    }
+
+    return {
+      eventId: event.id,
+      point,
+      isCore: corePointIds.has(point),
+      mode,
+      judgeStatus,
+      judgeModel,
+      elapsedMs,
+      fallbackReason,
+      disagreement: disagree,
+      linkedEventIds: link.linkedEventIds,
+      whatSummary,
+      verdictSummary,
+      impactKind,
+      impactSummary,
+    }
   })
 }
 
@@ -402,8 +594,10 @@ export function buildTrace(task: TelemetryTask, input: TelemetryEvent[], asOf = 
     const durations = spans.filter(span => span.kind === kind && span.durationMs !== null).map(span => span.durationMs!)
     return durations.length ? durations.reduce((total, duration) => total + duration, 0) : null
   }
+  const judgments = judgmentLinks(task, events)
+  const judgmentDetails = judgmentCausalDetails(events, judgments)
   return {
-    task, events, spans, agents, nodes, judgments: judgmentLinks(events),
+    task, events, spans, agents, nodes, judgments, judgmentDetails,
     timing: {
       wallClockMs: duration(interval(createdAt, terminalAt)),
       liveWallClockMs: terminal.has(task.status) || !createdAt ? null : Math.max(0, asOf - Date.parse(createdAt)),

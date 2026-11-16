@@ -64,6 +64,8 @@ const metricLabels = {
   'judgment.decisions': 'Judgment 调用', 'judgment.shadow_disagreement': 'Shadow 分歧率',
   'judgment.fallback_rate': 'Judge 异常回退率',
   'judgment.active_changes': 'Active 决策变化', 'judgment.mean_latency': '平均判断耗时',
+  'judgment.injection_blocks': '拦截注入片段', 'judgment.completion_followups': '拦截早停追问',
+  'judgment.admission_omissions': '折叠低质工具片段', 'judgment.memory_filtered': '过滤低价值记忆',
   'judgment.cost': '判断成本（人民币估算）', 'judgment.tokens': '判断 Token',
   'reliability.stop_requested': '停止请求', 'reliability.stopped': '已停止任务', 'reliability.resumed': '任务恢复',
   'reliability.output_recoveries': '模型输出续接', 'reliability.incomplete_streams': '未完整采集的任务',

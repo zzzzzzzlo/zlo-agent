@@ -136,6 +136,38 @@ export interface ConversationTurnMetric {
   toolCalls: number
   toolFailed: number
   durationMs: number | null
+  judgmentCalls?: number
+  judgmentInterventions?: number
+}
+
+export interface ConversationJudgmentItem {
+  taskId: string
+  point: string
+  mode: 'off' | 'shadow' | 'active'
+  impactKind: 'intervened' | 'shadow_diff' | 'fallback' | 'aligned' | 'baseline_only'
+  whatSummary: string
+  verdictSummary: string
+  impactSummary: string
+  judgeModel?: string
+  elapsedMs?: number
+  fallbackReason?: string
+}
+
+export interface ConversationJudgmentSummary {
+  total: number
+  externalCalls: number
+  activeInterventions: number
+  shadowDisagreements: number
+  fallbacks: number
+  injectionBlocks: number
+  completionFollowUps: number
+  admissionOmissions: number
+  patchFlags: number
+  memoryFiltered: number
+  estimatedCostUsd: number | null
+  estimatedCostCny?: number | null
+  byPoint: { point: string; total: number; activeInterventions: number; shadowDisagreements: number; fallbacks: number }[]
+  recent: ConversationJudgmentItem[]
 }
 
 export interface ConversationCompletionSummary {
@@ -168,6 +200,7 @@ export interface ConversationObservatory {
   latestTask?: { id: string; tokenLimit?: number; requests: number; confirmed: number; reserved: number; uncertain: number }
   completion?: ConversationCompletionSummary
   turnMetrics?: ConversationTurnMetric[]
+  judgments?: ConversationJudgmentSummary
 }
 
 export interface DesktopManagementApi {

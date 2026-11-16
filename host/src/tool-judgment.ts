@@ -57,7 +57,15 @@ export class ToolEvidenceArchive {
   replay(event: EventDraft, id: string, allowed: (tool: string) => boolean): Output | undefined {
     if (!reference.test(id) || !event.agentRunId) return
     const entry = this.#store.get<Evidence>(evidenceNamespace, id)
-    if (entry?.taskId === event.taskId && entry.agentRunId === event.agentRunId && allowed(entry.tool)) return entry.replay
+    if (entry?.taskId !== event.taskId || entry.agentRunId !== event.agentRunId || !allowed(entry.tool)) return
+    if (!this.#store.isClosed) {
+      try {
+        this.#store.transaction(() => {
+          this.#store.append({ ...event, type: 'tool.evidence_replayed', payload: { id: entry.operationId, tool: entry.tool } })
+        })
+      } catch { /* Telemetry recording cannot interrupt authorized evidence replay. */ }
+    }
+    return entry.replay
   }
 }
 

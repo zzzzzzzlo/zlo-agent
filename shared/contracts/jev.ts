@@ -77,6 +77,10 @@ export function defaultJevModes(): JevSettings['modes'] {
 
 export type DecisionPoint = typeof judgmentPoints[number]['id']
 export type JudgmentMode = 'off' | 'shadow' | 'active'
+export const publicBatchLabels = [
+  'page title', 'page content', 'element label', 'search title', 'search snippet',
+  'stdout', 'stderr', 'fact', 'experience', 'file', 'skill',
+] as const
 export const jevReasons = ['missing_key', 'timeout', 'busy', 'budget_exhausted', 'unauthorized',
   'rate_limited', 'unavailable', 'invalid_response', 'uncertain', 'configuration_changed', 'no_choice', 'invalid_model',
   'billing', 'cancelled'] as const

@@ -195,17 +195,24 @@ export function domainVisualChart(view, data) {
         name: group.point ?? group.label,
         mode: group.mode ?? 'off',
         decisions: m.get('judgment.decisions') ?? 0,
+        activeChanges: m.get('judgment.active_changes') ?? 0,
         disagreement: m.get('judgment.shadow_disagreement'),
         fallback: m.get('judgment.fallback_rate'),
       }
     })
     const active = groups.filter(g => g.decisions > 0)
     if (!active.length) return null
-    return el('div', { className: 'viz-bars' }, active.map(item =>
-      el('div', { className: 'viz-judge-row' },
-        progressRow(`${item.name} [${item.mode}]`, item.disagreement ?? 0, 100, 'blue',
-          `调用 ${numFmt.format(item.decisions)} · 分歧 ${fmtPct(item.disagreement)} · 回退 ${fmtPct(item.fallback)}`),
-      )))
+    const maxCalls = Math.max(1, ...active.map(g => g.decisions))
+    return el('div', { className: 'viz-bars' }, active.map(item => {
+      const pct = item.mode === 'active'
+        ? (item.decisions ? (item.activeChanges / item.decisions) * 100 : 0)
+        : (item.disagreement ?? (item.decisions / maxCalls) * 100)
+      const tone = item.mode === 'active' ? 'good' : 'blue'
+      return el('div', { className: 'viz-judge-row' },
+        progressRow(`${item.name} [${item.mode}]`, pct, 100, tone,
+          `调用 ${numFmt.format(item.decisions)} · Active 改写 ${numFmt.format(item.activeChanges)} · Shadow 分歧 ${fmtPct(item.disagreement)} · 回退 ${fmtPct(item.fallback)}`),
+      )
+    }))
   }
   return null
 }

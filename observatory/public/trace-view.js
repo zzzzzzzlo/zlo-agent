@@ -10,7 +10,7 @@ const eventLabels = {
   'agent.started': '启动 Agent', 'agent.finished': '结束 Agent',
   'model.request_started': '开始模型请求', 'model.reserved': '预留模型预算', 'model.reservation_settled': '结算模型预算',
   'model.usage': '模型用量', 'model.route_changed': '切换模型', 'model.output_recovery': '恢复模型输出',
-  'tool.started': '启动工具', 'tool.finished': '工具回执', 'tool.approval_resolved': '工具审批',
+  'tool.started': '启动工具', 'tool.finished': '工具回执', 'tool.approval_resolved': '工具审批', 'tool.evidence_replayed': '按需回放工具证据',
   'operation.reconciliation_required': '等待核对副作用', 'context.compacted': '压缩上下文',
   'memory.captured': '记录记忆', 'memory.recalled': '召回记忆', 'judgment.evaluated': '策略判断',
   'verification.finished': '确定性验收',
@@ -187,17 +187,37 @@ function attempts(trace) {
   return table(['Attempt', '节点', '状态', '开始', '结束', '原因', '恢复次数'], rows, '没有已记录的执行尝试。')
 }
 
+const impactBadges = {
+  intervened: ['active', '已介入'],
+  shadow_diff: ['warning', 'Shadow 分歧'],
+  fallback: ['bad', '异常回退'],
+  aligned: ['good', '一致放行'],
+  baseline_only: ['settled', '仅规则基线'],
+}
+
 function judgmentTrail(trace) {
   const events = new Map(trace.events.map(event => [event.id, event]))
-  return table(['决策点', '模式', '规则基线', '实际选择', 'Judge 结果', '模型', '耗时', '回退原因', '关联结果'], (trace.judgments ?? []).map(item => {
-    const payload = events.get(item.eventId)?.payload ?? {}
-    const judge = payload.judgeOutput ?? payload.shadow ?? payload.batch?.judgeOutput
-    const baseline = payload.baseline ?? payload.batch?.baseline
-    const applied = payload.output ?? payload.batch?.output
-    return [link(item.point ?? '未知决策点', 'traces', { task: trace.task.id, event: item.eventId }),
-      payload.mode, baseline == null ? null : JSON.stringify(baseline),
-      applied == null ? null : JSON.stringify(applied), judge == null ? null : JSON.stringify(judge),
-      payload.judgeModel, typeof payload.elapsedMs === 'number' ? payload.elapsedMs + ' ms' : null, payload.fallbackReason,
+  const details = trace.judgmentDetails?.length ? trace.judgmentDetails : (trace.judgments ?? []).map(item => ({
+    eventId: item.eventId,
+    point: item.point,
+    mode: events.get(item.eventId)?.payload?.mode,
+    judgeModel: events.get(item.eventId)?.payload?.judgeModel,
+    elapsedMs: events.get(item.eventId)?.payload?.elapsedMs,
+    linkedEventIds: item.linkedEventIds,
+    whatSummary: item.point ?? '—',
+    verdictSummary: JSON.stringify(events.get(item.eventId)?.payload?.output ?? events.get(item.eventId)?.payload?.batch?.output ?? '—'),
+    impactKind: 'aligned',
+    impactSummary: '—',
+  }))
+  return table(['决策点', '模式', '判定对象 (判了什么)', '裁决对比', '实际运行影响', '模型 / 耗时', '关联事件'], details.map(item => {
+    const [tone, label] = impactBadges[item.impactKind] ?? ['settled', item.impactKind]
+    return [
+      el('div', {}, link(item.point ?? '未知决策点', 'traces', { task: trace.task.id, event: item.eventId }), ' ', badge(tone, label)),
+      item.mode,
+      item.whatSummary,
+      item.verdictSummary,
+      item.impactSummary,
+      [item.judgeModel, typeof item.elapsedMs === 'number' ? item.elapsedMs + ' ms' : null].filter(Boolean).join(' · ') || null,
       el('div', { className: 'inline-actions' }, (item.linkedEventIds ?? []).map(id =>
         link(eventLabels[events.get(id)?.type] ?? shortId(id), 'traces', { task: trace.task.id, event: id }))),
     ]

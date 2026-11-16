@@ -133,7 +133,7 @@ test('metrics count provider usage and costs once, preserve coverage, and separa
   assert.equal(byId.get('judgment.cost')?.unit, 'CNY')
   assert.equal(byId.get('security.approvals_denied')?.value, 1)
   assert.equal(byId.get('security.policy_denials')?.quality, 'unknown')
-  assert.equal(metrics.judgments.length, 14)
+  assert.equal(metrics.judgments.length, 7)
   const alternateMetrics = metrics.models.find(group => group.model === 'pro')!.metrics
   assert.equal(alternateMetrics.find(metric => metric.id === 'model.mean_latency')?.quality, 'unknown')
   assert.equal(alternateMetrics.find(metric => metric.id === 'model.cost')?.quality, 'unknown')
@@ -367,4 +367,73 @@ test('expanded completion metrics measure Pass@1, self-repair, steering, edit ch
     { model: 'unrelated-model' }, { evaluations: evals })
   assert.equal(noMatchingTasks.domains.evaluation.find(metric => metric.id === 'eval.runs')?.value, 0)
   assert.equal(noMatchingTasks.domains.evaluation.find(metric => metric.id === 'eval.pass_rate')?.value, null)
+})
+
+test('causal judgment details link tool evidence replays, Root completion follow-ups, swarm.patch, and memory filtering', () => {
+  const { task, events, emit, run } = scenario()
+  const fetchReceipt = 'sha256:' + 'f'.repeat(64)
+  emit(241, 'tool.finished', { id: fetchReceipt, tool: 'web_fetch', status: 'succeeded' }, run('root'))
+  emit(242, 'judgment.evaluated', {
+    id: 'tool.injection', mode: 'active', judgeStatus: 'valid', judgeModel: 'jev-latest', elapsedMs: 12,
+    disagreement: true, evidenceRefs: [fetchReceipt],
+    features: { tool: 'web_fetch', bytes: 4200, candidateCount: 2 },
+    batch: { baseline: [false, false], output: [false, true], judgeOutput: [false, true], fallbackReasons: [null, null], labels: ['page title', 'page content'] },
+  }, run('root'))
+  emit(243, 'judgment.evaluated', {
+    id: 'tool.admission', mode: 'active', judgeStatus: 'valid', judgeModel: 'jev-latest', elapsedMs: 15,
+    disagreement: true, evidenceRefs: [fetchReceipt],
+    features: { tool: 'web_fetch', bytes: 3800, candidateCount: 2 },
+    batch: { baseline: [true, true], output: [false, true], judgeOutput: [false, true], fallbackReasons: [null, null], labels: ['page content', 'page content'] },
+  }, run('root'))
+  const replay = emit(244, 'tool.evidence_replayed', { id: fetchReceipt, tool: 'web_fetch' }, run('root'))
+  emit(245, 'judgment.evaluated', {
+    id: 'turn.completion', mode: 'active', judgeStatus: 'valid', judgeModel: 'jev-latest', elapsedMs: 18,
+    baseline: false, output: true, judgeOutput: true, disagreement: true,
+    features: { role: 'root', writeCount: 1, evidenceCount: 0 },
+    resultLink: { taskNodeId: 'root', taskAttemptId: 'r1' },
+  }, run('root'))
+  const followUp = emit(246, 'model.reserved', { route, kind: 'prompt', estimatedTokens: 60 }, { ...run('root'), correlationId: 'res-followup' })
+  emit(247, 'judgment.evaluated', {
+    id: 'swarm.patch', mode: 'active', judgeStatus: 'valid', judgeModel: 'jev-latest', elapsedMs: 9,
+    baseline: false, output: true, judgeOutput: true, disagreement: true,
+    features: { writeCount: 2, targetCount: 3, hasScopePath: true },
+    resultLink: { taskNodeId: 'a', taskAttemptId: 'a1' },
+  }, run('a'))
+  emit(248, 'judgment.evaluated', {
+    id: 'memory.capture', mode: 'active', judgeStatus: 'valid', judgeModel: 'jev-latest', elapsedMs: 11,
+    disagreement: true,
+    features: { evidenceCount: 3, factCount: 2, experienceCount: 1 },
+    batch: { baseline: [true, true, true], output: [false, true, true], judgeOutput: [false, true, true], fallbackReasons: [null, null, null], labels: ['fact', 'fact', 'experience'] },
+  }, run('root'))
+  const captured = emit(249, 'memory.captured', { count: 2 }, run('root'))
+
+  const trace = buildTrace(task, events)
+  const injectionDetail = trace.judgmentDetails.find(d => d.point === 'tool.injection')!
+  assert.equal(injectionDetail.impactKind, 'intervened')
+  assert.match(injectionDetail.whatSummary, /web_fetch.*4200 B.*页面正文/)
+  assert.match(injectionDetail.impactSummary, /额外隔离 1 段/)
+
+  const admissionDetail = trace.judgmentDetails.find(d => d.point === 'tool.admission')!
+  assert.ok(admissionDetail.linkedEventIds.includes(replay.id))
+  assert.match(admissionDetail.impactSummary, /read_tool_evidence/)
+
+  const completionDetail = trace.judgmentDetails.find(d => d.point === 'turn.completion')!
+  assert.ok(completionDetail.linkedEventIds.includes(followUp.id))
+  assert.match(completionDetail.impactSummary, /触发补充自检轮次/)
+
+  const patchDetail = trace.judgmentDetails.find(d => d.point === 'swarm.patch')!
+  assert.match(patchDetail.whatSummary, /写入 2 次 · 涉及 3 处路径/)
+  assert.match(patchDetail.impactSummary, /patch_scope_review/)
+
+  const memoryDetail = trace.judgmentDetails.find(d => d.point === 'memory.capture')!
+  assert.ok(memoryDetail.linkedEventIds.includes(captured.id))
+  assert.match(memoryDetail.impactSummary, /拦截 1 条低价值记忆.*2 条/)
+
+  const metrics = buildMetrics([task], events)
+  const byId = new Map(metrics.domains.judgment.map(m => [m.id, m.value]))
+  assert.equal(byId.get('judgment.injection_blocks'), 1)
+  assert.equal(byId.get('judgment.admission_omissions'), 1)
+  assert.equal(byId.get('judgment.completion_followups'), 1)
+  assert.equal(byId.get('judgment.memory_filtered'), 1)
+  assert.equal(metrics.judgments.length, 7)
 })

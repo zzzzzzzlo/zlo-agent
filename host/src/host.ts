@@ -901,7 +901,7 @@ export class LocalAgentHost {
       }
       case 'managementSnapshot': return this.managementSnapshot(command.conversationId)
       case 'conversationObservatory': {
-        const { latestTaskId, turnMetrics, ...activity } = this.#conversations.activity(management.id(command.conversationId))
+        const { latestTaskId, turnMetrics, judgments, ...activity } = this.#conversations.activity(management.id(command.conversationId))
         const usdToCnyRate = resolveUsdToCnyRate()
         return {
           ...activity,
@@ -911,6 +911,10 @@ export class LocalAgentHost {
             ...item,
             estimatedCostCny: item.estimatedCostUsd === null ? null : usdToCny(item.estimatedCostUsd, usdToCnyRate),
           })),
+          judgments: {
+            ...judgments,
+            estimatedCostCny: judgments.estimatedCostUsd === null ? null : usdToCny(judgments.estimatedCostUsd, usdToCnyRate),
+          },
           latestTask: latestTaskId ? { id: latestTaskId, ...this.#scheduler.budget(latestTaskId) } : undefined,
         }
       }

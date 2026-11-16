@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { ChevronRight, RefreshCw, X } from 'lucide-react'
 import { cnyRateNote, formatCny, usdToCny } from '../../../../shared/contracts/currency.ts'
-import type { ConversationObservatory, ConversationTurnMetric, VerificationRigorTier } from '../../../../shared/contracts/management.ts'
+import type { ConversationJudgmentItem, ConversationObservatory, ConversationTurnMetric, VerificationRigorTier } from '../../../../shared/contracts/management.ts'
 import type { Session, Turn } from '../../features/sessions/model'
 import { verificationExplanation, verificationLabel } from '../../features/sessions/verification'
 import type { RunStatus } from '../../integrations/agent/AgentAdapter'
@@ -126,7 +126,7 @@ export function ActivityPanel({ session, onClose, onManage }: {
   const ready = useWorkspace(state => state.host.state === 'ready')
   const { api, snapshot, loading, error, refresh } = useConversationObservatory(session, ready)
   const [selected, setSelected] = useState<string>()
-  const [view, setView] = useState<'run' | 'usage' | 'quality'>('run')
+  const [view, setView] = useState<'run' | 'jev' | 'usage' | 'quality'>('run')
   const turn = session.turns.find(item => item.id === selected) ?? session.turns.at(-1)
   const turnMetric = turn ? snapshot?.turnMetrics?.find(item => item.taskId === turn.id) : undefined
 
@@ -146,6 +146,7 @@ export function ActivityPanel({ session, onClose, onManage }: {
         </header>
         <nav className="activity-tabs" aria-label="中台视图">
           <button type="button" aria-pressed={view === 'run'} onClick={() => setView('run')}>运行</button>
+          <button type="button" aria-pressed={view === 'jev'} onClick={() => setView('jev')}>判定</button>
           <button type="button" aria-pressed={view === 'usage'} onClick={() => setView('usage')}>趋势</button>
           <button type="button" aria-pressed={view === 'quality'} onClick={() => setView('quality')}>完成度</button>
         </nav>
@@ -175,6 +176,12 @@ export function ActivityPanel({ session, onClose, onManage }: {
               api={Boolean(api)}
               onManage={onManage}
             />
+          )}
+
+          {view === 'jev' && (
+            snapshot?.judgments
+              ? <JevObservatoryView snapshot={snapshot} selectedTaskId={turn?.id} onSelectTask={(taskId) => { setSelected(taskId); setView('run') }} />
+              : <div className="panel-empty"><strong>暂无 Jev 判定数据</strong><p>连接本地 Host 并启用判定点后，此处会展示每轮判定的对象、基线对比与实际运行影响。</p></div>
           )}
 
           {view === 'usage' && (
@@ -339,6 +346,11 @@ function RunView({ session, snapshot, turn, turnMetric, selected, onSelect, api,
                 {turnMetric.selfRepaired && <span className="observatory-chip is-accent">自主修复通过</span>}
                 {turnMetric.steered && <span className="observatory-chip is-caution">人工纠偏介入</span>}
                 {turnMetric.attemptCount > 1 && <span className="observatory-chip">尝试 {turnMetric.attemptCount} 次</span>}
+                {(turnMetric.judgmentCalls ?? 0) > 0 && (
+                  <span className={`observatory-chip ${(turnMetric.judgmentInterventions ?? 0) > 0 ? 'is-accent' : ''}`}>
+                    Jev {turnMetric.judgmentCalls} 次{(turnMetric.judgmentInterventions ?? 0) > 0 ? ` · 介入 ${turnMetric.judgmentInterventions}` : ''}
+                  </span>
+                )}
               </div>
               <div className="observatory-turn-pill">
                 <span>本轮耗时 {formatDurationMs(turnMetric.durationMs)}</span>
@@ -346,6 +358,24 @@ function RunView({ session, snapshot, turn, turnMetric, selected, onSelect, api,
               </div>
             </>
           )}
+
+          {snapshot?.judgments && (() => {
+            const turnJudgments = snapshot.judgments.recent.filter(item => item.taskId === turn.id)
+            if (!turnJudgments.length) return null
+            return (
+              <div className="observatory-jev-inline" aria-label="本轮 Jev 判定影响">
+                <div className="observatory-chart-head">
+                  <h4>本轮 Jev 判定影响</h4>
+                  <span>{turnJudgments.length} 条记录</span>
+                </div>
+                <div className="observatory-jev-list">
+                  {turnJudgments.slice(0, 4).map((item, idx) => (
+                    <JevCausalCard key={`${item.taskId}:${item.point}:${idx}`} item={item} />
+                  ))}
+                </div>
+              </div>
+            )
+          })()}
 
           {turn.verification && (
             <div>
@@ -628,6 +658,138 @@ function CompletionQualityView({ snapshot }: { snapshot: ConversationObservatory
         <span className="management-note">需要跨会话关键路径 Trace、Jev Shadow 分歧对比或独立 AI 评分时，可在终端启动完整运行中台：</span>
         <code>npm.cmd --prefix observatory start</code>
       </div>
+    </div>
+  )
+}
+
+const judgmentImpactLabels: Record<ConversationJudgmentItem['impactKind'], { label: string; tone: string }> = {
+  intervened: { label: '已介入', tone: 'is-accent' },
+  shadow_diff: { label: 'Shadow 分歧', tone: 'is-caution' },
+  fallback: { label: '异常回退', tone: 'is-danger' },
+  aligned: { label: '一致放行', tone: 'is-positive' },
+  baseline_only: { label: '规则基线', tone: '' },
+}
+
+function JevCausalCard({ item, selected, onSelect }: {
+  item: ConversationJudgmentItem
+  selected?: boolean
+  onSelect?: () => void
+}) {
+  const meta = judgmentImpactLabels[item.impactKind] ?? { label: item.impactKind, tone: '' }
+  return (
+    <div
+      className={`observatory-jev-item${onSelect ? ' is-clickable' : ''}`}
+      data-active={selected || undefined}
+      onClick={onSelect}
+    >
+      <div className="observatory-jev-head">
+        <code>{item.point}</code>
+        <span className={`observatory-chip ${meta.tone}`}>{meta.label}</span>
+      </div>
+      <p className="observatory-jev-what">{item.whatSummary}</p>
+      <p className="observatory-jev-impact">{item.impactSummary}</p>
+      <div className="observatory-jev-meta">
+        <span>{item.verdictSummary}</span>
+        <span>{[item.judgeModel, typeof item.elapsedMs === 'number' ? `${item.elapsedMs} ms` : undefined].filter(Boolean).join(' · ') || item.mode}</span>
+      </div>
+    </div>
+  )
+}
+
+function JevObservatoryView({ snapshot, selectedTaskId, onSelectTask }: {
+  snapshot: ConversationObservatory
+  selectedTaskId?: string
+  onSelectTask(taskId: string): void
+}) {
+  const judgments = snapshot.judgments
+  if (!judgments || judgments.total === 0) {
+    return (
+      <div className="panel-empty">
+        <strong>本会话尚未产生 Jev 判定</strong>
+        <p>在「模型与配置 → Jev 判定设置」启用核心 6 项（或切换到 Shadow 观察）后，这里会统计拦截注入、早停追问、噪音折叠与真实影响。</p>
+      </div>
+    )
+  }
+  const costCny = judgments.estimatedCostCny !== undefined
+    ? judgments.estimatedCostCny
+    : judgments.estimatedCostUsd === null ? null : usdToCny(judgments.estimatedCostUsd, snapshot.usdToCnyRate)
+  const maxPointCalls = Math.max(1, ...judgments.byPoint.map(item => item.total))
+
+  return (
+    <div className="observatory-stack-list">
+      <div className="observatory-overview">
+        <div>
+          <span>Jev 调用次数</span>
+          <strong>{format.format(judgments.total)}</strong>
+          <small>外部请求 {format.format(judgments.externalCalls)} 次</small>
+        </div>
+        <div>
+          <span>生效介入</span>
+          <strong>{format.format(judgments.activeInterventions)}</strong>
+          <small>Shadow 分歧 {format.format(judgments.shadowDisagreements)}</small>
+        </div>
+        <div>
+          <span>异常回退率</span>
+          <strong>{formatPct(judgments.fallbacks, judgments.total)}</strong>
+          <small>回退 {format.format(judgments.fallbacks)} 次</small>
+        </div>
+        <div>
+          <span>Jev 预估成本</span>
+          <strong>{costCny === null ? '—' : formatCny(costCny)}</strong>
+          <small>独立于主模型统计</small>
+        </div>
+      </div>
+
+      <section className="observatory-chart-card">
+        <div className="observatory-chart-head">
+          <h3>Active 核心保护成效</h3>
+          <span>基于真实下游影响统计</span>
+        </div>
+        <div className="observatory-chip-row">
+          <span className={`observatory-chip ${judgments.injectionBlocks > 0 ? 'is-danger' : ''}`}>注入拦截 {judgments.injectionBlocks}</span>
+          <span className={`observatory-chip ${judgments.completionFollowUps > 0 ? 'is-accent' : ''}`}>早停追问 {judgments.completionFollowUps}</span>
+          <span className={`observatory-chip ${judgments.admissionOmissions > 0 ? 'is-positive' : ''}`}>噪音折叠 {judgments.admissionOmissions}</span>
+          <span className={`observatory-chip ${judgments.patchFlags > 0 ? 'is-caution' : ''}`}>补丁复核 {judgments.patchFlags}</span>
+          <span className={`observatory-chip ${judgments.memoryFiltered > 0 ? 'is-accent' : ''}`}>记忆去噪 {judgments.memoryFiltered}</span>
+        </div>
+      </section>
+
+      <section className="observatory-chart-card">
+        <div className="observatory-chart-head">
+          <h3>各判定点调用与介入分布</h3>
+          <span>{judgments.byPoint.length} 个活跃点</span>
+        </div>
+        <div className="observatory-hbars">
+          {judgments.byPoint.map(item => (
+            <div className="observatory-hbar-row" key={item.point}>
+              <div className="observatory-hbar-head">
+                <code>{item.point}</code>
+                <strong>{item.total} 次{item.activeInterventions ? ` · 介入 ${item.activeInterventions}` : ''}</strong>
+              </div>
+              <div className="observatory-hbar-track">
+                <span className="viz-stacked-seg viz-seg-input" style={{ width: `${(item.total / maxPointCalls) * 100}%` }} />
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="observatory-chart-card">
+        <div className="observatory-chart-head">
+          <h3>近期判定因果明细</h3>
+          <span>点击可跳回对应运行轮次</span>
+        </div>
+        <div className="observatory-jev-list">
+          {judgments.recent.map((item, index) => (
+            <JevCausalCard
+              key={`${item.taskId}:${item.point}:${index}`}
+              item={item}
+              selected={selectedTaskId === item.taskId}
+              onSelect={() => onSelectTask(item.taskId)}
+            />
+          ))}
+        </div>
+      </section>
     </div>
   )
 }
