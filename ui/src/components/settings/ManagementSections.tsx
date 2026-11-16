@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { cnyRateNote, DEFAULT_USD_TO_CNY_RATE, formatCny, usdToCny } from '../../../../shared/contracts/currency.ts'
 import type { AgentPreferences, DesktopManagementApi, ManagedDiagnostic, ManagementSnapshot } from '../../../../shared/contracts/management.ts'
 import { workspaceAccessLabels } from '../../features/sessions/model'
 import { activeSession, useWorkspace } from '../../stores/workspace'
@@ -262,7 +263,6 @@ function Memory({ snapshot, api, busy, perform }: ActionProps) {
 }
 
 const number = new Intl.NumberFormat('zh-CN')
-const dollars = new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD', maximumFractionDigits: 6 })
 function dateLabel(value: number | string) {
   const date = new Date(value)
   return Number.isNaN(date.getTime()) ? '时间未知' : date.toLocaleString()
@@ -362,32 +362,44 @@ function OfflineDiagnostics({ api }: { api: DesktopManagementApi }) {
 
 function Diagnostics(props: ActionProps) {
   const { snapshot } = props
-  const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0 }
+  const totals = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, costCny: 0 }
   let incompleteCost = false
+  let rate = DEFAULT_USD_TO_CNY_RATE
   for (const { usage } of snapshot.tasks) {
     totals.input += usage.input
     totals.output += usage.output
     totals.cacheRead += usage.cacheRead
     totals.cacheWrite += usage.cacheWrite
-    if (usage.estimatedCostUsd !== undefined) totals.cost += usage.estimatedCostUsd
+    if (usage.usdToCnyRate) rate = usage.usdToCnyRate
+    if (usage.estimatedCostCny !== undefined) totals.costCny += usage.estimatedCostCny
+    else if (usage.estimatedCostUsd !== undefined) totals.costCny += usdToCny(usage.estimatedCostUsd, rate)
     else if (usage.input || usage.output || usage.cacheRead || usage.cacheWrite) incompleteCost = true
   }
+  const tokenTotal = totals.input + totals.output + totals.cacheRead + totals.cacheWrite
   const latest = snapshot.tasks.find((task) => task.taskId === snapshot.conversation?.latestTaskId)
   const budget = latest?.budget
   return (
     <div className="management-stack">
       <section className="management-group">
-        <h4>会话用量</h4>
+        <h4>会话用量与人民币预估</h4>
         {snapshot.conversation ? (
           <>
+            {tokenTotal > 0 && (
+              <div className="viz-stacked-track" aria-hidden="true">
+                {totals.input > 0 && <span className="viz-stacked-seg viz-seg-input" style={{ width: `${(totals.input / tokenTotal) * 100}%` }} title={`输入 ${number.format(totals.input)}`} />}
+                {totals.cacheRead > 0 && <span className="viz-stacked-seg viz-seg-cache-read" style={{ width: `${(totals.cacheRead / tokenTotal) * 100}%` }} title={`缓存读取 ${number.format(totals.cacheRead)}`} />}
+                {totals.cacheWrite > 0 && <span className="viz-stacked-seg viz-seg-cache-write" style={{ width: `${(totals.cacheWrite / tokenTotal) * 100}%` }} title={`缓存写入 ${number.format(totals.cacheWrite)}`} />}
+                {totals.output > 0 && <span className="viz-stacked-seg viz-seg-output" style={{ width: `${(totals.output / tokenTotal) * 100}%` }} title={`输出 ${number.format(totals.output)}`} />}
+              </div>
+            )}
             <dl className="management-metadata">
               <div><dt>输入 Token</dt><dd>{number.format(totals.input)}</dd></div>
               <div><dt>输出 Token</dt><dd>{number.format(totals.output)}</dd></div>
               <div><dt>缓存读取</dt><dd>{number.format(totals.cacheRead)}</dd></div>
               <div><dt>缓存写入</dt><dd>{number.format(totals.cacheWrite)}</dd></div>
-              <div><dt>估算成本</dt><dd>{incompleteCost ? (totals.cost ? '已知部分 ' + dollars.format(totals.cost) : '暂无报价') : dollars.format(totals.cost)}</dd></div>
+              <div><dt>估算成本 (人民币)</dt><dd title={cnyRateNote(rate)}>{incompleteCost ? (totals.costCny ? '已知部分 ' + formatCny(totals.costCny) : '暂无报价') : formatCny(totals.costCny)}</dd></div>
             </dl>
-            <p className="management-note">最近 {snapshot.tasks.length} 个任务的用量。</p>
+            <p className="management-note">最近 {snapshot.tasks.length} 个任务的用量（{cnyRateNote(rate)}）。</p>
             <h4>最近任务用量</h4>
             <dl className="management-metadata">
               {budget?.confirmed !== undefined && <div><dt>确认消耗</dt><dd>{number.format(budget.confirmed)}</dd></div>}

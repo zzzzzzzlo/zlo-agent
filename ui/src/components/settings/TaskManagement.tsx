@@ -75,6 +75,13 @@ export function TaskManagement({ snapshot, busy, perform }: {
   const taskLabels = new Map(task.nodes.map((node) => [node.id, node.goal || roles[node.role]]))
   const agentLabels = new Map(task.agents.map((agent) => [agent.id, taskLabels.get(agent.nodeId) ?? roles[agent.role]]))
   const agentsById = new Map(task.agents.map((agent) => [agent.id, agent]))
+  const delegatedNodes = task.nodes.filter(node => node.id !== task.rootNodeId)
+  const succeededDelegated = delegatedNodes.filter(node => node.status === 'succeeded' || node.status === 'completed').length
+  const timedAgents = task.agents.filter(agent => typeof agent.startedAt === 'number')
+  const swimMin = timedAgents.length ? Math.min(...timedAgents.map(a => a.startedAt!)) : 0
+  const swimMax = timedAgents.length ? Math.max(...timedAgents.map(a => a.finishedAt ?? a.startedAt!), swimMin + 1) : 1
+  const swimSpan = Math.max(1, swimMax - swimMin)
+  const formatElapsed = (ms: number) => ms < 1000 ? `${Math.round(ms)} ms` : `${(ms / 1000).toFixed(1)} s`
 
   function indent(agent: ManagedTask['agents'][number]) {
     let parent = agent.parentId
@@ -121,7 +128,12 @@ export function TaskManagement({ snapshot, busy, perform }: {
         {task.status === 'needs_reconciliation' && <p className="management-note">请在「用量与诊断」中检查相关操作。</p>}
       </section>
       <section className="management-group">
-        <h4>任务 DAG</h4>
+        <h4>任务 DAG{delegatedNodes.length > 0 && ` · 子目标达成 ${succeededDelegated}/${delegatedNodes.length}`}</h4>
+        {delegatedNodes.length > 0 && (
+          <div className="observatory-hbar-track" aria-hidden="true">
+            <span className="observatory-hbar-fill" style={{ width: `${(succeededDelegated / delegatedNodes.length) * 100}%`, background: 'var(--positive)' }} />
+          </div>
+        )}
         {!task.nodes.length && <p className="management-note">此任务暂无节点记录。</p>}
         {task.nodes.map((node) => (
           <details key={node.id} className="management-detail">
@@ -151,6 +163,30 @@ export function TaskManagement({ snapshot, busy, perform }: {
       <section className="management-group">
         <h4>Agent Tree</h4>
         {!task.agents.length && <p className="management-note">此任务暂无 Agent 运行记录。</p>}
+        {timedAgents.length > 0 && (
+          <div className="task-swimlane" aria-label="并发执行泳道">
+            {timedAgents.map(agent => {
+              const start = agent.startedAt!
+              const end = agent.finishedAt ?? swimMax
+              const leftPct = Math.max(0, Math.min(98, ((start - swimMin) / swimSpan) * 100))
+              const widthPct = Math.max(2, Math.min(100 - leftPct, ((end - start) / swimSpan) * 100))
+              const statusCls = agent.status === 'completed' || agent.status === 'succeeded' ? 'is-completed'
+                : agent.status === 'failed' ? 'is-error'
+                  : agent.status === 'interrupted' || agent.status === 'stopped' ? 'is-interrupted' : ''
+              return (
+                <div className="task-swimlane-row" key={'swim-' + agent.id}>
+                  <span className="task-swimlane-label" title={taskLabels.get(agent.nodeId) ?? roles[agent.role]}>
+                    {roles[agent.role]} · {(taskLabels.get(agent.nodeId) ?? agent.nodeId).slice(0, 18)}
+                  </span>
+                  <div className="task-swimlane-track" aria-hidden="true">
+                    <span className={`task-swimlane-bar ${statusCls}`} style={{ left: `${leftPct}%`, width: `${widthPct}%` }} />
+                  </div>
+                  <span className="task-swimlane-time">{agent.finishedAt ? formatElapsed(agent.finishedAt - start) : '进行中'}</span>
+                </div>
+              )
+            })}
+          </div>
+        )}
         {task.agents.map((agent) => (
           <div className="management-row" key={agent.id} style={{ marginInlineStart: indent(agent) }}>
             <div>
