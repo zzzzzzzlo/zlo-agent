@@ -1,90 +1,157 @@
+/* Zlo Agent · Design Tokens · Light-first, Mu-inspired clean aesthetic */
+
 :root {
   color-scheme: light;
-  --canvas: #f8f8f6;
-  --canvas-edge: #efefeb;
-  --backdrop-ink: #f8f8f6;
-  --backdrop-opacity: 100%;
-  --backdrop-soft: 100%;
-  --backdrop-vivid: 100%;
-  --text: #292927;
-  --muted: #565650;
-  --quiet: #73736b;
-  --accent: #6d587a;
-  --accent-fill: #6d587a;
+
+  /* ─── Background layers ─── */
+  --bg-base: #ffffff;
+  --bg-surface: #ffffff;
+  --bg-elevated: #f7f7fa;
+  --bg-hover: #f2f2f6;
+  --bg-active: #eaeaf0;
+  --bg-sidebar: #f8f7f6;
+  --bg-input: #ffffff;
+  --bg-code: #f6f6f9;
+  --bg-bubble: #f4f3f2;
+
+  /* ─── Text ─── */
+  --text-primary: #1a1a24;
+  --text-secondary: #6b6b80;
+  --text-tertiary: #a0a0b2;
+  --text-on-accent: #ffffff;
+
+  /* ─── Accent (purple) ─── */
+  --accent: #7c6af6;
+  --accent-hover: #6d5ae8;
+  --accent-dim: rgba(124, 106, 246, 0.08);
+  --accent-border: rgba(124, 106, 246, 0.22);
+  --accent-fill: #7c6af6;
   --accent-ink: #ffffff;
-  --accent-wash: #6d587a12;
-  --positive: #347253;
-  --danger: #a34848;
-  --caution: #8a641f;
-  --line: #29292714;
-  --line-strong: #29292726;
-  --surface: #fdfdfc;
-  --surface-hover: #efefeb;
-  --surface-selected: #ebe7ed;
-  --bubble: #efefeb;
-  --sidebar-base: #f3f3f0;
-  --dialog-base: #fdfdfc;
-  --rim: #29292718;
-  --rim-crest: #29292718;
-  --shadow: 0 18px 50px #29292724, 0 2px 8px #29292712;
+  --accent-wash: rgba(124, 106, 246, 0.07);
+
+  /* ─── Brand gradient (pink → purple like Mu) ─── */
+  --brand-from: #f472b6;
+  --brand-to: #a855f7;
+
+  /* ─── Semantic ─── */
+  --positive: #22c55e;
+  --positive-dim: rgba(34, 197, 94, 0.10);
+  --danger: #ef4444;
+  --danger-dim: rgba(239, 68, 68, 0.10);
+  --caution: #eab308;
+  --caution-dim: rgba(234, 179, 8, 0.10);
+  --info: #3b82f6;
+
+  /* ─── Borders ─── */
+  --border: rgba(0, 0, 0, 0.07);
+  --border-mid: rgba(0, 0, 0, 0.10);
+  --border-strong: rgba(0, 0, 0, 0.14);
+
+  /* ─── Effects ─── */
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.05);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.07);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.10);
+  --scrim: rgba(0, 0, 0, 0.28);
+
+  /* ─── Compatibility aliases ─── */
+  --canvas: var(--bg-base);
+  --canvas-edge: var(--bg-elevated);
+  --text: var(--text-primary);
+  --muted: var(--text-secondary);
+  --quiet: var(--text-tertiary);
+  --line: var(--border);
+  --line-strong: var(--border-mid);
+  --surface: var(--bg-surface);
+  --surface-hover: var(--bg-hover);
+  --surface-selected: var(--bg-active);
+  --bubble: var(--bg-bubble);
+  --sidebar-base: var(--bg-sidebar);
+  --dialog-base: var(--bg-surface);
+  --rim: var(--border);
+  --rim-crest: var(--border);
+  --shadow: var(--shadow-lg);
   --orbit-glow: transparent;
-  --orbit-line: #6d587a38;
-  --scrim: #29292755;
-  --lq-text: var(--text);
-  --lq-tint: #fdfdfcee;
-  --lq-tint-deep: #fdfdfcee;
-  --lq-rim-hi: #29292718;
-  --lq-rim-lo: #29292718;
-  --lq-shadow: var(--shadow);
+  --orbit-line: var(--accent-border);
+
+  /* ─── Typography ─── */
   --font-ui: "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI", sans-serif;
   --font-display: "Segoe UI Variable Display", "Microsoft YaHei UI", "Segoe UI", sans-serif;
   --font-mono: "Cascadia Mono", Consolas, "Microsoft YaHei UI", monospace;
-  --sidebar-width: 224px;
+
+  /* ─── Dimensions ─── */
+  --sidebar-width: 200px;
   --activity-width: 340px;
-  --title-height: 48px;
+  --title-height: 42px;
   --status-height: 28px;
-  --chat-width: 780px;
-  --chat-gutter: clamp(20px, 5%, 56px);
+  --chat-width: 720px;
+  --chat-gutter: clamp(20px, 5%, 48px);
+
+  /* ─── Radius ─── */
   --radius-sm: 7px;
-  --radius-md: 11px;
-  --radius-lg: 16px;
-  --radius-window: 12px;
-  --ease: cubic-bezier(.16, 1, .3, 1);
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 18px;
+  --radius-round: 9999px;
+  --radius-window: 10px;
+
+  /* ─── Motion ─── */
+  --ease: cubic-bezier(0.16, 1, 0.3, 1);
+
+  /* ─── Liqui-design compatibility ─── */
+  --lq-text: var(--text-primary);
+  --lq-tint: #ffffffee;
+  --lq-tint-deep: #ffffffee;
+  --lq-rim-hi: var(--border);
+  --lq-rim-lo: var(--border);
+  --lq-shadow: var(--shadow-md);
 }
 
+/* ─── Dark theme ─── */
 :root[data-theme="dark"] {
   color-scheme: dark;
-  --canvas: #1d1d1b;
-  --canvas-edge: #272725;
-  --backdrop-ink: #1d1d1b;
-  --text: #efefeb;
-  --muted: #c0c0b8;
-  --quiet: #999990;
-  --accent: #c4aed2;
-  --accent-fill: #c4aed2;
-  --accent-ink: #28232c;
-  --accent-wash: #c4aed218;
-  --positive: #8dc5a5;
-  --danger: #e2a0a0;
-  --caution: #d8b775;
-  --line: #efefeb16;
-  --line-strong: #efefeb29;
-  --surface: #242422;
-  --surface-hover: #30302d;
-  --surface-selected: #373138;
-  --bubble: #2b2b28;
-  --sidebar-base: #20201e;
-  --dialog-base: #242422;
-  --rim: #efefeb20;
-  --rim-crest: #efefeb20;
-  --shadow: 0 18px 50px #00000055, 0 2px 8px #00000033;
-  --orbit-line: #c4aed248;
-  --scrim: #00000080;
-  --lq-tint: #242422fa;
-  --lq-tint-deep: #242422fa;
-  --lq-rim-hi: #efefeb20;
-  --lq-rim-lo: #efefeb20;
+
+  --bg-base: #111114;
+  --bg-surface: #1a1a1f;
+  --bg-elevated: #222228;
+  --bg-hover: #2a2a32;
+  --bg-active: #333340;
+  --bg-sidebar: #141416;
+  --bg-input: #1a1a1f;
+  --bg-code: #1e1e24;
+  --bg-bubble: #2a2a30;
+
+  --text-primary: #e8e8f0;
+  --text-secondary: #8888a0;
+  --text-tertiary: #555568;
+
+  --accent: #9484ff;
+  --accent-hover: #a898ff;
+  --accent-dim: rgba(148, 132, 255, 0.12);
+  --accent-border: rgba(148, 132, 255, 0.30);
+  --accent-fill: #9484ff;
+  --accent-ink: #1a1a24;
+  --accent-wash: rgba(148, 132, 255, 0.10);
+
+  --positive: #34d399;
+  --positive-dim: rgba(52, 211, 153, 0.12);
+  --danger: #f87171;
+  --danger-dim: rgba(248, 113, 113, 0.12);
+  --caution: #fbbf24;
+  --caution-dim: rgba(251, 191, 36, 0.12);
+  --info: #60a5fa;
+
+  --border: rgba(255, 255, 255, 0.06);
+  --border-mid: rgba(255, 255, 255, 0.10);
+  --border-strong: rgba(255, 255, 255, 0.16);
+
+  --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.25);
+  --shadow-md: 0 4px 16px rgba(0, 0, 0, 0.35);
+  --shadow-lg: 0 12px 40px rgba(0, 0, 0, 0.45);
+  --scrim: rgba(0, 0, 0, 0.60);
+
+  --lq-tint: #1a1a1ffa;
+  --lq-tint-deep: #1a1a1ffa;
 }
 
-:root[data-glass="soft"] { --backdrop-opacity: var(--backdrop-soft); }
-:root[data-glass="vivid"] { --backdrop-opacity: var(--backdrop-vivid); }
+:root[data-glass="soft"] { --backdrop-opacity: 85%; }
+:root[data-glass="vivid"] { --backdrop-opacity: 100%; }

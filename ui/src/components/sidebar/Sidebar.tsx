@@ -49,7 +49,7 @@ export function Sidebar({ onCreate, onSettings, onSessionAction, onSession }: {
       <div className="sidebar-content">
         <div className="sidebar-top">
           <button className="new-session" onClick={onCreate} disabled={!ready}>
-            <Plus size={16} /><span>新建会话</span><kbd>Ctrl N</kbd>
+            <Plus size={15} /><span>新建会话</span><kbd>Ctrl N</kbd>
           </button>
         </div>
         <div className="sidebar-label session-label"><span>会话历史</span><span>{sessions.length.toString().padStart(2, '0')}</span></div>
@@ -62,22 +62,22 @@ export function Sidebar({ onCreate, onSettings, onSessionAction, onSession }: {
                 {isBusy(session.turns.at(-1)?.status ?? session.latestStatus) && <i className="live-dot" aria-label="运行中" />}
               </button>
               <IconButton label={`${session.title}的会话操作`} className="session-more" aria-haspopup="dialog" onClick={(event) => openMenu(event, session.id)}>
-                <MoreHorizontal size={16} />
+                <MoreHorizontal size={15} />
               </IconButton>
             </div>
           ))}
         </nav>
         <div className="sidebar-footer">
           <button className="settings-entry" onClick={onSettings}>
-            <Settings2 size={16} /><strong>设置</strong>
+            <Settings2 size={15} /><strong>设置</strong>
           </button>
-          <IconButton className="mobile-sidebar-close" label="关闭会话导航" onClick={toggle}><PanelLeft size={16} /></IconButton>
+          <IconButton className="mobile-sidebar-close" label="关闭会话导航" onClick={toggle}><PanelLeft size={15} /></IconButton>
         </div>
       </div>
       <div className="session-popover" ref={popover} popover="auto" role="dialog" aria-label="会话操作">
         <div className="session-menu">
-          <button onClick={() => act('rename')}><Pencil size={14} />重命名</button>
-          <button onClick={() => act('delete')}><Trash2 size={14} />归档会话</button>
+          <button onClick={() => act('rename')}><Pencil size={13} />重命名</button>
+          <button onClick={() => act('delete')}><Trash2 size={13} />归档会话</button>
         </div>
       </div>
     </aside>
