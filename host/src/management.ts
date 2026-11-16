@@ -1,5 +1,6 @@
 import type { AgentPreferences, ManagedOperation, ManagedTask, ManagedTool, ProviderId } from '../../shared/contracts/management.ts'
 import type { ConversationSummary } from '../../shared/contracts/desktop.ts'
+import { resolveUsdToCnyRate, usdToCny } from '../../shared/contracts/currency.ts'
 import { verificationVerdict } from '../../shared/contracts/domain.ts'
 import type { WorkspaceAccess } from '../../shared/contracts/domain.ts'
 import { ConversationError, parseRoute } from './conversation.ts'
@@ -100,19 +101,42 @@ export function managedOperation(operation: Operation, approval?: string): Manag
 export function taskView(task: TaskSnapshot, events: AgentEvent[], operations: Operation[],
   rootAccess: WorkspaceAccess, budget: ManagedTask['budget']): ManagedTask {
   const agents = new Map<string, ManagedTask['agents'][number]>()
+  const nodeTimings = new Map<string, { startedAt?: number; finishedAt?: number }>()
   const approvals = new Map<string, ManagedOperation>()
   const operationOrder = new Map<string, number>()
   const toolsByNode = new Map<string, Set<string>>()
   const usage: ManagedTask['usage'] = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  const usdToCnyRate = resolveUsdToCnyRate()
   for (const event of events) {
     const { payload, agentRunId, taskNodeId, parentAgentRunId } = event
-    if (event.type === 'agent.started' && agentRunId && taskNodeId &&
+    const time = Date.parse(event.occurredAt)
+    const timestamp = Number.isFinite(time) ? time : undefined
+    if (event.type === 'task.created' && timestamp !== undefined) {
+      const current = nodeTimings.get(task.rootNodeId) ?? {}
+      nodeTimings.set(task.rootNodeId, { ...current, startedAt: current.startedAt ?? timestamp })
+    } else if ((event.type === 'task.state_changed' || event.type === 'task.stopped') && timestamp !== undefined &&
+      typeof payload.status === 'string' && ['succeeded', 'failed', 'stopped', 'blocked', 'needs_reconciliation'].includes(payload.status)) {
+      const current = nodeTimings.get(task.rootNodeId) ?? {}
+      nodeTimings.set(task.rootNodeId, { ...current, finishedAt: timestamp })
+    } else if (event.type === 'task.node_started' && taskNodeId && timestamp !== undefined) {
+      const current = nodeTimings.get(taskNodeId) ?? {}
+      nodeTimings.set(taskNodeId, { ...current, startedAt: current.startedAt ?? timestamp })
+    } else if ((event.type === 'task.node_settled' || event.type === 'task.worker_settled') && taskNodeId && timestamp !== undefined) {
+      const current = nodeTimings.get(taskNodeId) ?? {}
+      nodeTimings.set(taskNodeId, { ...current, finishedAt: timestamp })
+    } else if (event.type === 'agent.started' && agentRunId && taskNodeId &&
       (payload.role === 'root' || payload.role === 'team' || payload.role === 'worker')) {
       agents.set(agentRunId, { id: agentRunId, nodeId: taskNodeId, parentId: parentAgentRunId,
-        role: payload.role, status: 'active', route: payload.route as ManagedTask['agents'][number]['route'] })
+        role: payload.role, status: 'active', route: payload.route as ManagedTask['agents'][number]['route'],
+        ...(timestamp !== undefined ? { startedAt: timestamp } : {}) })
+      if (timestamp !== undefined) {
+        const current = nodeTimings.get(taskNodeId) ?? {}
+        nodeTimings.set(taskNodeId, { ...current, startedAt: current.startedAt ?? timestamp })
+      }
     } else if (event.type === 'agent.finished' && agentRunId) {
       const agent = agents.get(agentRunId)
       if (agent && typeof payload.status === 'string') agent.status = payload.status
+      if (agent && timestamp !== undefined) agent.finishedAt = timestamp
     } else if (event.type === 'model.route_changed' && agentRunId && agents.has(agentRunId)) {
       agents.get(agentRunId)!.route = payload.route as ManagedTask['agents'][number]['route']
     } else if (event.type === 'tool.approval_resolved' && typeof payload.id === 'string' && typeof payload.tool === 'string') {
@@ -130,6 +154,10 @@ export function taskView(task: TaskSnapshot, events: AgentEvent[], operations: O
       }
     }
   }
+  if (usage.estimatedCostUsd !== undefined) {
+    usage.estimatedCostCny = usdToCny(usage.estimatedCostUsd, usdToCnyRate)
+    usage.usdToCnyRate = usdToCnyRate
+  }
   const receipts = operations.map(operation => {
     const approval = approvals.get(operation.id)?.approval
     approvals.delete(operation.id)
@@ -142,17 +170,20 @@ export function taskView(task: TaskSnapshot, events: AgentEvent[], operations: O
   const routeFor = (node: string) => [...agents.values()].reverse().find(run => run.nodeId === node)?.route
   const allReceipts = [...receipts, ...approvals.values()].sort((a, b) => (operationOrder.get(b.id) ?? 0) - (operationOrder.get(a.id) ?? 0))
   const unknown = allReceipts.filter(item => item.status === 'unknown_effect')
+  const timingFor = (nodeId: string) => nodeTimings.get(nodeId)
   return {
     taskId: task.id, rootNodeId: task.rootNodeId, status: task.status, reason: task.reconciliationBlock ?? task.reason, verification, usage, budget,
     nodes: [
       { id: task.rootNodeId, role: 'root', goal: task.goal, status: task.status, dependencies: [], access: rootAccess,
-        route: routeFor(task.rootNodeId) ?? task.route, verification, tools: [...(toolsByNode.get(task.rootNodeId) ?? [])] },
+        route: routeFor(task.rootNodeId) ?? task.route, verification, tools: [...(toolsByNode.get(task.rootNodeId) ?? [])],
+        ...timingFor(task.rootNodeId) },
       ...[...(task.worker ? [task.worker] : []), ...(task.nodes ?? [])].map(node => ({
         id: node.id, role: node.role ?? 'worker' as const, goal: node.goal, status: node.status,
         parentNodeId: node.parentNodeId, dependencies: node.dependencies,
         access: rootAccess === 'read' ? 'read' : node.access === 'trusted' && rootAccess === 'write' ? 'write' : (node.access ?? 'read'),
         scopePath: node.scopePath, route: routeFor(node.id) ?? node.route, verification: node.verification,
         result: node.result && redactProcessOutput(node.result.summary), tools: [...(toolsByNode.get(node.id) ?? [])],
+        ...timingFor(node.id),
       })),
     ],
     agents: [...agents.values()], operations: [...unknown,

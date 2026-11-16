@@ -17,6 +17,7 @@ import type { CustomProviderCredential, CustomProviderTest, GrokCredential, Grok
 import { customRoute, grokProviderId, isCustomRoute, parseCustomCredential, validCustomId } from '../../shared/contracts/provider-setup.ts'
 import { judgeEndpoint, judgeKeyMatches, parseJevSettings } from '../../shared/contracts/jev.ts'
 import type { JudgeCredentials } from '../../shared/contracts/jev.ts'
+import { resolveUsdToCnyRate, usdToCny } from '../../shared/contracts/currency.ts'
 import type { AgentPreferences, ManagedMemory, ManagedModel, ManagedOperation, ManagedProvider, ManagementCommand, ManagementSnapshot, PrivateCredentialCommand, ProviderId } from '../../shared/contracts/management.ts'
 import type { AgentEvent, EventDraft, ModelRoute, TaskStatus, VerificationCheck, WorkspaceAccess } from './contracts/domain.ts'
 import type {
@@ -852,9 +853,18 @@ export class LocalAgentHost {
       }
       case 'managementSnapshot': return this.managementSnapshot(command.conversationId)
       case 'conversationObservatory': {
-        const { latestTaskId, ...activity } = this.#conversations.activity(management.id(command.conversationId))
-        return { ...activity, latestTask: latestTaskId ? { id: latestTaskId,
-          ...this.#scheduler.budget(latestTaskId) } : undefined }
+        const { latestTaskId, turnMetrics, ...activity } = this.#conversations.activity(management.id(command.conversationId))
+        const usdToCnyRate = resolveUsdToCnyRate()
+        return {
+          ...activity,
+          estimatedCostCny: activity.estimatedCostUsd === null ? null : usdToCny(activity.estimatedCostUsd, usdToCnyRate),
+          usdToCnyRate,
+          turnMetrics: turnMetrics.map(item => ({
+            ...item,
+            estimatedCostCny: item.estimatedCostUsd === null ? null : usdToCny(item.estimatedCostUsd, usdToCnyRate),
+          })),
+          latestTask: latestTaskId ? { id: latestTaskId, ...this.#scheduler.budget(latestTaskId) } : undefined,
+        }
       }
       case 'saveAgentPreferences': return this.saveAgentPreferences(command.preferences)
       case 'setWorkspaceAccess': return this.setConversationWorkspaceAccess(command.conversationId, command.access, command.expected,

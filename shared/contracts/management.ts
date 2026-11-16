@@ -1,4 +1,4 @@
-import type { EndReason, ModelCatalogEntry, ModelRoute, TaskStatus, VerificationResult, WorkspaceAccess } from './domain.ts'
+import type { EndReason, ModelCatalogEntry, ModelRoute, TaskStatus, VerificationResult, VerificationVerdict, WorkspaceAccess } from './domain.ts'
 import type { ConversationSummary, UsageTotals } from './desktop.ts'
 import type { ChatGptSession } from './chatgpt.ts'
 import type { JevSettings, JevStatus, JudgeCredentials } from './jev.ts'
@@ -69,10 +69,21 @@ export interface ManagedTask {
     verification?: VerificationResult
     result?: string
     tools?: string[]
+    startedAt?: number
+    finishedAt?: number
   }[]
-  agents: { id: string; nodeId: string; role: 'root' | 'team' | 'worker'; status: string; parentId?: string; route?: ModelRoute }[]
+  agents: {
+    id: string
+    nodeId: string
+    role: 'root' | 'team' | 'worker'
+    status: string
+    parentId?: string
+    route?: ModelRoute
+    startedAt?: number
+    finishedAt?: number
+  }[]
   operations: ManagedOperation[]
-  usage: UsageTotals & { estimatedCostUsd?: number }
+  usage: UsageTotals & { estimatedCostUsd?: number; estimatedCostCny?: number; usdToCnyRate?: number }
   budget?: { tokenLimit?: number; costLimitUsd?: number; requests?: number; confirmed?: number; reserved?: number; uncertain?: number }
 }
 
@@ -104,6 +115,45 @@ export interface ManagementSnapshot {
   diagnostics: ManagedDiagnostic[]
 }
 
+export type VerificationRigorTier = 'T3' | 'T2' | 'T1' | 'T0'
+
+export interface ConversationTurnMetric {
+  taskId: string
+  label: string
+  status: TaskStatus
+  verdict: VerificationVerdict
+  rigorTier: VerificationRigorTier
+  attemptCount: number
+  firstPassVerified: boolean
+  selfRepaired: boolean
+  steered: boolean
+  input: number
+  output: number
+  cacheRead: number
+  cacheWrite: number
+  estimatedCostUsd: number | null
+  estimatedCostCny: number | null
+  toolCalls: number
+  toolFailed: number
+  durationMs: number | null
+}
+
+export interface ConversationCompletionSummary {
+  ended: number
+  verified: number
+  unverified: number
+  failed: number
+  active: number
+  stopped: number
+  needsReconciliation: number
+  firstPassVerified: number
+  selfRepaired: number
+  steered: number
+  rigorTiers: { command: number; visual: number; path: number; unverified: number }
+  nodeTotal: number
+  nodeSucceeded: number
+}
+
 export interface ConversationObservatory {
   conversationId: string
   turns: number
@@ -112,8 +162,12 @@ export interface ConversationObservatory {
   usageReports: number
   pricedReports: number
   estimatedCostUsd: number | null
+  estimatedCostCny?: number | null
+  usdToCnyRate?: number
   tools: { name: string; status: string; count: number }[]
   latestTask?: { id: string; tokenLimit?: number; requests: number; confirmed: number; reserved: number; uncertain: number }
+  completion?: ConversationCompletionSummary
+  turnMetrics?: ConversationTurnMetric[]
 }
 
 export interface DesktopManagementApi {

@@ -4,7 +4,7 @@ import { test } from 'node:test'
 
 const dependencies: Record<string, string[]> = {
   cli: ['contracts/desktop', 'conversation', 'execution', 'fake', 'faux', 'host', 'pi', 'shared/diagnostics', 'shared/loopback-http', 'shared/management', 'shared/jev', 'management', 'model-management', 'telemetry-http', 'jev-transport', 'shared/provider-setup'],
-  host: ['contracts/domain', 'contracts/desktop', 'conversation', 'execution', 'orchestrator', 'policies', 'store', 'task-engine', 'workspace', 'diagnostics', 'shared/diagnostics', 'judgment', 'memory', 'model-scheduler', 'verification', 'tool-approval', 'shared/tool-approval', 'artifact-tools', 'browser-tools', 'preview-tools', 'file-tools', 'git-tools', 'process-tools', 'web-tools', 'management', 'reconciliation', 'shared/chatgpt', 'shared/management', 'telemetry-projection', 'shared/jev', 'jev-settings', 'shared/provider-setup'],
+  host: ['contracts/domain', 'contracts/desktop', 'conversation', 'execution', 'orchestrator', 'policies', 'store', 'task-engine', 'workspace', 'diagnostics', 'shared/diagnostics', 'judgment', 'memory', 'model-scheduler', 'verification', 'tool-approval', 'shared/tool-approval', 'artifact-tools', 'browser-tools', 'preview-tools', 'file-tools', 'git-tools', 'process-tools', 'web-tools', 'management', 'reconciliation', 'shared/chatgpt', 'shared/currency', 'shared/management', 'telemetry-projection', 'shared/jev', 'jev-settings', 'shared/provider-setup'],
   'telemetry-http': ['host', 'contracts/domain', 'shared/loopback-http', 'telemetry-evidence', 'telemetry-projection'],
   'telemetry-evidence': ['shared/observatory', 'task-engine', 'telemetry-projection', 'workspace', 'workspace-process'],
   'telemetry-projection': ['shared/domain', 'shared/observatory', 'shared/tool-approval', 'contracts/domain', 'task-engine', 'workspace-process', 'shared/jev'],
@@ -34,7 +34,7 @@ const dependencies: Record<string, string[]> = {
   'jev-transport': ['shared/jev'],
   memory: ['contracts/domain', 'store', 'judgment'],
   'model-scheduler': ['contracts/domain', 'execution', 'store', 'judgment'],
-  management: ['contracts/domain', 'contracts/desktop', 'shared/domain', 'shared/management', 'conversation', 'policies', 'task-engine', 'workspace', 'workspace-process'],
+  management: ['contracts/domain', 'contracts/desktop', 'shared/currency', 'shared/domain', 'shared/management', 'conversation', 'policies', 'task-engine', 'workspace', 'workspace-process'],
   'model-management': ['shared/management'],
   'chatgpt-responses': [],
   reconciliation: ['task-engine', 'workspace'],
@@ -52,7 +52,8 @@ const dependencies: Record<string, string[]> = {
   faux: ['pi'],
   'contracts/desktop': ['shared/domain', 'shared/tool-approval'],
   'contracts/domain': ['shared/domain'],
-  'shared/management': ['shared/domain', 'contracts/desktop', 'shared/chatgpt', 'shared/jev', 'shared/provider-setup', 'shared/tool-approval'],
+  'shared/management': ['shared/domain', 'contracts/desktop', 'shared/chatgpt', 'shared/currency', 'shared/jev', 'shared/provider-setup', 'shared/tool-approval'],
+  'shared/currency': [],
   'shared/provider-setup': ['shared/domain'],
   'shared/chatgpt': ['shared/domain'],
   'shared/observatory': ['shared/domain'],

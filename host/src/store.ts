@@ -2,7 +2,8 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, realpathSync, statSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
-import type { AgentEvent, EventDraft } from './contracts/domain.ts';
+import type { AgentEvent, EventDraft, TaskStatus, VerificationResult, VerificationVerdict } from './contracts/domain.ts';
+import { verificationVerdict } from './contracts/domain.ts';
 
 export type { AgentEvent, EventDraft } from './contracts/domain.ts';
 
@@ -158,30 +159,169 @@ export class LocalStore {
   }
 
   conversationActivity(namespace: string) {
-    const model = this.#db.prepare(`
-      WITH activity AS (
-        SELECT json_extract(e.event, '$.type') AS type, json_extract(e.event, '$.payload') AS payload
-        FROM records r JOIN events e ON e.task_id = json_extract(r.value, '$.taskId')
-        WHERE r.namespace = ? AND json_extract(e.event, '$.type') IN ('model.request_started', 'model.usage')
+    const rows = this.#db.prepare(`
+      WITH turn_tasks AS (
+        SELECT r.id AS turnId, r.value AS turnJson, json_extract(r.value, '$.taskId') AS taskId, t.value AS taskJson
+        FROM records r
+        LEFT JOIN records t ON t.namespace = 'tasks' AND t.id = json_extract(r.value, '$.taskId')
+        WHERE r.namespace = ?
+        ORDER BY r.id
+      ),
+      task_events AS (
+        SELECT e.task_id AS taskId,
+          count(*) FILTER (WHERE json_extract(e.event, '$.type') = 'model.request_started') AS requests,
+          count(*) FILTER (WHERE json_extract(e.event, '$.type') = 'model.usage') AS reports,
+          count(json_extract(e.event, '$.payload.estimatedCostUsd')) FILTER (WHERE json_extract(e.event, '$.type') = 'model.usage') AS priced,
+          sum(json_extract(e.event, '$.payload.estimatedCostUsd')) FILTER (WHERE json_extract(e.event, '$.type') = 'model.usage') AS cost,
+          sum(json_extract(e.event, '$.payload.input')) FILTER (WHERE json_extract(e.event, '$.type') = 'model.usage') AS input,
+          sum(json_extract(e.event, '$.payload.output')) FILTER (WHERE json_extract(e.event, '$.type') = 'model.usage') AS output,
+          sum(json_extract(e.event, '$.payload.cacheRead')) FILTER (WHERE json_extract(e.event, '$.type') = 'model.usage') AS cacheRead,
+          sum(json_extract(e.event, '$.payload.cacheWrite')) FILTER (WHERE json_extract(e.event, '$.type') = 'model.usage') AS cacheWrite,
+          max(CASE WHEN json_extract(e.event, '$.type') = 'visual.round_finished'
+            AND json_extract(e.event, '$.payload.rendered') = 1
+            AND coalesce(json_extract(e.event, '$.payload.runtimeErrors'), 0) = 0 THEN 1 ELSE 0 END) AS cleanVisual,
+          count(*) FILTER (WHERE json_extract(e.event, '$.type') = 'model.output_recovery') AS outputRecoveries,
+          count(*) FILTER (WHERE json_extract(e.event, '$.type') = 'task.resumed') AS resumes,
+          count(*) FILTER (WHERE json_extract(e.event, '$.type') IN ('task.instruction_added', 'instruction.applied')) AS steerEvents,
+          min(json_extract(e.event, '$.occurredAt')) AS firstAt,
+          max(CASE WHEN json_extract(e.event, '$.type') IN ('task.state_changed', 'task.stopped')
+            AND json_extract(e.event, '$.payload.status') IN ('succeeded', 'failed', 'stopped', 'blocked', 'needs_reconciliation')
+            THEN json_extract(e.event, '$.occurredAt') END) AS terminalAt,
+          max(json_extract(e.event, '$.occurredAt')) AS lastAt
+        FROM events e
+        WHERE e.task_id IN (SELECT taskId FROM turn_tasks)
+        GROUP BY e.task_id
       )
-      SELECT count(*) FILTER (WHERE type = 'model.request_started') AS requests,
-        count(*) FILTER (WHERE type = 'model.usage') AS reports,
-        count(json_extract(payload, '$.estimatedCostUsd')) FILTER (WHERE type = 'model.usage') AS priced,
-        sum(json_extract(payload, '$.estimatedCostUsd')) FILTER (WHERE type = 'model.usage') AS cost,
-        sum(json_extract(payload, '$.input')) FILTER (WHERE type = 'model.usage') AS input,
-        sum(json_extract(payload, '$.output')) FILTER (WHERE type = 'model.usage') AS output,
-        sum(json_extract(payload, '$.cacheRead')) FILTER (WHERE type = 'model.usage') AS cacheRead,
-        sum(json_extract(payload, '$.cacheWrite')) FILTER (WHERE type = 'model.usage') AS cacheWrite
-      FROM activity
-    `).get(namespace)!;
+      SELECT tt.turnJson, tt.taskJson,
+        te.requests, te.reports, te.priced, te.cost, te.input, te.output, te.cacheRead, te.cacheWrite,
+        te.cleanVisual, te.outputRecoveries, te.resumes, te.steerEvents, te.firstAt, te.terminalAt, te.lastAt
+      FROM turn_tasks tt
+      LEFT JOIN task_events te ON te.taskId = tt.taskId
+      ORDER BY tt.turnId
+    `).all(namespace);
+
+    const endedStatuses = new Set<TaskStatus>(['succeeded', 'failed', 'stopped', 'blocked', 'needs_reconciliation']);
+    let modelRequests = 0, usageReports = 0, pricedReports = 0;
+    let totalCost: number | null = null;
+    const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
+    const completion = {
+      ended: 0, verified: 0, unverified: 0, failed: 0, active: 0, stopped: 0, needsReconciliation: 0,
+      firstPassVerified: 0, selfRepaired: 0, steered: 0,
+      rigorTiers: { command: 0, visual: 0, path: 0, unverified: 0 },
+      nodeTotal: 0, nodeSucceeded: 0,
+    };
+    const turnMetrics: {
+      taskId: string; label: string; status: TaskStatus; verdict: VerificationVerdict;
+      rigorTier: 'T3' | 'T2' | 'T1' | 'T0'; attemptCount: number;
+      firstPassVerified: boolean; selfRepaired: boolean; steered: boolean;
+      input: number; output: number; cacheRead: number; cacheWrite: number;
+      estimatedCostUsd: number | null; toolCalls: number; toolFailed: number; durationMs: number | null;
+    }[] = [];
+
+    for (const row of rows) {
+      const turn = JSON.parse(row.turnJson as string) as {
+        taskId: string; status: TaskStatus; verification?: VerificationResult;
+        user?: { text?: string }; instructions?: unknown[];
+        tools?: { status: string }[];
+        nodes?: { status: string }[];
+      };
+      const task = typeof row.taskJson === 'string'
+        ? JSON.parse(row.taskJson) as { attemptCount?: number; instructions?: unknown[]; nodes?: { replans?: number; status?: string }[] }
+        : undefined;
+      const requests = Number(row.requests ?? 0);
+      const reports = Number(row.reports ?? 0);
+      const priced = Number(row.priced ?? 0);
+      const cost = typeof row.cost === 'number' ? row.cost : null;
+      const input = Number(row.input ?? 0);
+      const output = Number(row.output ?? 0);
+      const cacheRead = Number(row.cacheRead ?? 0);
+      const cacheWrite = Number(row.cacheWrite ?? 0);
+      modelRequests += requests;
+      usageReports += reports;
+      pricedReports += priced;
+      if (cost !== null) totalCost = (totalCost ?? 0) + cost;
+      usage.input += input;
+      usage.output += output;
+      usage.cacheRead += cacheRead;
+      usage.cacheWrite += cacheWrite;
+
+      const ended = endedStatuses.has(turn.status);
+      const verdict: VerificationVerdict = turn.verification ? verificationVerdict(turn.verification) : 'unverified';
+      const cleanVisual = Number(row.cleanVisual ?? 0) > 0;
+      const rigorTier: 'T3' | 'T2' | 'T1' | 'T0' = verdict !== 'verified' ? 'T0'
+        : turn.verification?.basis === 'project_command' ? 'T3' : cleanVisual ? 'T2' : 'T1';
+      const steered = (turn.instructions?.length ?? 0) > 0 || Number(row.steerEvents ?? 0) > 0 ||
+        Number(row.resumes ?? 0) > 0 || (task?.instructions?.length ?? 0) > 0;
+      const hasReplans = (task?.nodes ?? []).some(node => (node.replans ?? 0) > 0);
+      const attemptCount = task?.attemptCount ?? 1;
+      const toolCalls = turn.tools?.length ?? 0;
+      const toolFailed = turn.tools?.filter(item => item.status === 'failed').length ?? 0;
+      const firstPassVerified = ended && verdict === 'verified' && attemptCount === 1 && !steered && !hasReplans;
+      const selfRepaired = ended && verdict === 'verified' && !steered && Number(row.resumes ?? 0) === 0 &&
+        (toolFailed > 0 || attemptCount > 1 || hasReplans || Number(row.outputRecoveries ?? 0) > 0);
+
+      if (ended) {
+        completion.ended++;
+        if (verdict === 'verified') {
+          completion.verified++;
+          if (rigorTier === 'T3') completion.rigorTiers.command++;
+          else if (rigorTier === 'T2') completion.rigorTiers.visual++;
+          else completion.rigorTiers.path++;
+        } else if (verdict === 'failed' || turn.status === 'failed') {
+          completion.failed++;
+        } else {
+          completion.unverified++;
+          completion.rigorTiers.unverified++;
+        }
+        if (turn.status === 'stopped' || turn.status === 'blocked') completion.stopped++;
+        if (turn.status === 'needs_reconciliation') completion.needsReconciliation++;
+        if (firstPassVerified) completion.firstPassVerified++;
+        if (selfRepaired) completion.selfRepaired++;
+      } else {
+        completion.active++;
+      }
+      if (steered) completion.steered++;
+      const nodes = turn.nodes ?? [];
+      completion.nodeTotal += nodes.length;
+      completion.nodeSucceeded += nodes.filter(node => node.status === 'succeeded').length;
+
+      const startMs = typeof row.firstAt === 'string' ? Date.parse(row.firstAt) : NaN;
+      const endIso = ended ? (typeof row.terminalAt === 'string' ? row.terminalAt : row.lastAt) : row.lastAt;
+      const endMs = typeof endIso === 'string' ? Date.parse(endIso) : NaN;
+      const durationMs = Number.isFinite(startMs) && Number.isFinite(endMs) && endMs >= startMs ? endMs - startMs : null;
+
+      turnMetrics.push({
+        taskId: turn.taskId,
+        label: String(turn.user?.text ?? '').replace(/\s+/g, ' ').trim().slice(0, 48),
+        status: turn.status,
+        verdict,
+        rigorTier,
+        attemptCount,
+        firstPassVerified,
+        selfRepaired,
+        steered,
+        input,
+        output,
+        cacheRead,
+        cacheWrite,
+        estimatedCostUsd: priced > 0 ? cost : null,
+        toolCalls,
+        toolFailed,
+        durationMs,
+      });
+    }
+
     const tools = this.#db.prepare(`
       SELECT json_extract(tool.value, '$.name') AS name, json_extract(tool.value, '$.status') AS status, count(*) AS count
       FROM records r, json_each(r.value, '$.tools') tool
       WHERE r.namespace = ? GROUP BY name, status ORDER BY name, status
     `).all(namespace).map(row => ({ name: row.name as string, status: row.status as string, count: Number(row.count) }));
-    return { modelRequests: Number(model.requests), usageReports: Number(model.reports), pricedReports: Number(model.priced),
-      estimatedCostUsd: typeof model.cost === 'number' ? model.cost : null,
-      usage: { input: Number(model.input ?? 0), output: Number(model.output ?? 0), cacheRead: Number(model.cacheRead ?? 0), cacheWrite: Number(model.cacheWrite ?? 0) }, tools };
+
+    return {
+      modelRequests, usageReports, pricedReports,
+      estimatedCostUsd: totalCost, usage, tools,
+      completion, turnMetrics: turnMetrics.slice(-30),
+    };
   }
 
   matchingRecords<T>(namespace: string, path: string, value: string): T[] {

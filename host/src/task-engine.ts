@@ -1,4 +1,6 @@
-import { randomBytes, randomUUID } from 'node:crypto'
+import { createHash, randomBytes, randomUUID } from 'node:crypto'
+
+const fileWriteTools = new Set(['create_text_file', 'edit_text_file', 'delete_text_file', 'apply_patch'])
 
 let lastTaskMs = 0
 let lastTaskSeq = 0
@@ -1031,9 +1033,13 @@ export class TaskEngine {
         (event.agentRunId !== undefined && event.agentRunId !== operation.agentRunId)) throw new Error('Tool receipt is not open')
       const paths = status === 'succeeded' && operation.effect === 'write'
         ? changedPaths?.slice(0, 12).filter(path => typeof path === 'string' && path.length <= 256) : undefined
+      const rawTargets = status === 'succeeded' && operation.effect === 'write' && fileWriteTools.has(operation.tool)
+        ? (paths?.length ? paths : operation.target ? [operation.target] : []) : []
+      const targetDigests = rawTargets.length
+        ? [...new Set(rawTargets.map(path => 'sha256:' + createHash('sha256').update(path).digest('hex')))] : undefined
       this.#db.put('operations', id, { ...operation, status, ...(paths?.length ? { changedPaths: paths } : {}) })
       this.#db.append({ ...event, taskRunId: operation.taskRunId, taskAttemptId: operation.attemptId, taskNodeId: operation.taskNodeId,
-        type: 'tool.finished', payload: { id, tool: operation.tool, status, reason } })
+        type: 'tool.finished', payload: { id, tool: operation.tool, status, reason, ...(targetDigests ? { targetDigests } : {}) } })
     })
   }
 
