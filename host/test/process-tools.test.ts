@@ -14,6 +14,7 @@ const shell = windows ? 'powershell' : 'sh'
 
 interface ToolResult {
   ok: boolean
+  untrusted?: boolean
   error?: string
   code?: string
   processId: string
@@ -21,6 +22,10 @@ interface ToolResult {
   exitCode: number | null
   truncated: boolean
   cursor: number
+  hasMore?: boolean
+  totalFrames?: number
+  tailStartCursor?: number
+  truncationNotice?: string
   frames: { cursor: number; stream: string; text: string }[]
 }
 
@@ -74,6 +79,7 @@ test('authorized shell streams complete redacted frames and settles the original
     return output.frames.some(frame => frame.text.includes('[redacted]')) ? output : undefined
   })
   assert.equal(first.state, 'running')
+  assert.equal(first.untrusted, true)
   const visible = first.frames.map(frame => frame.text).join('')
   assert.match(visible, /ready/)
   assert.doesNotMatch(visible, /test-private-value|incomplete/)
@@ -172,25 +178,90 @@ test('shell enforces bounded input, output, timeout and task abort', async t => 
   assert.equal((await invoke('process_status', { processId: cancelled.processId })).state, 'stopped')
 })
 
-test('the output cap discards a credential-bearing line cut in the middle', async t => {
+test('the output cap retains and redacts tail credentials while discarding oversized credential lines', async t => {
   const { invoke, operations } = await setup(t)
   const command = windows
-    ? "for ($i=0; $i -lt 15; $i++) { [Console]::Write(('x' * 4095) + [char]10) }; [Console]::Write(('x' * 4086) + [char]10); [Console]::WriteLine('sk-probe-xxxxxxxxxxxxxxxxxxxxxxxx')"
-    : String.raw`i=0; while [ "$i" -lt 15 ]; do printf '%04095d\n' 0; i=$((i+1)); done; printf '%04086d\n' 0; printf 'sk-probe-xxxxxxxxxxxxxxxxxxxxxxxx\n'`
+    ? "for ($i=0; $i -lt 15; $i++) { [Console]::Write(('x' * 4095) + [char]10) }; [Console]::Write(('x' * 4086) + [char]10); [Console]::WriteLine('sk-probe-xxxxxxxxxxxxxxxxxxxxxxxx'); [Console]::Write(('y' * 4096) + 'sk-probe-yyyyyyyyyyyyyyyyyyyyyyyy' + [char]10); [Console]::WriteLine('AFTER_OVERSIZED')"
+    : String.raw`i=0; while [ "$i" -lt 15 ]; do printf '%04095d\n' 0; i=$((i+1)); done; printf '%04086d\n' 0; printf 'sk-probe-xxxxxxxxxxxxxxxxxxxxxxxx\n'; printf '%04096d' 0; printf 'sk-probe-yyyyyyyyyyyyyyyyyyyyyyyy\nAFTER_OVERSIZED\n'`
   const launched = await invoke('shell_exec', { shell, command })
   assert.equal(launched.ok, true)
   assert.equal(await operations[0]!.completion, 'succeeded')
   let after = 0
   const visible: string[] = []
-  for (let page = 0; page < 6; page++) {
+  for (let page = 0; page < 12; page++) {
     const output = await invoke('process_output', { processId: launched.processId, after })
+    assert.equal(output.untrusted, true)
     assert.equal(output.truncated, true)
     visible.push(...output.frames.map(frame => frame.text))
-    if (output.cursor === after) break
+    if (!output.hasMore || output.cursor === after) break
     after = output.cursor
   }
-  assert.equal(visible.length, 16)
-  assert.doesNotMatch(visible.join(''), /sk-probe/)
+  const joined = visible.join('')
+  assert.match(joined, /\[redacted\]/u)
+  assert.match(joined, /AFTER_OVERSIZED/u)
+  assert.doesNotMatch(joined, /sk-probe/)
+})
+
+test('ProcessOutput preserves head, middle diagnostic lines, and latest tail past 256 frames / 64 KiB', async t => {
+  const { root, invoke, operations, context } = await setup(t)
+  const script = join(root, 'noisy-build.cjs')
+  await writeFile(script, [
+    "console.log('HEADER_START_LINE')",
+    "for (let i = 1; i <= 420; i++) {",
+    "  if (i === 120) console.error('src/app.ts(12,3): error TS2345: Type string is not assignable')",
+    "  else console.log('noise line ' + i + ' ' + 'z'.repeat(240))",
+    "}",
+    "console.error('FINAL_SUMMARY_FAIL')",
+    "process.exitCode = 1",
+  ].join('\n'))
+  const command = windows
+    ? `& '${process.execPath.replaceAll("'", "''")}' '${script.replaceAll("'", "''")}'`
+    : `"${process.execPath}" "${script}"`
+  const launched = await invoke('shell_exec', { shell, command })
+  assert.equal(launched.ok, true)
+  assert.equal(await operations[0]!.completion, 'failed')
+
+  const collected: string[] = []
+  let after = 0
+  let firstPage: ToolResult | undefined
+  for (let i = 0; i < 32; i++) {
+    const page = await invoke('process_output', { processId: launched.processId, after, limit: 32 })
+    if (!firstPage) firstPage = page
+    assert.equal(page.ok, true)
+    assert.equal(page.untrusted, true)
+    assert.equal(page.truncated, true)
+    collected.push(...page.frames.map(frame => frame.text))
+    if (!page.hasMore || page.cursor === after) break
+    after = page.cursor
+  }
+  const full = collected.join('')
+  assert.ok(firstPage?.tailStartCursor && firstPage.tailStartCursor > 100)
+  assert.ok((firstPage?.totalFrames ?? 0) > 300)
+  assert.match(firstPage?.truncationNotice ?? '', /tailStartCursor/u)
+  assert.match(full, /HEADER_START_LINE/u)
+  assert.match(full, /omitted output line/u)
+  assert.match(full, /error TS2345: Type string is not assignable/u)
+  assert.match(full, /FINAL_SUMMARY_FAIL/u)
+
+  // Jumping directly to tail past cursor 256 must work without hitting maxFrames input cap.
+  const jumped = await invoke('process_output', {
+    processId: launched.processId,
+    after: firstPage!.tailStartCursor! - 1,
+    limit: 32,
+  })
+  assert.equal(jumped.ok, true)
+  assert.ok(jumped.frames.length > 0)
+
+  // Subsequent runs keep isolated process handles cleanly without leaking across runs.
+  const secondRun = { ...context, agentRunId: 'agent-2' }
+  const second = await invoke('shell_exec', {
+    shell,
+    command: windows ? '[Console]::WriteLine("run2-ok")' : 'printf "run2-ok\\n"',
+  }, secondRun)
+  assert.equal(second.ok, true)
+  assert.equal(await operations[1]!.completion, 'succeeded')
+  assert.equal((await invoke('process_output', { processId: launched.processId }, secondRun)).ok, false)
+  assert.match((await invoke('process_output', { processId: second.processId }, secondRun)).frames[0]!.text, /run2-ok/u)
 })
 
 test('P1-3: process_stop terminates inherited-pipe descendants even after the top-level shell has already exited', { timeout: 25_000 }, async t => {

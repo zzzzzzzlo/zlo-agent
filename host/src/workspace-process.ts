@@ -12,18 +12,24 @@ const npmScripts = {
 
 const commandTimeoutMs = 90_000
 const outputLimit = 16 * 1024
+const headOutputLimit = 4 * 1024
+const errorOutputLimit = 2 * 1024
+const maxErrorLines = 12
+const tailOutputLimit = 12 * 1024
+const maxTrackedLineBytes = 4 * 1024
 const windows = process.platform === 'win32'
+const diagnosticLinePattern = /\b(?:error|fail(?:ed|ure)?|fatal|panic|exception|traceback|assertionerror|syntaxerror|typeerror|referenceerror|segfault|unhandled|enoent|eaccess|eperm)\b|error\s+ts\d{4}:|^[×✖]|^\s*FAIL\b|^\s*ERR!/iu
 
 export function parseProjectCommand(input: unknown): ProjectCommand {
   if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Invalid project command')
   const { command, path, args } = input as Record<string, unknown>
   if (Object.keys(input).some((key) => !['command', 'path', 'args'].includes(key)) ||
-    typeof path !== 'string' || !path || path.length > 512 || path.includes('\0')) {
+    typeof path !== 'string' || !path || path.length > 512 || !path.isWellFormed() || path.includes('\0')) {
     throw new Error('Invalid project command path or arguments')
   }
   if (command === 'node_script') {
     if (args !== undefined && (!Array.isArray(args) || args.length > 16 ||
-      !args.every((arg: unknown) => typeof arg === 'string' && arg.length <= 1024 && !arg.includes('\0')))) {
+      !args.every((arg: unknown) => typeof arg === 'string' && arg.length <= 1024 && arg.isWellFormed() && !arg.includes('\0')))) {
       throw new Error('Invalid project script arguments')
     }
     return { command, path, ...(args !== undefined ? { args: [...args] } : {}) }
@@ -91,6 +97,7 @@ export function projectInvocation(command: ProjectCommand, target: string, works
   }
   const npm = findFile([dirname(node), ...path].flatMap((directory) => [
     join(directory, 'node_modules', 'npm', 'bin', 'npm-cli.js'),
+    join(directory, '..', 'lib', 'node_modules', 'npm', 'bin', 'npm-cli.js'),
     join(directory, 'npm'),
   ]).filter((candidate) => !windows || candidate.endsWith('.js')), workspace, constants.R_OK)
   if (!npm) return undefined
@@ -154,9 +161,220 @@ export function redactProcessOutput(text: string, truncated = false): string {
       }
     }
   }
-  return text
+  text = text
     .replace(/\b(Authorization["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)[^\s"']+/giu, '$1[redacted]')
     .replace(/\b(?:sk[-_][\w-]{16,}|gh[pousr]_[a-z0-9]{20,}|github_pat_[\w-]{20,}|AKIA[A-Z0-9]{16})\b/gu, '[redacted]')
+  if (truncated) {
+    text = text
+      .replace(/\b(Authorization["']?\s*[:=]\s*["']?(?:Bearer|Basic)\s+)[^\s"']*$/iu, '$1[redacted]')
+      .replace(/\b(?:sk[-_][\w-]{3,}|gh[pousr]_[a-z0-9]{3,}|github_pat_[\w-]{3,}|AKIA[A-Z0-9]{4,})$/u, '[redacted]')
+  }
+  return text
+}
+
+function redactLeadingCutSecret(text: string): string {
+  for (const [key, value] of Object.entries(process.env)) {
+    if (!value || value.length < 8 ||
+      !/(?:API|ACCESS|PRIVATE)[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTHORIZATION/iu.test(key)) continue
+    const maxCut = Math.min(value.length - 1, text.length)
+    for (let len = maxCut; len >= 8; len--) {
+      if (value.endsWith(text.slice(0, len))) {
+        return '[redacted]' + text.slice(len)
+      }
+    }
+  }
+  return text
+}
+
+function trimUtf8End(buffer: Buffer): Buffer {
+  if (!buffer.length) return buffer
+  let i = buffer.length - 1
+  while (i >= 0 && i >= buffer.length - 4 && (buffer[i]! & 0xc0) === 0x80) i--
+  if (i < 0) return buffer
+  const lead = buffer[i]!
+  const expected = (lead & 0x80) === 0 ? 1
+    : (lead & 0xe0) === 0xc0 ? 2
+      : (lead & 0xf0) === 0xe0 ? 3
+        : (lead & 0xf8) === 0xf0 ? 4 : 1
+  return i + expected > buffer.length ? buffer.subarray(0, i) : buffer
+}
+
+function trimUtf8Start(buffer: Buffer): Buffer {
+  let start = 0
+  while (start < buffer.length && start < 3 && (buffer[start]! & 0xc0) === 0x80) start++
+  return start > 0 ? buffer.subarray(start) : buffer
+}
+
+interface TrackedErrorLine {
+  startOffset: number
+  endOffset: number
+  text: string
+}
+
+class ChannelCapture {
+  totalBytes = 0
+  truncated = false
+  #headChunks: Buffer[] = []
+  #headBytes = 0
+  #tailChunks: Buffer[] = []
+  #tailBytes = 0
+  #lineStartOffset = 0
+  #lineChunks: Buffer[] = []
+  #lineBytes = 0
+  #lineOversized = false
+  #errors: TrackedErrorLine[] = []
+  #seenErrors = new Set<string>()
+  #errorBytes = 0
+
+  push(chunk: Buffer): void {
+    const chunkStart = this.totalBytes
+    this.totalBytes += chunk.length
+    if (this.totalBytes > outputLimit) this.truncated = true
+
+    if (this.#headBytes < outputLimit) {
+      const take = Math.min(outputLimit - this.#headBytes, chunk.length)
+      this.#headChunks.push(chunk.subarray(0, take))
+      this.#headBytes += take
+    }
+
+    if (chunk.length >= tailOutputLimit) {
+      this.#tailChunks = [chunk.subarray(chunk.length - tailOutputLimit)]
+      this.#tailBytes = tailOutputLimit
+    } else {
+      this.#tailChunks.push(chunk)
+      this.#tailBytes += chunk.length
+      while (this.#tailBytes > tailOutputLimit) {
+        const excess = this.#tailBytes - tailOutputLimit
+        const first = this.#tailChunks[0]!
+        if (first.length <= excess) {
+          this.#tailBytes -= first.length
+          this.#tailChunks.shift()
+        } else {
+          this.#tailChunks[0] = first.subarray(excess)
+          this.#tailBytes -= excess
+        }
+      }
+    }
+
+    this.#scanDiagnostics(chunk, chunkStart)
+  }
+
+  #scanDiagnostics(chunk: Buffer, chunkStart: number): void {
+    let offset = 0
+    while (offset < chunk.length) {
+      const nl = chunk.indexOf(0x0a, offset)
+      if (nl < 0) {
+        const remaining = chunk.length - offset
+        if (!this.#lineOversized && this.#lineBytes + remaining <= maxTrackedLineBytes) {
+          this.#lineChunks.push(chunk.subarray(offset))
+          this.#lineBytes += remaining
+        } else {
+          this.#lineOversized = true
+          this.#lineChunks = []
+          this.#lineBytes = 0
+        }
+        break
+      }
+      const part = chunk.subarray(offset, nl)
+      const endOffset = chunkStart + nl + 1
+      if (!this.#lineOversized && this.#lineBytes + part.length <= maxTrackedLineBytes &&
+        this.#lineStartOffset >= headOutputLimit / 2) {
+        const rawLine = Buffer.concat([...this.#lineChunks, part], this.#lineBytes + part.length)
+        if (!rawLine.includes(0)) {
+          this.#recordError(this.#lineStartOffset, endOffset, rawLine.toString('utf8'))
+        }
+      }
+      this.#lineStartOffset = endOffset
+      this.#lineChunks = []
+      this.#lineBytes = 0
+      this.#lineOversized = false
+      offset = nl + 1
+    }
+  }
+
+  #recordError(startOffset: number, endOffset: number, rawLine: string): void {
+    if (this.#errors.length >= maxErrorLines * 2 || this.#errorBytes >= errorOutputLimit * 2) return
+    const clean = rawLine.replace(/\r$/u, '').replace(/[\u0000-\u0008\u000b-\u001f\u007f\u202a-\u202e\u2066-\u2069]/gu, '')
+    if (!clean.trim() || !diagnosticLinePattern.test(clean)) return
+    const redacted = redactProcessOutput(clean).slice(0, 300)
+    if (this.#seenErrors.has(redacted)) return
+    this.#seenErrors.add(redacted)
+    this.#errorBytes += Buffer.byteLength(redacted) + 1
+    this.#errors.push({ startOffset, endOffset, text: redacted })
+  }
+
+  render(): string {
+    if (!this.truncated) {
+      return Buffer.concat(this.#headChunks, this.#headBytes).toString('utf8')
+    }
+    const rawHead = Buffer.concat(this.#headChunks, this.#headBytes).subarray(0, headOutputLimit)
+    let headBuf = trimUtf8End(rawHead)
+    const rawTail = Buffer.concat(this.#tailChunks, this.#tailBytes)
+    const rawTailStart = this.totalBytes - rawTail.length
+    const overlap = Math.max(0, headBuf.length - rawTailStart)
+    let tailBuf = trimUtf8Start(rawTail.subarray(overlap))
+
+    if (headBuf.includes(0) || tailBuf.includes(0)) {
+      const lastNul = headBuf.lastIndexOf(0)
+      if (lastNul >= 0) headBuf = headBuf.subarray(lastNul + 1)
+      const firstNul = tailBuf.indexOf(0)
+      if (firstNul >= 0) tailBuf = tailBuf.subarray(firstNul + 1)
+      const headStr = redactProcessOutput(headBuf.toString('utf8'), true)
+      let tailStr = redactProcessOutput(tailBuf.toString('utf8'), false)
+      const omitted = Math.max(0, this.totalBytes - headBuf.length - tailBuf.length)
+      const marker = `\n... [truncated ${omitted} bytes] ...\0`
+      const maxTail = Math.max(0, outputLimit - Buffer.byteLength(headStr) - Buffer.byteLength(marker))
+      if (Buffer.byteLength(tailStr) > maxTail) {
+        const sliced = trimUtf8Start(Buffer.from(tailStr, 'utf8').subarray(Buffer.byteLength(tailStr) - maxTail))
+        const nul = sliced.indexOf(0)
+        tailStr = (nul >= 0 ? sliced.subarray(nul + 1) : sliced).toString('utf8')
+      }
+      return headStr + marker + tailStr
+    }
+
+    let headStr = headBuf.toString('utf8')
+    const lastHeadNl = headStr.lastIndexOf('\n')
+    if (lastHeadNl >= 512) headStr = headStr.slice(0, lastHeadNl + 1)
+    const headByteLen = Buffer.byteLength(headStr)
+    headStr = redactProcessOutput(headStr, !headStr.endsWith('\n'))
+
+    let tailStr = tailBuf.toString('utf8')
+    const firstTailNl = tailStr.indexOf('\n')
+    if (firstTailNl >= 0 && firstTailNl < tailStr.length - 1) {
+      tailStr = tailStr.slice(firstTailNl + 1)
+    } else {
+      tailStr = redactLeadingCutSecret(tailStr)
+    }
+    const tailByteStart = this.totalBytes - Buffer.byteLength(tailStr)
+    tailStr = redactProcessOutput(tailStr, false)
+
+    const keptErrors: string[] = []
+    let keptErrorBytes = 0
+    for (const item of this.#errors) {
+      if (item.startOffset < headByteLen || item.endOffset > tailByteStart) continue
+      const size = Buffer.byteLength(item.text) + 1
+      if (keptErrors.length >= maxErrorLines || keptErrorBytes + size > errorOutputLimit) break
+      keptErrors.push(item.text)
+      keptErrorBytes += size
+    }
+
+    const omittedBytes = Math.max(0, this.totalBytes - headByteLen - Buffer.byteLength(tailStr))
+    const prefix = headStr.endsWith('\n') || !headStr.length ? '' : '\n'
+    const notice = keptErrors.length
+      ? `${prefix}... [truncated ${omittedBytes} bytes; showing head, ${keptErrors.length} key diagnostic line(s), and tail] ...\n${keptErrors.join('\n')}\n... [tail] ...\n`
+      : `${prefix}... [truncated ${omittedBytes} bytes; showing head and tail] ...\n`
+
+    const maxTailAllowed = Math.max(0, outputLimit - Buffer.byteLength(headStr) - Buffer.byteLength(notice))
+    if (Buffer.byteLength(tailStr) > maxTailAllowed) {
+      const tailBytesBuf = Buffer.from(tailStr, 'utf8')
+      const trimmed = trimUtf8Start(tailBytesBuf.subarray(tailBytesBuf.length - maxTailAllowed))
+      let candidate = trimmed.toString('utf8')
+      const nl = candidate.indexOf('\n')
+      if (nl >= 0 && nl < candidate.length - 1) candidate = candidate.slice(nl + 1)
+      tailStr = candidate
+    }
+    return headStr + notice + tailStr
+  }
 }
 
 interface ProcessOutput {
@@ -181,8 +399,7 @@ export function runWorkspaceProcess(invocation: Invocation, cwd: string, workspa
       shell: false,
       windowsHide: true,
     })
-    const buffers = { stdout: Buffer.alloc(outputLimit), stderr: Buffer.alloc(outputLimit) }
-    const sizes = { stdout: 0, stderr: 0 }
+    const captures = { stdout: new ChannelCapture(), stderr: new ChannelCapture() }
     let truncated = false
     let finished = false
     let stopping = false
@@ -192,9 +409,7 @@ export function runWorkspaceProcess(invocation: Invocation, cwd: string, workspa
     for (const channel of ['stdout', 'stderr'] as const) {
       child[channel].on('error', () => { truncated = true })
       child[channel].on('data', (chunk: Buffer) => {
-        const available = outputLimit - sizes[channel]
-        sizes[channel] += chunk.copy(buffers[channel], sizes[channel], 0, available)
-        if (chunk.length > available) truncated = true
+        captures[channel].push(chunk)
       })
     }
     const finish = (code: number | null, unavailable = false) => {
@@ -210,9 +425,9 @@ export function runWorkspaceProcess(invocation: Invocation, cwd: string, workspa
       } else {
         resolve({
           state: 'exited', code: code!,
-          stdout: buffers.stdout.toString('utf8', 0, sizes.stdout),
-          stderr: buffers.stderr.toString('utf8', 0, sizes.stderr),
-          truncated,
+          stdout: captures.stdout.render(),
+          stderr: captures.stderr.render(),
+          truncated: truncated || captures.stdout.truncated || captures.stderr.truncated,
         })
       }
     }
