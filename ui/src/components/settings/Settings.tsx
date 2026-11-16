@@ -9,6 +9,12 @@ const themes = [
   { id: 'light', label: '浅色', icon: Sun },
 ] as const
 
+const strengths = [
+  { id: 'soft', label: '柔和' },
+  { id: 'balanced', label: '均衡' },
+  { id: 'vivid', label: '通透' },
+] as const
+
 export type SettingsSection = ManagementSection | 'appearance' | 'about'
 
 export const settingsGroups = [
@@ -22,6 +28,8 @@ export const settingsLabels = { ...managementLabels, appearance: '外观', about
 export function SettingsPreferences({ section }: { section: 'appearance' | 'about' }) {
   const theme = useWorkspace((state) => state.theme)
   const setTheme = useWorkspace((state) => state.setTheme)
+  const strength = useWorkspace((state) => state.strength)
+  const setStrength = useWorkspace((state) => state.setStrength)
   const mock = useWorkspace((state) => state.mock)
 
   return section === 'appearance' ? (
@@ -35,6 +43,17 @@ export function SettingsPreferences({ section }: { section: 'appearance' | 'abou
               <input type="radio" name="theme" checked={theme === id} onChange={() => setTheme(id)} />
               <span className={`theme-preview preview-${id}`}><i /><i /><i /></span>
               <span className="theme-option-label"><Icon size={14} />{label}{theme === id && <Check size={14} className="option-check" />}</span>
+            </label>
+          ))}
+        </div>
+      </fieldset>
+      <fieldset>
+        <legend>玻璃质感</legend>
+        <div className="theme-options">
+          {strengths.map(({ id, label }) => (
+            <label className="theme-option" key={id}>
+              <input type="radio" name="glass-strength" checked={strength === id} onChange={() => setStrength(id)} />
+              <span className="theme-option-label">{label}{strength === id && <Check size={14} className="option-check" />}</span>
             </label>
           ))}
         </div>

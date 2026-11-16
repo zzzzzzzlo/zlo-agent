@@ -17,13 +17,14 @@ const commands = [
 interface DirectoryIdentity {
   dev: bigint
   ino: bigint
+  birthtimeNs: bigint
 }
 
 async function directoryIdentity(workspace: string): Promise<DirectoryIdentity | undefined> {
   try {
     if (await realpath(workspace) !== workspace) return undefined
     const identity = await stat(workspace, { bigint: true })
-    if (identity.isDirectory()) return { dev: identity.dev, ino: identity.ino }
+    if (identity.isDirectory()) return { dev: identity.dev, ino: identity.ino, birthtimeNs: identity.birthtimeNs }
   } catch {
     return undefined
   }
@@ -96,6 +97,7 @@ export function registerAgentIpc(options: {
     const current = await directoryIdentity(workspace)
     const selected = window.isDestroyed() ? undefined : selectedDirectories.get(window.webContents)?.get(workspace)
     if (!current || !selected || current.dev !== selected.dev || current.ino !== selected.ino ||
+      (current.ino === 0n && current.birthtimeNs !== selected.birthtimeNs) ||
       (expected && selected !== expected) || window.webContents.getURL() !== options.rendererUrl) {
       throw new HostTransportError('INVALID_INPUT', '工作区路径已改变，请重新选择。')
     }

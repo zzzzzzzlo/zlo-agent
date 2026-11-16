@@ -43,7 +43,7 @@ function segmentMatch(segment: string, pattern: string): boolean {
     else if (char === '?') expression += '.'
     else expression += char.replace(/[\\^$.|+()[\]{}]/gu, '\\$&')
   }
-  return new RegExp(expression + '$', 'u').test(segment)
+  return new RegExp(expression + '$', process.platform === 'win32' ? 'iu' : 'u').test(segment)
 }
 
 function globMatch(path: string, pattern: string): boolean {

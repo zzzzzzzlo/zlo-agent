@@ -70,11 +70,15 @@ function judgment(p: Record<string, unknown>) {
     (typeof value === 'string' && /^opaque:\d{1,2}$/u.test(value) ? value : undefined)
   const input = obj(p.features)
   const features: Record<string, unknown> = {}
-  for (const key of ['nodeCount', 'nodeOrdinal', 'goalLength', 'evidenceCount', 'artifactCount', 'completedChildren', 'replanCount']) features[key] = num(input[key])
-  for (const key of ['teamCandidate', 'hasDependencies', 'nonEmptyGoal', 'independent', 'requested', 'checked', 'checkPassed', 'hasWrite', 'isRootChild']) features[key] = bool(input[key])
+  for (const key of ['nodeCount', 'nodeOrdinal', 'goalLength', 'evidenceCount', 'artifactCount', 'completedChildren', 'replanCount',
+    'failedCount', 'writeCount', 'toolCount', 'length']) features[key] = num(input[key])
+  for (const key of ['teamCandidate', 'hasDependencies', 'nonEmptyGoal', 'independent', 'requested', 'checked', 'checkPassed',
+    'checkConfigured', 'hasWrite', 'isRootChild', 'initial']) features[key] = bool(input[key])
   features.role = oneOf(input.role, roles)
   features.access = oneOf(input.access, accessLevels)
   features.status = oneOf(input.status, ['missing', ...states])
+  features.tool = oneOf(input.tool, ['web_search', 'web_fetch', 'browser_snapshot', 'process_output',
+    'search_files', 'search_content', 'read_text_file', 'git_diff'])
   if (Array.isArray(input.candidates)) features.candidates = list(input.candidates, 8).map(value => {
     const c = obj(value)
     return { index: num(c.index), providerKey: ref(c.providerKey), modelKey: ref(c.modelKey), contextWindow: num(c.contextWindow),

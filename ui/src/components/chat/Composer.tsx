@@ -34,7 +34,7 @@ export function Composer() {
             aria-label="消息"
             placeholder={running ? '追加本轮任务的说明…' : '描述你想完成的任务…'}
             rows={2}
-            maxLength={8000}
+            maxLength={running ? 8000 : 16000}
             value={value}
             onChange={(event) => setDraft(session?.id ?? null, event.target.value)}
             onKeyDown={(event) => {

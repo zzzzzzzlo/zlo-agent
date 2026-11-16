@@ -56,7 +56,8 @@ interface Connection {
   pending: Map<string, PendingRequest>
   approvals: Map<string, AbortController>
   startupTimer?: NodeJS.Timeout
-  incompleteLine: string
+  incompleteChunks: string[]
+  incompleteLength: number
   failure?: string
 }
 
@@ -259,7 +260,8 @@ export class HostProcessManager {
     const closed = Promise.withResolvers<void>()
     const connection: Connection = {
       child, correlationId, state: 'starting', ready: ready.promise, resolveReady: ready.resolve,
-      closed: closed.promise, resolveClosed: closed.resolve, pending: new Map(), approvals: new Map(), incompleteLine: '',
+      closed: closed.promise, resolveClosed: closed.resolve, pending: new Map(), approvals: new Map(),
+      incompleteChunks: [], incompleteLength: 0,
     }
     this.#connection = connection
     child.once('error', () => { this.#fail(connection, 'desktop.host_spawn_failed', 'Agent Host 进程无法运行。') })
@@ -366,15 +368,25 @@ export class HostProcessManager {
 
   #read(connection: Connection, chunk: string): void {
     if (this.#connection !== connection || connection.state === 'stopping') return
-    if (!chunk.includes('\n') && connection.incompleteLine.length + chunk.length > maxLineLength) {
-      connection.incompleteLine = ''
-      this.#fail(connection, 'desktop.host_protocol_invalid', 'Agent Host 的协议数据超出长度上限。')
+    if (!chunk.includes('\n')) {
+      if (connection.incompleteLength + chunk.length > maxLineLength) {
+        connection.incompleteChunks = []
+        connection.incompleteLength = 0
+        this.#fail(connection, 'desktop.host_protocol_invalid', 'Agent Host 的协议数据超出长度上限。')
+        return
+      }
+      connection.incompleteChunks.push(chunk)
+      connection.incompleteLength += chunk.length
       return
     }
-    const lines = (connection.incompleteLine + chunk).split('\n')
-    connection.incompleteLine = lines.pop() ?? ''
-    if (connection.incompleteLine.length > maxLineLength || lines.some((line) => line.length > maxLineLength)) {
-      connection.incompleteLine = ''
+    const combined = connection.incompleteChunks.length ? connection.incompleteChunks.join('') + chunk : chunk
+    const lines = combined.split('\n')
+    const tail = lines.pop() ?? ''
+    connection.incompleteChunks = tail ? [tail] : []
+    connection.incompleteLength = tail.length
+    if (connection.incompleteLength > maxLineLength || lines.some((line) => line.length > maxLineLength)) {
+      connection.incompleteChunks = []
+      connection.incompleteLength = 0
       this.#fail(connection, 'desktop.host_protocol_invalid', 'Agent Host 的协议数据超出长度上限。')
       return
     }

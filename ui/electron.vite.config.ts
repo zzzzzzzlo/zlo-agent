@@ -17,8 +17,13 @@ export default defineConfig({
         name: 'production-csp',
         apply: 'build',
         transformIndexHtml(html) {
-          return html.replace("script-src 'self' 'unsafe-inline'", "script-src 'self'")
-            .replace("connect-src 'self' ws://localhost:* ws://127.0.0.1:*", "connect-src 'none'")
+          const devScriptCsp = "script-src 'self' 'unsafe-inline'"
+          const devConnectCsp = "connect-src 'self' ws://localhost:* ws://127.0.0.1:*"
+          if (!html.includes(devScriptCsp) || !html.includes(devConnectCsp)) {
+            throw new Error('Expected development CSP directives in src/index.html before production replacement')
+          }
+          return html.replace(devScriptCsp, "script-src 'self'")
+            .replace(devConnectCsp, "connect-src 'none'")
         },
       },
     ],

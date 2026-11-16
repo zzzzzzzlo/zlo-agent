@@ -1,6 +1,12 @@
+/node_modules/
 /host/node_modules/
 /host/dist/
 /host/.zlo-agent/
+/observatory/node_modules/
+/ui/node_modules/
+/ui/out/
+/ui/release/
+/.workbuddy/
 /.zlo-agent/
 *.log
 observatory.sqlite*

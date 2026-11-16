@@ -46,8 +46,8 @@ function preferences(value: unknown): AgentPreferences {
 async function directoryIdentity(path: string): Promise<string> {
   if (!localDirectory(path) || path === parse(path).root || await realpath(path) !== path) return invalid()
   const stat = await lstat(path, { bigint: true })
-  if (!stat.isDirectory() || stat.ino === 0n) return invalid()
-  return stat.dev + ':' + stat.ino
+  if (!stat.isDirectory()) return invalid()
+  return stat.ino === 0n ? `${stat.dev}:0:${stat.birthtimeNs}` : `${stat.dev}:${stat.ino}`
 }
 
 export function registerManagementIpc(options: {

@@ -13,10 +13,11 @@ interface Subscription {
   cursor: number;
   sink: EventSink;
   pending: boolean;
+  dirty: boolean;
   active: boolean;
 }
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 const REPLAY_BATCH_SIZE = 128;
 
 export class StorePersistenceError extends Error {
@@ -189,6 +190,20 @@ export class LocalStore {
     `).all(namespace, path, value).map(row => JSON.parse(row.value as string) as T);
   }
 
+  recordsByTaskId<T>(namespace: 'operations' | 'attempts', taskId: string): T[] {
+    const sql = namespace === 'operations'
+      ? `SELECT value FROM records INDEXED BY idx_records_operations_task WHERE namespace = 'operations' AND json_extract(value, '$.taskId') = ? ORDER BY id`
+      : `SELECT value FROM records INDEXED BY idx_records_attempts_task WHERE namespace = 'attempts' AND json_extract(value, '$.taskId') = ? ORDER BY id`;
+    return this.#db.prepare(sql).all(taskId).map(row => JSON.parse(row.value as string) as T);
+  }
+
+  firstReadyTask<T>(): T | undefined {
+    const row = this.#db.prepare(`
+      SELECT value FROM records INDEXED BY idx_records_task_status WHERE namespace = 'tasks' AND json_extract(value, '$.status') = 'ready' ORDER BY id ASC LIMIT 1
+    `).get();
+    return row ? JSON.parse(row.value as string) as T : undefined;
+  }
+
   put(namespace: string, id: string, value: unknown): void {
     this.#requireTransaction();
     const encoded = encode(value);
@@ -278,7 +293,7 @@ export class LocalStore {
   subscribe(taskId: string, after: number, sink: EventSink): () => void {
     validateCursor(after);
     if (!this.#db.isOpen) throw new Error('Local store is closed');
-    const subscription: Subscription = { taskId, cursor: after, sink, pending: false, active: true };
+    const subscription: Subscription = { taskId, cursor: after, sink, pending: false, dirty: false, active: true };
     const subscriptions = this.#subscriptions.get(taskId) ?? new Set<Subscription>();
     subscriptions.add(subscription);
     this.#subscriptions.set(taskId, subscriptions);
@@ -287,26 +302,44 @@ export class LocalStore {
   }
 
   #migrate(): void {
-    const version = this.#db.prepare('PRAGMA user_version').get()?.user_version;
+    const rawVersion = this.#db.prepare('PRAGMA user_version').get()?.user_version;
+    const version = typeof rawVersion === 'number' ? rawVersion : Number(rawVersion ?? 0);
     if (version === SCHEMA_VERSION) return;
-    if (version !== 0) throw new Error(`Unsupported local store schema version: ${version}`);
+    if (!Number.isInteger(version) || version < 0 || version > SCHEMA_VERSION) {
+      throw new Error(`Unsupported local store schema version: ${String(rawVersion)}`);
+    }
     this.transaction(() => {
-      this.#db.exec(`
-        CREATE TABLE records (
-          namespace TEXT NOT NULL,
-          id TEXT NOT NULL,
-          value TEXT NOT NULL CHECK (json_valid(value)),
-          PRIMARY KEY (namespace, id)
-        ) STRICT, WITHOUT ROWID;
-        CREATE TABLE events (
-          task_id TEXT NOT NULL,
-          seq INTEGER NOT NULL CHECK (seq > 0),
-          id TEXT NOT NULL UNIQUE,
-          event TEXT NOT NULL CHECK (json_valid(event)),
-          PRIMARY KEY (task_id, seq)
-        ) STRICT, WITHOUT ROWID;
-        PRAGMA user_version = ${SCHEMA_VERSION};
-      `);
+      if (version < 1) {
+        this.#db.exec(`
+          CREATE TABLE records (
+            namespace TEXT NOT NULL,
+            id TEXT NOT NULL,
+            value TEXT NOT NULL CHECK (json_valid(value)),
+            PRIMARY KEY (namespace, id)
+          ) STRICT, WITHOUT ROWID;
+          CREATE TABLE events (
+            task_id TEXT NOT NULL,
+            seq INTEGER NOT NULL CHECK (seq > 0),
+            id TEXT NOT NULL UNIQUE,
+            event TEXT NOT NULL CHECK (json_valid(event)),
+            PRIMARY KEY (task_id, seq)
+          ) STRICT, WITHOUT ROWID;
+        `);
+      }
+      if (version < 2) {
+        this.#db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_records_operations_task
+            ON records(json_extract(value, '$.taskId'), id)
+            WHERE namespace = 'operations';
+          CREATE INDEX IF NOT EXISTS idx_records_attempts_task
+            ON records(json_extract(value, '$.taskId'), id)
+            WHERE namespace = 'attempts';
+          CREATE INDEX IF NOT EXISTS idx_records_task_status
+            ON records(json_extract(value, '$.status'), id)
+            WHERE namespace = 'tasks';
+        `);
+      }
+      this.#db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
     });
   }
 
@@ -323,7 +356,11 @@ export class LocalStore {
   }
 
   #schedule(subscription: Subscription): void {
-    if (!subscription.active || subscription.pending) return;
+    if (!subscription.active) return;
+    if (subscription.pending) {
+      subscription.dirty = true;
+      return;
+    }
     subscription.pending = true;
     setImmediate(() => { void this.#deliver(subscription); });
   }
@@ -341,8 +378,10 @@ export class LocalStore {
           // Consumers own their failures and can reconnect from their last acknowledged cursor.
         }
       }
+      const more = subscription.dirty || batch.length === REPLAY_BATCH_SIZE;
+      subscription.dirty = false;
       subscription.pending = false;
-      if (batch.length > 0) this.#schedule(subscription);
+      if (more) this.#schedule(subscription);
     } catch {
       // Replay failures are isolated from writes. Reconnecting or reading directly can retry.
       this.#unsubscribe(subscription);

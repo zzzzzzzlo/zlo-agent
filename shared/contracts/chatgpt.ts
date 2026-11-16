@@ -1,14 +1,6 @@
 import type { ModelCatalogEntry } from './domain.ts'
 
-/** Private credential hand-off between Electron Main and the bundled Host. */
-export interface ChatGptSession {
-  profileId: string
-  accessToken: string
-  expiresAt: number
-  models: string[]
-}
-
-/** Private Main-to-Host DTO. Excluded from the desktop API below. */
+/** Private credential hand-off between Electron Main and the bundled Host. Excluded from the desktop API below. */
 export interface ChatGptSession {
   profileId: string
   accessToken: string

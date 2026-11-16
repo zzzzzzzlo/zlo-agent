@@ -401,7 +401,7 @@ export class LocalAgentHost {
     const active = status === 'ready' || status === 'running' || status === 'verifying'
     const deferred = Boolean(conversation.piSessionId) || active
     const pending = deferred && command.route && (!current || !sameRoute(current, command.route)) ? command.route : undefined
-    const selected = deferred ? current : command.route ?? current
+    const selected = deferred ? current : (command.route === null ? undefined : (command.route ?? current))
     const commit = () => this.#conversations.recordModelRequest(command, selected, pending)
     if (conversation.latestTaskId && (active || status === 'blocked' || status === 'stopped')) {
       let result: ConversationSummary | undefined
@@ -995,7 +995,7 @@ export class LocalAgentHost {
   #dispatch(): void {
     if (this.#closing || this.#closed || this.#store.isClosed || this.#active || this.#storageFailure || this.#credentialMutation) return
     try {
-      const ready = this.#engine.list().find((task) => task.status === 'ready')
+      const ready = this.#engine.nextReady()
       if (!ready) return
       const task = this.#engine.start(ready.id)
       const active: ActiveTask = { taskId: task.id, abort: new AbortController(), done: Promise.resolve() }

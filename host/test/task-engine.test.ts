@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { test } from 'node:test'
+import { FakeExecution } from '../src/fake.ts'
+import { LocalAgentHost } from '../src/host.ts'
+import { LocalJudgment } from '../src/judgment.ts'
 import { LocalStore } from '../src/store.ts'
 import { TaskEngine } from '../src/task-engine.ts'
+import { telemetryEvent } from '../src/telemetry-projection.ts'
 
 const check = { path: 'demo.txt', contains: 'verified by zlo agent' }
 
@@ -27,5 +34,57 @@ test('TaskEngine rejects illegal transitions, stale plans and reused request IDs
     assert.equal(store.events(taskId).filter((event) => event.type === 'verification.finished').length, 0)
   } finally {
     store.close()
+  }
+})
+
+test('P2-1 & P2-2: UUIDv7 FIFO task ordering, Phase 2 judgment telemetry projection, and conversation model clearing', async (t) => {
+  const store = new LocalStore(':memory:')
+  try {
+    const engine = new TaskEngine(store)
+    const createdIds: string[] = []
+    for (let i = 0; i < 40; i++) {
+      createdIds.push(engine.create({ requestId: `req-${i}`, goal: `Goal ${i}`, cwd: 'ignored' }).taskId)
+    }
+    assert.deepEqual([...createdIds].sort(), createdIds)
+    assert.equal(engine.nextReady()?.id, createdIds[0])
+
+    // Concurrent new task creation during cursor pagination never causes older tasks to be skipped.
+    const page1 = engine.listPage(null, 15)
+    assert.equal(page1.length, 15)
+    engine.create({ requestId: 'req-late', goal: 'Late task', cwd: 'ignored' })
+    const page2 = engine.listPage(page1.at(-1)!.id, 30)
+    assert.deepEqual([...page1, ...page2].map(item => item.id), [...createdIds].reverse())
+
+    const judgment = new LocalJudgment(store, { modes: { 'tool.admission': 'shadow' } })
+    await judgment.decide(
+      { taskId: createdIds[0]!, type: 'unused', payload: {} },
+      'tool.admission',
+      { evidenceCount: 2, failedCount: 1, writeCount: 3, checkConfigured: true, checkPassed: false, toolCount: 4, length: 900, initial: true, tool: 'web_fetch' },
+      true,
+      [true, false],
+    )
+    const projected = telemetryEvent(store.events(createdIds[0]!).at(-1)!)
+    const features = projected.payload.features as Record<string, unknown>
+    assert.equal(features.failedCount, 1)
+    assert.equal(features.writeCount, 3)
+    assert.equal(features.toolCount, 4)
+    assert.equal(features.length, 900)
+    assert.equal(features.checkConfigured, true)
+    assert.equal(features.initial, true)
+    assert.equal(features.tool, 'web_fetch')
+  } finally {
+    store.close()
+  }
+
+  const root = mkdtempSync(join(tmpdir(), 'zlo-model-clear-'))
+  t.after(() => rmSync(root, { recursive: true, force: true }))
+  const host = new LocalAgentHost({ directory: join(root, 'state'), defaultWorkspace: join(root, 'ws'), execution: new FakeExecution() })
+  try {
+    const conv = await host.createConversation({ requestId: 'c1', route: { provider: 'fake', model: 'alternate' } })
+    assert.deepEqual(conv.route, { provider: 'fake', model: 'alternate' })
+    const cleared = await host.setConversationModel({ requestId: 'm-clear', conversationId: conv.id, route: null })
+    assert.equal(cleared.route, undefined)
+  } finally {
+    await host.close()
   }
 })

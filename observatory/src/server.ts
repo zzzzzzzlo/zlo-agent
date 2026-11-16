@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises'
+import type { TelemetryEvent } from '../../shared/contracts/observatory.ts'
 import { bearer, bodyRecord, HttpError, json, listenLoopback, validLocalToken } from '../../shared/loopback-http.ts'
 import { isTaskId } from './collector.ts'
 import type { Collector } from './collector.ts'
@@ -39,6 +40,24 @@ export function startDashboard(options: { port: number; token: string; database:
   const { port, token, database, collector, jobs, model } = options
   if (!validLocalToken(token)) throw new Error('Invalid dashboard token')
   const configuration = () => ({ automatic: database.automaticSince() !== null, model })
+  const eventCache = new Map<string, { cursor: number; events: TelemetryEvent[] }>()
+  function cachedEventsForTasks(taskIds: readonly string[], cursors: ReadonlyMap<string, number>): TelemetryEvent[] {
+    const out: TelemetryEvent[] = []
+    for (const id of taskIds) {
+      const cursor = cursors.get(id) ?? 0
+      const hit = eventCache.get(id)
+      let stream: TelemetryEvent[]
+      if (hit && hit.cursor === cursor) {
+        stream = hit.events
+      } else {
+        stream = database.events(id)
+        eventCache.set(id, { cursor, events: stream })
+        if (eventCache.size > 2048) eventCache.delete(eventCache.keys().next().value!)
+      }
+      for (const item of stream) out.push(item)
+    }
+    return out
+  }
   return listenLoopback(port, async (req, res, url) => {
     res.setHeader('content-security-policy', "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self'; img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'")
     const asset = assets.get(url.pathname)
@@ -52,7 +71,10 @@ export function startDashboard(options: { port: number; token: string; database:
     if (url.pathname === '/api/overview' && req.method === 'GET') {
       const filter = filters(url)
       const tasks = filter.taskId ? [database.task(filter.taskId)].filter(task => task !== undefined) : database.tasks()
-      const events = filter.taskId ? database.events(filter.taskId) : database.allEvents()
+      const cursors = filter.taskId
+        ? new Map(tasks.map(task => [task.id, database.cursor(task.id)]))
+        : database.cursors()
+      const events = cachedEventsForTasks(tasks.map(task => task.id), cursors)
       const metrics = buildMetrics(tasks, events, Date.now(), filter)
       const selected = new Set(metrics.taskIds)
       json(res, { tasks: tasks.filter(task => selected.has(task.id)), metrics, health: collector.health() })

@@ -17,9 +17,8 @@
 
 ```ts
 type TaskStatus =
-  | 'created' | 'ready' | 'blocked' | 'running' | 'verifying'
-  | 'succeeded' | 'failed' | 'stop_requested' | 'stopping'
-  | 'stopped' | 'needs_reconciliation' | 'cancelled';
+  | 'ready' | 'running' | 'verifying' | 'succeeded' | 'failed'
+  | 'blocked' | 'stop_requested' | 'stopping' | 'stopped' | 'needs_reconciliation';
 
 type AgentLifecycle =
   | 'created' | 'starting' | 'active' | 'idle'
@@ -30,7 +29,7 @@ type AttemptStatus =
   | 'succeeded' | 'failed' | 'interrupted' | 'unknown_effect';
 ```
 
-状态转移必须显式验证、原子提交；任何外部的模型/工具结果只是**请求转移的证据**。根任务成功必须经过验收；停止与取消不可混淆：`stopped` 可恢复，`cancelled` 是明确放弃。支持 `blocked` 等待依赖、`needs_reconciliation` 防止未知效果重试。
+状态转移必须显式验证、原子提交；任何外部的模型/工具结果只是**请求转移的证据**。根任务创建即进入 `ready`，成功必须经过验收；`stopped` 支持恢复，支持 `blocked` 等待依赖或前置阻断、`needs_reconciliation` 防止未知效果盲目重试（详见 `shared/contracts/domain.ts`）。
 
 ## Port 接口草案
 

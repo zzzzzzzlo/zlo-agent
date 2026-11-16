@@ -174,3 +174,51 @@ test('configures SQLite busy_timeout on WAL database while wrapping persistence 
   }
   assert.throws(() => store.transaction(() => 1), (error: unknown) => error instanceof StorePersistenceError);
 });
+
+test('P2-1: migrates v1 SQLite stores to v2 and uses expression indexes for taskId and ready-status queries', (t) => {
+  const path = databasePath(t);
+  const legacy = new DatabaseSync(path);
+  legacy.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE records (
+      namespace TEXT NOT NULL,
+      id TEXT NOT NULL,
+      value TEXT NOT NULL CHECK (json_valid(value)),
+      PRIMARY KEY (namespace, id)
+    ) STRICT, WITHOUT ROWID;
+    CREATE TABLE events (
+      task_id TEXT NOT NULL,
+      seq INTEGER NOT NULL CHECK (seq > 0),
+      id TEXT NOT NULL UNIQUE,
+      event TEXT NOT NULL CHECK (json_valid(event)),
+      PRIMARY KEY (task_id, seq)
+    ) STRICT, WITHOUT ROWID;
+    INSERT INTO records(namespace, id, value) VALUES ('tasks', '01', '{"id":"01","status":"succeeded"}');
+    INSERT INTO records(namespace, id, value) VALUES ('tasks', '02', '{"id":"02","status":"ready"}');
+    INSERT INTO records(namespace, id, value) VALUES ('operations', 'op-1', '{"id":"op-1","taskId":"02"}');
+    PRAGMA user_version = 1;
+  `);
+  legacy.close();
+
+  const store = new LocalStore(path);
+  try {
+    assert.deepEqual(store.firstReadyTask(), { id: '02', status: 'ready' });
+    assert.deepEqual(store.recordsByTaskId('operations', '02'), [{ id: 'op-1', taskId: '02' }]);
+    const reader = new DatabaseSync(path, { readOnly: true });
+    try {
+      assert.equal(reader.prepare('PRAGMA user_version').get()?.user_version, 2);
+      const opPlan = reader.prepare(`
+        EXPLAIN QUERY PLAN SELECT value FROM records INDEXED BY idx_records_operations_task WHERE namespace = 'operations' AND json_extract(value, '$.taskId') = ? ORDER BY id
+      `).all('02').map(row => String(row.detail)).join('\n');
+      assert.match(opPlan, /SEARCH records USING INDEX idx_records_operations_task/);
+      const readyPlan = reader.prepare(`
+        EXPLAIN QUERY PLAN SELECT value FROM records INDEXED BY idx_records_task_status WHERE namespace = 'tasks' AND json_extract(value, '$.status') = 'ready' ORDER BY id ASC LIMIT 1
+      `).all().map(row => String(row.detail)).join('\n');
+      assert.match(readyPlan, /SEARCH records USING INDEX idx_records_task_status/);
+    } finally {
+      reader.close();
+    }
+  } finally {
+    store.close();
+  }
+});

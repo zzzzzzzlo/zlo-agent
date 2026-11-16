@@ -1,4 +1,4 @@
-import { useLayoutEffect, useRef } from 'react'
+import { useId, useLayoutEffect, useRef } from 'react'
 import type { ReactNode } from 'react'
 import { X } from 'lucide-react'
 import { IconButton } from './IconButton'
@@ -11,20 +11,21 @@ export function Modal({ title, subtitle, onClose, children, className = '' }: {
   className?: string
 }) {
   const dialog = useRef<HTMLDialogElement>(null)
+  const titleId = useId()
   useLayoutEffect(() => { dialog.current?.showModal() }, [])
 
   return (
     <dialog
       ref={dialog}
       className={`modal ${className}`}
-      aria-labelledby="modal-title"
+      aria-labelledby={titleId}
       onCancel={(event) => { event.preventDefault(); onClose() }}
       onClick={(event) => { if (event.target === event.currentTarget) onClose() }}
     >
       <div className="modal-panel">
         <header className="modal-header">
           <div>
-            <h2 id="modal-title">{title}</h2>
+            <h2 id={titleId}>{title}</h2>
             {subtitle && <p>{subtitle}</p>}
           </div>
           <IconButton label="关闭弹窗" onClick={onClose}><X size={17} /></IconButton>

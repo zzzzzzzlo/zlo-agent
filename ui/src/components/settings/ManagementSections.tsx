@@ -136,7 +136,7 @@ function Permissions({ snapshot, api, busy, perform, save }: ActionProps & Prefe
             <p className="management-path">{conversation.workspace}</p>
             <label className="field-label">
               当前会话权限
-              <select disabled={busy} value={conversation.workspaceAccess ?? 'read'} onChange={(event) => {
+              <select disabled={busy} value={conversation.workspaceAccess ?? (conversation.check ? 'write' : 'read')} onChange={(event) => {
                 const access = event.target.value as AgentPreferences['workspaceAccess']
                 perform(() => api.setWorkspaceAccess({ conversationId: conversation.id, access }))
               }}>

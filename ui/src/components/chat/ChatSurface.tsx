@@ -20,7 +20,7 @@ export function ChatSurface() {
   const mock = useWorkspace((state) => state.mock)
   const viewport = useRef<HTMLDivElement>(null)
   const following = useRef(true)
-  const olderAnchor = useRef<{ height: number; top: number } | undefined>(undefined)
+  const olderAnchor = useRef<{ height: number; top: number; firstTurnId: string | undefined } | undefined>(undefined)
   const [atEnd, setAtEnd] = useState(true)
 
   function scrollToEnd() {
@@ -36,7 +36,7 @@ export function ChatSurface() {
   }, [id])
   useLayoutEffect(() => {
     const anchor = olderAnchor.current
-    if (anchor && viewport.current) {
+    if (anchor && viewport.current && turns?.[0]?.id !== anchor.firstTurnId) {
       viewport.current.scrollTop = anchor.top + viewport.current.scrollHeight - anchor.height
       olderAnchor.current = undefined
     } else if (following.current) scrollToEnd()
@@ -44,7 +44,7 @@ export function ChatSurface() {
 
   function older() {
     if (!viewport.current) return
-    olderAnchor.current = { height: viewport.current.scrollHeight, top: viewport.current.scrollTop }
+    olderAnchor.current = { height: viewport.current.scrollHeight, top: viewport.current.scrollTop, firstTurnId: turns?.[0]?.id }
     void loadOlder().then((loaded) => { if (!loaded) olderAnchor.current = undefined })
   }
 

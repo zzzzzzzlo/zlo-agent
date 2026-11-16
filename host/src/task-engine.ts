@@ -1,4 +1,35 @@
-import { randomUUID } from 'node:crypto'
+import { randomBytes, randomUUID } from 'node:crypto'
+
+let lastTaskMs = 0
+let lastTaskSeq = 0
+
+/** Monotonic RFC 9562 UUIDv7 so task records sort in strict FIFO creation order. */
+function monotonicTaskId(): string {
+  const now = Date.now()
+  if (now > lastTaskMs) {
+    lastTaskMs = now
+    lastTaskSeq = 0
+  } else {
+    lastTaskSeq++
+    if (lastTaskSeq > 0xfff) {
+      lastTaskMs++
+      lastTaskSeq = 0
+    }
+  }
+  const bytes = randomBytes(16)
+  const ts = BigInt(lastTaskMs)
+  bytes[0] = Number((ts >> 40n) & 0xffn)
+  bytes[1] = Number((ts >> 32n) & 0xffn)
+  bytes[2] = Number((ts >> 24n) & 0xffn)
+  bytes[3] = Number((ts >> 16n) & 0xffn)
+  bytes[4] = Number((ts >> 8n) & 0xffn)
+  bytes[5] = Number(ts & 0xffn)
+  bytes[6] = 0x70 | ((lastTaskSeq >> 8) & 0x0f)
+  bytes[7] = lastTaskSeq & 0xff
+  bytes[8] = 0x80 | (bytes[8]! & 0x3f)
+  const hex = bytes.toString('hex')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
 import type { ApprovalKind } from '../../shared/contracts/tool-approval.ts'
 import { normalizeVerification, projectCommands } from './contracts/domain.ts'
 import type { EndReason, EventDraft, ModelRoute, TaskStatus, ToolFailureReason, VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
@@ -353,18 +384,23 @@ export class TaskEngine {
 
   list(): TaskSnapshot[] { return this.#db.list<TaskSnapshot>('tasks').map(normalizeTask) }
 
+  nextReady(): TaskSnapshot | undefined {
+    const ready = this.#db.firstReadyTask<TaskSnapshot>()
+    return ready ? normalizeTask(ready) : undefined
+  }
+
   listPage(before: string | null, limit: number): TaskSnapshot[] {
     return this.#db.listBefore<TaskSnapshot>('tasks', before, limit).map(normalizeTask)
   }
 
   attempts(taskId: string): Attempt[] {
     this.get(taskId)
-    return this.#db.matchingRecords<Attempt>('attempts', '$.taskId', taskId)
+    return this.#db.recordsByTaskId<Attempt>('attempts', taskId)
   }
 
   operations(taskId: string): Operation[] {
     this.get(taskId)
-    return this.#db.matchingRecords<Operation>('operations', '$.taskId', taskId)
+    return this.#db.recordsByTaskId<Operation>('operations', taskId)
   }
 
   recorded<T>(requestId: string, signature: unknown): T | undefined {
@@ -412,7 +448,7 @@ export class TaskEngine {
         throw new Error('Command verification requires trusted workspace access')
       }
       const task: TaskSnapshot = {
-        schemaVersion: 1, id: randomUUID(), taskRunId: randomUUID(), rootNodeId: randomUUID(), cwd: command.cwd,
+        schemaVersion: 1, id: monotonicTaskId(), taskRunId: randomUUID(), rootNodeId: randomUUID(), cwd: command.cwd,
         conversationId: command.conversationId,
         goal: checkText(command.goal, 'goal', 16000),
         check,

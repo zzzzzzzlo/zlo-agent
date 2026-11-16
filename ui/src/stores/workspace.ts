@@ -114,6 +114,18 @@ export function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boo
       persist()
     }
 
+    function pruneIdleWatches(keepId: string | null) {
+      const { sessions } = get()
+      for (const [watchedId, close] of watchers.entries()) {
+        if (watchedId === keepId) continue
+        const session = sessions.find((item) => item.id === watchedId)
+        if (!session || (!isBusy(session.latestStatus) && !isBusy(session.turns.at(-1)?.status))) {
+          close()
+          watchers.delete(watchedId)
+        }
+      }
+    }
+
     function watch(id: string) {
       if (!adapter || watchers.has(id)) return
       const cursor = get().sessions.find((session) => session.id === id)?.historyCursor
@@ -121,7 +133,10 @@ export function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boo
         history: (history) => updateSession(id, (previous) => applyHistory(history, previous)),
         event: (event) => {
           if (event.payload.conversation?.archived) remove(id)
-          else updateSession(id, (session) => applyHostEvent(session, event))
+          else {
+            updateSession(id, (session) => applyHostEvent(session, event))
+            if (id !== get().activeId) pruneIdleWatches(get().activeId)
+          }
         },
         error: (error) => {
           watchers.delete(id)
@@ -165,17 +180,22 @@ export function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boo
 
     async function createConversation(input: NewConversation): Promise<string> {
       if (!commands) throw new Error('桌面 Host 接口不可用。')
+      const previousActiveId = get().activeId
       const signature = JSON.stringify(input)
       if (pendingCreate?.signature !== signature) pendingCreate = { signature, requestId: crypto.randomUUID() }
       const conversation = await commands.createConversation({ requestId: pendingCreate.requestId, ...input })
       pendingCreate = undefined
-      set(({ sessions }) => ({
-        activeId: conversation.id,
+      const shouldActivate = get().activeId === previousActiveId
+      set(({ sessions, activeId }) => ({
+        activeId: shouldActivate ? conversation.id : activeId,
         sessions: [toSession(conversation, sessions.find((session) => session.id === conversation.id)),
           ...sessions.filter((session) => session.id !== conversation.id)],
       }))
       persist()
-      watch(conversation.id)
+      if (shouldActivate) {
+        pruneIdleWatches(conversation.id)
+        watch(conversation.id)
+      }
       return conversation.id
     }
 
@@ -270,6 +290,7 @@ export function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boo
         if (!get().sessions.some((session) => session.id === id)) return
         set({ activeId: id, error: undefined })
         persist()
+        pruneIdleWatches(id)
         if (get().host.state === 'ready') watch(id)
       },
       renameSession(id, title) {

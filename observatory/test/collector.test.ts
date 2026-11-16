@@ -13,6 +13,8 @@ import { fileURLToPath } from 'node:url'
 import type { TelemetryEvent, TelemetryTask } from '../../shared/contracts/observatory.ts'
 import { Collector, TelemetryClient } from '../src/collector.ts'
 import { ObservatoryDatabase } from '../src/database.ts'
+import { buildMetrics } from '../src/metrics.ts'
+import { startDashboard } from '../src/server.ts'
 
 const token = 'fixture-collector-authorization-token'
 const timeout = () => AbortSignal.timeout(10_000)
@@ -157,6 +159,66 @@ test('a sequence gap rolls back the batch; replay repairs it and exact duplicate
     assert.throws(() => db.ingest(id, [{ ...second, id: randomUUID() }]), /identity conflict/u)
     assert.deepEqual(db.events(id), supplied)
   } finally {
+    db.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('P2-1: multi-pass catching_up does not inflate missing_events and /api/overview reuses cached streams', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'zlo-observatory-catchup-'))
+  const db = new ObservatoryDatabase(root)
+  let server: Awaited<ReturnType<typeof startDashboard>> | undefined
+  try {
+    const id = randomUUID(), now = new Date().toISOString()
+    const total = 1100
+    const fullTask: TelemetryTask = {
+      id, taskRunId: randomUUID(), rootNodeId: randomUUID(), status: 'succeeded',
+      attemptCount: 1, planVersion: 0, cursor: total, nodes: [], attempts: [],
+    }
+    const allEvents: TelemetryEvent[] = Array.from({ length: total }, (_, index) => ({
+      id: randomUUID(), taskId: id, schemaVersion: 1, seq: index + 1, occurredAt: now,
+      type: index === 0 ? 'task.created' : 'task.state_changed', payload: { status: index + 1 === total ? 'succeeded' : 'running' },
+    }))
+    const collector = new Collector(db, {
+      async heads() { return { schemaVersion: 1, tasks: [{ id, cursor: fullTask.cursor }], next: null } },
+      async snapshot() { return fullTask },
+      async events(_, after) { return allEvents.slice(after, after + 128) },
+      async watch() { return { changed: false } },
+    })
+
+    // First sync ingests 8 * 128 = 1024 events and reports behind=true without false missing_events!
+    const firstPass = await collector.sync()
+    assert.equal(firstPass.behind, true)
+    assert.equal(firstPass.gapStreams, 0)
+    assert.equal(db.cursor(id), 1024)
+    const midMetrics = buildMetrics(db.tasks(), db.events(id))
+    assert.equal(midMetrics.domains.reliability.find(m => m.id === 'reliability.missing_events')?.value, 0)
+
+    // Second sync catches up the remaining 76 events cleanly.
+    const secondPass = await collector.sync()
+    assert.equal(secondPass.behind, false)
+    assert.equal(db.cursor(id), total)
+
+    let eventReads = 0
+    const originalEvents = db.events.bind(db)
+    db.events = (taskId: string) => {
+      eventReads++
+      return originalEvents(taskId)
+    }
+    const port = await freePort()
+    server = await startDashboard({
+      port, token, database: db, collector,
+      jobs: { start() { return 'job' }, cancel() { return false } } as never,
+    })
+    const headers = { authorization: 'Bearer ' + token }
+    const res1 = await fetch(`http://127.0.0.1:${port}/api/overview`, { headers })
+    assert.equal(res1.status, 200)
+    assert.equal(eventReads, 1)
+    const res2 = await fetch(`http://127.0.0.1:${port}/api/overview`, { headers })
+    assert.equal(res2.status, 200)
+    assert.equal(eventReads, 1)
+  } finally {
+    await server?.close()
     db.close()
     await rm(root, { recursive: true, force: true })
   }

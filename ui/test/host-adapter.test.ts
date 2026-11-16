@@ -354,3 +354,36 @@ test('P1-6: retrying send after a transient steer error when the old turn has fi
     adapter.dispose()
   }
 })
+
+test('P2-2: selectSession unwatches idle background sessions and createSession preserves activeId if switched mid-flight', async () => {
+  const storeFactory = await loadWorkspaceFactory()
+  const unwatched: string[] = []
+  const second = { ...conversation, id: '22222222-2222-4222-8222-222222222222', title: '第二个会话' }
+  const createdConv = { ...conversation, id: '33333333-3333-4333-8333-333333333333', title: '新建会话' }
+  const resolveCreate = Promise.withResolvers<typeof createdConv>()
+  const { api } = testApi()
+  api.listConversations = async () => [conversation, second]
+  api.unwatchConversation = async (input) => { unwatched.push(input.conversationId) }
+  api.createConversation = async () => resolveCreate.promise
+  const adapter = new HostAgentAdapter(api)
+  const store = storeFactory(adapter, false)
+  const close = store.getState().initialize()
+  try {
+    await setImmediate()
+    assert.equal(store.getState().activeId, conversation.id)
+    store.getState().selectSession(second.id)
+    await setImmediate()
+    assert.ok(unwatched.includes(conversation.id))
+
+    const creating = store.getState().createSession({ title: '新建会话' })
+    // User explicitly switches back to conversation.id while createConversation is in flight.
+    store.getState().selectSession(conversation.id)
+    resolveCreate.resolve(createdConv)
+    await creating
+    assert.equal(store.getState().activeId, conversation.id)
+    assert.ok(store.getState().sessions.some(item => item.id === createdConv.id))
+  } finally {
+    close()
+    adapter.dispose()
+  }
+})

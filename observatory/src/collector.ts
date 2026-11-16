@@ -148,7 +148,7 @@ export class Collector {
               after = next
             } catch { gap = true }
           }
-          this.#database.saveSnapshot(snapshot)
+          this.#database.saveSnapshot(!gap && after < snapshot.cursor ? { ...snapshot, cursor: after } : snapshot)
         }
         if (gap) { gapStreams++; continue }
         if (!snapshot) continue

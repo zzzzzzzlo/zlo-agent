@@ -15,7 +15,8 @@
     "test:desktop": "npm run build && node --test test/desktop-e2e.test.mjs",
     "build": "npm run typecheck && electron-vite build",
     "stage:host": "node electron/scripts/stage-host.mjs",
-    "pack:win": "npm run build && npm run stage:host && node -e \"require('electron')\" && electron-builder --win portable --publish never --config.electronDist=node_modules/electron/dist"
+    "pack:win": "npm run build && npm run stage:host && node -e \"require('electron')\" && electron-builder --win portable --publish never --config.electronDist=node_modules/electron/dist",
+    "smoke:packed": "node electron/scripts/smoke-packed.mjs"
   },
   "dependencies": {
     "@liqui-design/glass": "0.5.0",
