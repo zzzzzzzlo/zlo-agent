@@ -143,10 +143,12 @@ function publicFeatures(point: DecisionPoint, input: Record<string, unknown>): R
         evidenceCount: count(candidate.evidenceCount), estimatedBytes: count(candidate.estimatedBytes),
       })),
     }
-    case 'handoff.sufficiency': return {
-      role: category(input.role, ['team', 'worker']), access: category(input.access, ['read', 'write', 'trusted']),
-      evidenceCount: count(input.evidenceCount), artifactCount: count(input.artifactCount), completedChildren: count(input.completedChildren),
-      checked: flag(input.checked), checkPassed: flag(input.checkPassed),
+    case 'turn.completion': return {
+      role: category(input.role, ['root', 'team', 'worker']), access: category(input.access, ['read', 'write', 'trusted']),
+      evidenceCount: count(input.evidenceCount), writeCount: count(input.writeCount), failedCount: count(input.failedCount),
+      artifactCount: count(input.artifactCount), completedChildren: count(input.completedChildren),
+      checkConfigured: flag(input.checkConfigured), checked: flag(input.checked), checkPassed: flag(input.checkPassed),
+      attemptCount: count(input.attemptCount),
     }
     case 'task.replan': return {
       status: category(input.status, ['missing', 'ready', 'running', 'failed', 'succeeded']), requested: flag(input.requested),
@@ -158,7 +160,7 @@ function publicFeatures(point: DecisionPoint, input: Record<string, unknown>): R
       checkPassed: flag(input.checkPassed), toolCount: count(input.toolCount),
       length: count(input.length), initial: flag(input.initial),
       tool: category(input.tool, ['web_search', 'web_fetch', 'browser_snapshot', 'process_output',
-        'search_files', 'search_content', 'read_text_file', 'git_diff']),
+        'run_project_command', 'search_files', 'search_content', 'read_text_file', 'git_diff']),
     }
   }
 }

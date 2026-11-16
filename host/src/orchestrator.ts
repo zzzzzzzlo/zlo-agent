@@ -17,7 +17,7 @@ import type { ToolApprovalBroker } from './tool-approval.ts'
 import type { ToolApprovalMode } from '../../shared/contracts/tool-approval.ts'
 import { ToolRun } from './tool-run.ts'
 import { ToolEvidenceArchive } from './tool-judgment.ts'
-import { followUpAllows, reviewTurn } from './turn-judgment.ts'
+import { followUpAllows, reviewCompletion } from './turn-judgment.ts'
 import type { TurnFollowUp } from './turn-judgment.ts'
 import { verifyWorkspace } from './verification.ts'
 import { VisualTelemetry } from './visual-workflow.ts'
@@ -487,44 +487,53 @@ export class MultiAgentOrchestrator {
           }
         }
         await drainDeferred()
-        const attempted = new Set<TurnFollowUp['id']>()
-        while (!signal.aborted && outcome.status === 'completed' &&
-          !blockingWrite() &&
-          (this.#judgment.mode('turn.completion', task.id) !== 'off' || this.#judgment.mode('turn.continue', task.id) !== 'off')) {
-          followUp = await reviewTurn(this.#judgment, event, { goal: node.goal, summary: outcome.text, checkConfigured: Boolean(node.check),
-            operations: this.#tasks.operations(task.id), completedReceipts: this.#completedReceipts(event), attempted, signal })
-          if (!followUp || signal.aborted) break
-          await session.checkpoint()
-          outcome = await session.run(followUp.nudge)
-          await drainDeferred()
-        }
-        followUp = undefined
-        executionCompleted = outcome.status === 'completed'
-        if (!signal.aborted && outcome.status === 'completed' && outcome.text.trim()) {
+        let reviewRounds = 0
+        let completionAccepted = true
+        let settledEvidence = false
+        let hardEvidence = false
+        while (!signal.aborted && outcome.status === 'completed' && outcome.text.trim() && !blockingWrite()) {
           if (node.check?.command && (!this.#capabilities.enabled('run_project_command') ||
             (scope.tools && !scope.tools.includes('run_project_command')) ||
             scope.disallowedTools?.includes('run_project_command'))) {
             verification = { passed: false, evidence: 'project_command_disabled' }
-          } else if (node.check) verification = await verifyWorkspace(this.#tasks, this.#extensions.workflow,
-            workspace, event, node.check, signal, scope.access)
+          } else if (node.check) {
+            verification = await verifyWorkspace(this.#tasks, this.#extensions.workflow,
+              workspace, event, node.check, signal, scope.access)
+          }
           const completedChildren = this.#tasks.get(task.id).nodes?.filter(child =>
             child.parentNodeId === node.id && child.status === 'succeeded').length ?? 0
-          const hardEvidence = node.check ? verification?.passed === true : evidence.size > 0 || completedChildren > 0
-          const successfulTools = new Set(this.#tasks.operations(task.id)
-            .filter(operation => evidence.has(operation.id)).map(operation => operation.tool))
-          const accepted = await this.#judgment.decide(event, 'handoff.sufficiency', {
-            goal: node.goal, parentGoal: task.goal, summary: outcome.text.slice(0, 4000),
-            successfulTools: [...successfulTools].slice(0, 12),
-            evidenceCount: evidence.size, artifactCount: artifacts.size, checked: Boolean(node.check),
-            checkPassed: verification?.passed === true, role, access: scope.access, completedChildren,
-          }, hardEvidence, hardEvidence ? [true, false] : [false], [...evidence], { signal })
+          hardEvidence = node.check ? verification?.passed === true : evidence.size > 0 || completedChildren > 0
+          const successfulTools = [...new Set(this.#tasks.operations(task.id)
+            .filter(operation => evidence.has(operation.id)).map(operation => operation.tool))].slice(0, 24)
+          settledEvidence = true
+          const judgment = await reviewCompletion(this.#judgment, event, {
+            goal: node.goal, parentGoal: task.goal, summary: outcome.text, role, access: scope.access,
+            checkConfigured: Boolean(node.check), checked: Boolean(node.check), checkPassed: verification?.passed === true,
+            evidenceCount: evidence.size, artifactCount: artifacts.size, completedChildren, successfulTools,
+            operations: this.#tasks.operations(task.id), completedReceipts: this.#completedReceipts(event),
+            allowed: hardEvidence || reviewRounds === 0 ? [false, true] : [false],
+            attemptCount: reviewRounds, maxFollowUps: 1, signal, evidenceRefs: [...evidence],
+          })
+          completionAccepted = !judgment.insufficient
+          if (!judgment.followUp || signal.aborted) break
+          reviewRounds++
+          followUp = judgment.followUp
+          settledEvidence = false
+          await session.checkpoint()
+          outcome = await session.run(followUp.nudge)
+          followUp = undefined
+          await drainDeferred()
+        }
+        followUp = undefined
+        executionCompleted = outcome.status === 'completed'
+        if (!signal.aborted && outcome.status === 'completed' && outcome.text.trim() && settledEvidence) {
           const review = await this.#reviewWorkerPatch(task, node, event, scope, signal)
           result = {
-            resultStatus: hardEvidence && accepted ? 'succeeded' : 'failed',
+            resultStatus: hardEvidence && completionAccepted ? 'succeeded' : 'failed',
             executionStatus: 'completed',
             summary: outcome.text.slice(0, 1600), artifactRefs: [...artifacts], evidenceRefs: [...evidence],
             remainingRisks: [
-              ...(!hardEvidence ? ['verification_failed'] : !accepted ? ['handoff_insufficient'] : []),
+              ...(!hardEvidence ? ['verification_failed'] : !completionAccepted ? ['handoff_insufficient'] : []),
               ...(review ? ['patch_scope_review'] : []),
             ],
           }
@@ -617,11 +626,11 @@ export class MultiAgentOrchestrator {
     let deferredResultRounds = 0
     let followUp: TurnFollowUp | undefined
     let advice: Awaited<ReturnType<typeof preflight>> = {}
-    const attempted = new Set<TurnFollowUp['id']>()
-    if (this.#judgment.mode('turn.completion', task.id) !== 'off' || this.#judgment.mode('turn.continue', task.id) !== 'off') {
+    let completionAttempts = 0
+    if (this.#judgment.mode('turn.completion', task.id) !== 'off') {
       for (const decision of this.#db.eventsOfTypes(task.id, ['judgment.evaluated'])) {
         const { id } = decision.payload
-        if (decision.taskAttemptId === task.attemptId && (id === 'turn.completion' || id === 'turn.continue')) attempted.add(id)
+        if (decision.taskAttemptId === task.attemptId && (id === 'turn.completion' || id === 'turn.continue')) completionAttempts++
       }
     }
     const seenSteers = new Set<string>()
@@ -1029,10 +1038,17 @@ export class MultiAgentOrchestrator {
           const after = this.#tasks.get(task.id)
           const more = after.instructions.some((item) => !item.delivered) || this.#tasks.runnableNodes(task.id).length > 0 ||
             (!conversationId && after.route && !sameRoute(after.route, session.route))
-          if (!more && !hasUnknownWrite() && (this.#judgment.mode('turn.completion', task.id) !== 'off' ||
-            this.#judgment.mode('turn.continue', task.id) !== 'off')) {
-            followUp = await reviewTurn(this.#judgment, event, { goal: task.goal, summary: result.text, checkConfigured: Boolean(task.check),
-              operations: this.#tasks.operations(task.id), completedReceipts: this.#completedReceipts(event), attempted, signal })
+          if (!more && !hasUnknownWrite() && completionAttempts < 1 && this.#judgment.mode('turn.completion', task.id) !== 'off') {
+            const children = this.#tasks.get(task.id).nodes ?? []
+            const completedChildren = children.filter(child => child.status === 'succeeded').length
+            const review = await reviewCompletion(this.#judgment, event, {
+              goal: task.goal, summary: result.text, role: 'root', access: rootScope.access,
+              checkConfigured: Boolean(task.check), completedChildren,
+              operations: this.#tasks.operations(task.id), completedReceipts: this.#completedReceipts(event),
+              attemptCount: completionAttempts, maxFollowUps: 1, signal,
+            })
+            completionAttempts++
+            followUp = review.followUp
             if (signal.aborted) break
             const postReview = this.#tasks.get(task.id)
             const arrivedDuringReview = postReview.instructions.some((item) => !item.delivered) ||

@@ -305,8 +305,8 @@ function judgmentMetrics(events: TelemetryEvent[], complete: boolean, usdToCnyRa
       (Array.isArray(outcomes) && outcomes.some(item => typeof item === 'boolean')))
   })
   const shadowDifferent = shadow.filter(({ payload }) => payload.disagreement ?? payload.shadow !== payload.baseline).length
-  const fallbacks = events.filter(event => event.payload.mode !== 'off' && event.payload.judgeStatus && event.payload.judgeStatus !== 'baseline' && event.payload.judgeStatus !== 'valid').length
-  const activeJudgeAttempts = events.filter(event => event.payload.mode !== 'off' && event.payload.judgeStatus && event.payload.judgeStatus !== 'baseline').length
+  const fallbacks = events.filter(event => event.payload.mode !== 'off' && event.payload.judgeStatus && event.payload.judgeStatus !== 'baseline' && event.payload.judgeStatus !== 'valid' && event.payload.fallbackReason !== 'no_choice').length
+  const activeJudgeAttempts = events.filter(event => event.payload.mode !== 'off' && event.payload.judgeStatus && event.payload.judgeStatus !== 'baseline' && event.payload.fallbackReason !== 'no_choice').length
   const external = events.filter(event => event.payload.requestSent ??
     (event.payload.mode !== 'off' && event.payload.judgeStatus !== 'baseline'))
   return [

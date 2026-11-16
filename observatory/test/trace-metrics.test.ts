@@ -133,23 +133,34 @@ test('metrics count provider usage and costs once, preserve coverage, and separa
   assert.equal(byId.get('judgment.cost')?.unit, 'CNY')
   assert.equal(byId.get('security.approvals_denied')?.value, 1)
   assert.equal(byId.get('security.policy_denials')?.quality, 'unknown')
-  assert.equal(metrics.judgments.length, 16)
+  assert.equal(metrics.judgments.length, 14)
   const alternateMetrics = metrics.models.find(group => group.model === 'pro')!.metrics
   assert.equal(alternateMetrics.find(metric => metric.id === 'model.mean_latency')?.quality, 'unknown')
   assert.equal(alternateMetrics.find(metric => metric.id === 'model.cost')?.quality, 'unknown')
 })
 
-test('Judgment usage includes attempted Jev requests and excludes local fallbacks', () => {
+test('Judgment usage includes attempted Jev requests and excludes local fallbacks and no_choice', () => {
   const { task, events, emit, run } = scenario()
+  emit(244, 'judgment.evaluated', { id: 'delegation.worth', mode: 'active', output: false, baseline: false,
+    judgeStatus: 'failed', requestSent: false, fallbackReason: 'no_choice' }, run('c'))
   emit(245, 'judgment.evaluated', { id: 'context.relevance', mode: 'active', output: 0, baseline: 0,
     judgeStatus: 'failed', requestSent: false, fallbackReason: 'budget_exhausted' }, run('c'))
   emit(250, 'judgment.evaluated', { id: 'context.relevance', mode: 'active', output: 0, baseline: 0,
     judgeStatus: 'timed_out', requestSent: true, fallbackReason: 'timeout' }, run('c'))
+  emit(251, 'judgment.evaluated', { id: 'turn.completion', mode: 'active', output: false, baseline: false,
+    judgeStatus: 'valid', requestSent: true, resultLink: { taskNodeId: 'c', taskAttemptId: 'c1' } }, run('c'))
+  emit(252, 'task.node_settled', { resultStatus: 'succeeded' }, { taskNodeId: 'c', taskAttemptId: 'c1' })
   const metrics = buildMetrics([task], events).domains.judgment
   const tokens = metrics.find(metric => metric.id === 'judgment.tokens')
   assert.equal(tokens?.value, 5)
   assert.equal(tokens?.samples, 1)
-  assert.equal(tokens?.population, 2)
+  assert.equal(tokens?.population, 3)
+  const fallbackRate = metrics.find(metric => metric.id === 'judgment.fallback_rate')
+  assert.equal(fallbackRate?.samples, 2)
+  assert.equal(fallbackRate?.population, 4)
+  const trace = buildTrace(task, events)
+  const link = trace.judgments.find(item => item.point === 'turn.completion')
+  assert.ok(link && link.linkedEventIds.length === 1)
 })
 
 test('time, role and model filters retain span ends and do not attribute root requests to a worker', () => {

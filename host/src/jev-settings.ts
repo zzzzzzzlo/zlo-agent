@@ -1,5 +1,5 @@
 import { jevDefaultModel, jevEndpoint, judgmentPoints, parseJevSettings } from '../../shared/contracts/jev.ts'
-import type { DecisionPoint, JevDecisionStatus, JevSettings, JevStatus, JudgeCredentials } from '../../shared/contracts/jev.ts'
+import type { DecisionPoint, JevDecisionStatus, JevReason, JevSettings, JevStatus, JudgeCredentials } from '../../shared/contracts/jev.ts'
 import { JevFailure, JevJudge } from './jev-judge.ts'
 import type { Judge, JudgmentOptions } from './judgment.ts'
 import type { LocalStore } from './store.ts'
@@ -7,9 +7,10 @@ import type { LocalStore } from './store.ts'
 const namespace = 'jev-configuration'
 const settingsId = 'settings'
 const connectionId = 'connection'
-const taskRequestLimit = 32
-const requestsPerMinute = 60
 const probeTimeoutMs = 3500
+const judgeTimeoutMs = 10_000
+
+type BackoffReason = Extract<JevReason, 'rate_limited' | 'timeout' | 'unavailable' | 'invalid_response' | 'unauthorized' | 'billing' | 'invalid_model'>
 
 export class JevConfiguration {
   readonly #store: LocalStore
@@ -18,10 +19,10 @@ export class JevConfiguration {
   readonly #keys: Map<string, string>
   #generation = new AbortController()
   readonly #pointControllers = new Map<DecisionPoint, AbortController>()
-  #recent: number[] = []
   #cooldown = 0
-  #cooldownReason: 'rate_limited' | 'timeout' | 'unavailable' = 'rate_limited'
+  #cooldownReason: BackoffReason = 'rate_limited'
   #consecutiveFailures = 0
+  #rateLimitStreak = 0
   #probing = false
 
   constructor(store: LocalStore, key: string | null = null, request: typeof fetch = fetch, keys: JudgeCredentials = {}) {
@@ -59,12 +60,10 @@ export class JevConfiguration {
         for (const { id } of judgmentPoints) this.#store.put(namespace, id, null)
       }
     })
-    if (routeChanged || globalChanged) this.#invalidate()
-    if (routeChanged) {
-      this.#cooldown = 0
-      this.#consecutiveFailures = 0
-    }
-    else for (const { id } of judgmentPoints) {
+    if (routeChanged || globalChanged) {
+      this.#invalidate()
+      this.#resetBackoff()
+    } else for (const { id } of judgmentPoints) {
       if (settings.modes[id] === this.#settings.modes[id]) continue
       this.#pointControllers.get(id)?.abort()
       this.#pointControllers.delete(id)
@@ -78,10 +77,15 @@ export class JevConfiguration {
     else this.#keys.set(endpoint, key)
     if (endpoint !== this.#settings.endpoint) return this.status()
     this.#invalidate()
-    this.#cooldown = 0
-    this.#consecutiveFailures = 0
+    this.#resetBackoff()
     this.#store.transaction(() => this.#store.put(namespace, connectionId, { state: 'untested' }))
     return this.status()
+  }
+
+  #resetBackoff() {
+    this.#cooldown = 0
+    this.#consecutiveFailures = 0
+    this.#rateLimitStreak = 0
   }
 
   #invalidate() {
@@ -104,9 +108,9 @@ export class JevConfiguration {
     const key = this.#keys.get(route.endpoint)
     try {
       if (!key) throw new JevFailure('missing_key')
-      this.#reserve()
+      this.#resetBackoff()
       const model = await new JevJudge(key, route, this.#request).test(signal)
-      this.#consecutiveFailures = 0
+      this.#resetBackoff()
       connection = { state: 'connected', at, model }
     } catch (error) {
       const reason = timeout.aborted ? 'timeout' : error instanceof JevFailure ? error.reason : 'unavailable'
@@ -121,37 +125,37 @@ export class JevConfiguration {
     return this.status()
   }
 
-  #reserve(taskId?: string) {
-    const now = Date.now()
-    if (now < this.#cooldown) throw new JevFailure(this.#cooldownReason)
-    this.#recent = this.#recent.filter(time => time > now - 60_000)
-    if (this.#recent.length >= requestsPerMinute) throw new JevFailure('budget_exhausted')
-    if (taskId) this.#store.transaction(() => {
-      const used = this.#store.get<number>('jev-budget', taskId) ?? 0
-      if (used >= taskRequestLimit) throw new JevFailure('budget_exhausted')
-      this.#store.put('jev-budget', taskId, used + 1)
-    })
-    this.#recent.push(now)
+  #reserve() {
+    if (Date.now() < this.#cooldown) throw new JevFailure(this.#cooldownReason)
   }
 
   #backoff(reason: JevDecisionStatus['reason']) {
-    if (Date.now() < this.#cooldown) return
+    const now = Date.now()
+    if (now < this.#cooldown) return
+    if (reason === 'unauthorized' || reason === 'billing' || reason === 'invalid_model') {
+      this.#cooldownReason = reason
+      this.#cooldown = now + 60_000
+      return
+    }
     if (reason === 'rate_limited') {
+      this.#rateLimitStreak++
       this.#cooldownReason = 'rate_limited'
-      this.#cooldown = Date.now() + 15_000
-    } else if (reason === 'timeout' || reason === 'unavailable') {
+      this.#cooldown = now + Math.min(60_000, 15_000 * 2 ** (this.#rateLimitStreak - 1))
+      return
+    }
+    if (reason === 'timeout' || reason === 'unavailable' || reason === 'invalid_response') {
       this.#consecutiveFailures++
       if (this.#consecutiveFailures >= 2) {
         this.#cooldownReason = reason
-        this.#cooldown = Date.now() + 10_000
+        this.#cooldown = now + Math.min(60_000, 10_000 * 2 ** (this.#consecutiveFailures - 2))
       }
     }
   }
 
   judgmentOptions(): JudgmentOptions {
     return {
-      timeoutMs: probeTimeoutMs,
-      policy: (point: DecisionPoint, taskId: string) => {
+      timeoutMs: judgeTimeoutMs,
+      policy: (point: DecisionPoint, _taskId: string) => {
         const mode = this.#settings.enabled ? this.#settings.modes[point] : 'off'
         if (mode === 'off') return { mode }
         const route = this.#settings
@@ -165,7 +169,7 @@ export class JevConfiguration {
           try {
             signal.throwIfAborted()
             if (!key) throw new JevFailure('missing_key')
-            this.#reserve(taskId)
+            this.#reserve()
             return await operation(new JevJudge(key, route, this.#request))
           } catch (error) {
             const reason = error instanceof JevFailure ? error.reason : 'unavailable'
@@ -185,7 +189,7 @@ export class JevConfiguration {
         this.#store.put(namespace, point, status)
         const { at, reason, model } = status
         if (model && (!reason || reason === 'uncertain')) {
-          this.#consecutiveFailures = 0
+          this.#resetBackoff()
           this.#store.put(namespace, connectionId, { state: 'connected', at, model })
         } else if (reason && ['unauthorized', 'rate_limited', 'timeout', 'unavailable', 'invalid_response', 'invalid_model', 'billing'].includes(reason)) {
           this.#backoff(reason)
