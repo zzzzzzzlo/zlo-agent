@@ -251,15 +251,16 @@ test('a delegated browser has its own session and returns image bytes through th
   } finally { await host.close() }
 })
 
-test('P1-5: rejects out-of-scope nested Team plans, separates deterministic check from handoff.sufficiency, reports multiple deferred shells, and recalls custom-provider memory', {
+test('P1-5: rejects out-of-scope nested Team plans, separates deterministic check from turn.completion, reports multiple deferred shells, and recalls custom-provider memory', {
   timeout: 30_000,
 }, async t => {
   const { cwd, directory } = await fixture(t)
 
-  // 1. Off / Shadow / Active semantics for handoff.sufficiency when deterministic node.check passes, plus nested Team scope check.
+  // 1. Off / Shadow / Active semantics for unified turn.completion when deterministic node.check passes, plus nested Team scope check.
   for (const mode of ['off', 'shadow', 'active'] as const) {
     const modeCheck = { path: `src/checked-${mode}.txt`, contains: 'deterministic-pass' }
     const modeDir = join(directory, 'handoff-' + mode)
+    let childPasses = 0
     const execution = new DelegationFixture(async (config, call) => {
       if (config.role === 'root') {
         const invalidNested = await call('propose_task_plan', {
@@ -270,22 +271,27 @@ test('P1-5: rejects out-of-scope nested Team plans, separates deterministic chec
         })
         assert.equal(invalidNested.ok, false)
         const handoff = await call('delegate_task', {
-          goal: 'Create checked file', access: 'write', scopePath: 'src', tools: ['create_text_file'], check: modeCheck,
+          goal: 'Create checked file', access: 'write', scopePath: 'src', tools: ['create_text_file', 'read_text_file'], check: modeCheck,
         })
         assert.equal(handoff.ok, mode !== 'active')
         return 'Completed check run'
       }
-      assert.equal((await call('create_text_file', { path: modeCheck.path, content: modeCheck.contains })).ok, true)
-      return ' terse summary '
+      childPasses++
+      if (childPasses === 1) {
+        assert.equal((await call('create_text_file', { path: modeCheck.path, content: modeCheck.contains })).ok, true)
+        return ' terse summary '
+      }
+      assert.equal((await call('read_text_file', { path: modeCheck.path })).ok, true)
+      return ' verified on follow-up pass '
     })
     const host = new LocalAgentHost({
       directory: modeDir,
       execution,
       judgment: {
-        modes: { 'handoff.sufficiency': mode },
+        modes: { 'turn.completion': mode },
         judge: {
           async evaluate(req) {
-            if (req.id === 'handoff.sufficiency') return { output: false }
+            if (req.id === 'turn.completion') return { output: true }
             return { output: undefined }
           },
         },
@@ -296,9 +302,10 @@ test('P1-5: rejects out-of-scope nested Team plans, separates deterministic chec
       await host.idle()
       const worker = host.getTask(taskId).nodes?.[0]
       assert.ok(worker)
-      // Deterministic check passed in every mode, so verification verdict remains 'verified' even if active handoff.sufficiency declines delivery!
+      // Deterministic check passed in every mode, so verification verdict remains 'verified' even if active turn.completion rejects delivery after forced follow-up!
       assert.equal(worker.verification?.passed, true)
       assert.equal(worker.verification?.verdict, 'verified')
+      assert.equal(childPasses, mode === 'active' ? 2 : 1)
       if (mode === 'active') {
         assert.equal(worker.status, 'failed')
         assert.ok(worker.result?.remainingRisks.includes('handoff_insufficient'))

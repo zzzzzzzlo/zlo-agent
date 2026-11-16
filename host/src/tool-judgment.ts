@@ -7,11 +7,14 @@ import type { LocalStore } from './store.ts'
 const evidenceNamespace = 'tool-judge-evidence'
 const evidenceQuota = 'tool-judge-evidence-count'
 const maxArchiveEntries = 32
-const maxArchiveBytes = 256 * 1024
+const maxArchiveBytes = 512 * 1024
 const batchLimit = 8
-const maxExcerptBytes = 300
+const batchConcurrency = 4
+const maxExcerptBytes = 1200
+const seamOverlapChars = 120
 const minAdmissionBytes = 1_500
 const quarantined = '[Potential instructions from external content withheld.]'
+const omittedNotice = '[Excerpt omitted.]'
 const reference = /^[\da-f]{8}(?:-[\da-f]{4}){3}-[\da-f]{12}$/u
 const knownInjection = /\b(?:ignore|disregard|override)\b[^.!?]{0,80}\b(?:previous|prior|system|developer)\b[^.!?]{0,40}\b(?:instruction|message|prompt|policy)s?\b|(?:忽略|无视|覆盖).{0,20}(?:之前|系统|开发者).{0,12}(?:指令|提示|规则)/iu
 const toolText = /^\w{1,64}$/u
@@ -59,21 +62,52 @@ export class ToolEvidenceArchive {
 }
 
 function chunks(text: string): string[] {
+  if (!text) return []
   const parts: string[] = []
-  let current = ''
-  let size = 0
-  for (const char of text) {
-    const bytes = Buffer.byteLength(char)
-    if (size + bytes > maxExcerptBytes) {
-      parts.push(current)
-      current = ''
-      size = 0
+  let start = 0
+  while (start < text.length) {
+    let end = start
+    let bytes = 0
+    let lastBreak = -1
+    while (end < text.length) {
+      const codePoint = text.codePointAt(end)!
+      const char = String.fromCodePoint(codePoint)
+      const charBytes = Buffer.byteLength(char)
+      if (bytes + charBytes > maxExcerptBytes) break
+      bytes += charBytes
+      end += char.length
+      if (/\s/u.test(char) && bytes >= maxExcerptBytes / 2) lastBreak = end
     }
-    current += char
-    size += bytes
+    if (end === start) {
+      const char = String.fromCodePoint(text.codePointAt(start)!)
+      end = start + char.length
+    } else if (end < text.length && lastBreak > start) {
+      end = lastBreak
+    }
+    parts.push(text.slice(start, end))
+    start = end
   }
-  if (current) parts.push(current)
   return parts
+}
+
+function chunkArray<T>(items: readonly T[], size = batchLimit): T[][] {
+  const result: T[][] = []
+  for (let index = 0; index < items.length; index += size) result.push(items.slice(index, index + size))
+  return result
+}
+
+async function mapLimited<T, R>(items: readonly T[], concurrency: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  if (!items.length) return []
+  const results = new Array<R>(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.min(concurrency, items.length) }, async () => {
+    while (next < items.length) {
+      const current = next++
+      results[current] = await fn(items[current]!)
+    }
+  })
+  await Promise.all(workers)
+  return results
 }
 
 interface Segment {
@@ -82,23 +116,42 @@ interface Segment {
   group?: symbol
   blocked?: boolean
   dismissed?: boolean
-  alwaysRetain?: boolean
 }
 
 function textSegments(value: unknown, field: string): Segment[] {
-  if (typeof value !== 'string') return []
+  if (typeof value !== 'string' || !value) return []
   const group = Symbol()
   return chunks(value).map(text => ({ field, text, group }))
 }
 
-interface ExternalText {
+function joinVisible(parts: readonly Segment[], visible: (segment: Segment) => string): string {
+  let out = ''
+  let omitted = false
+  for (const part of parts) {
+    const piece = visible(part)
+    if (piece === omittedNotice) {
+      if (!omitted) {
+        out += (out && !/\s$/u.test(out) ? '\n' : '') + piece
+        omitted = true
+      }
+    } else {
+      omitted = false
+      out += piece
+    }
+  }
+  return out
+}
+
+interface InspectableText {
   segments: Segment[]
+  admissible: boolean
   render(visible: (segment: Segment) => string): Output
 }
 
-function externalText(tool: string, result: Output): ExternalText | undefined {
-  if (result.ok !== true || result.untrusted !== true) return
-  if (tool === 'web_search' && Array.isArray(result.results)) {
+function inspectableText(tool: string, result: Output): InspectableText | undefined {
+  const isExternalTool = tool === 'web_search' || tool === 'web_fetch' || tool === 'browser_snapshot'
+  const untrustedExternal = result.ok === true && (isExternalTool || result.untrusted === true)
+  if (tool === 'web_search' && untrustedExternal && Array.isArray(result.results)) {
     const segments: Segment[] = []
     const hits = result.results.map((item: unknown) => {
       const hit = record(item)
@@ -110,31 +163,60 @@ function externalText(tool: string, result: Output): ExternalText | undefined {
     })
     return {
       segments,
+      admissible: true,
       render: visible => ({ ...result, results: hits.map(({ hit, title, snippet }) => {
         if ([...title, ...snippet].some(segment => segment.blocked)) return { notice: quarantined }
-        return { ...record(hit), title: title.map(visible).join(''), snippet: snippet.map(visible).join('') }
+        return { ...record(hit), title: joinVisible(title, visible), snippet: joinVisible(snippet, visible) }
       }) }),
     }
   }
-  if (tool !== 'web_fetch' && (tool !== 'browser_snapshot' || typeof result.url !== 'string')) return
-  const title = textSegments(result.title, 'page title')
-  const text = textSegments(result.text, 'page content')
-  const elements = Array.isArray(result.elements) ? result.elements.map(item => {
-    const element = record(item)
-    const labels = textSegments(element?.label, 'element label')
-    return { element, labels }
-  }) : undefined
-  return {
-    segments: [...title, ...text, ...elements?.flatMap(({ labels }) => labels) ?? []],
-    render: visible => ({ ...result, title: title.map(visible).join(''), text: text.map(visible).join(''),
-      ...(elements && { elements: elements.map(({ element, labels }) => labels.some(segment => segment.blocked)
-        ? { notice: quarantined } : { ...element, label: labels.map(visible).join('') }) }) }),
+  if (untrustedExternal && (tool === 'web_fetch' || tool === 'browser_snapshot' ||
+    typeof result.text === 'string' || typeof result.title === 'string' || Array.isArray(result.elements))) {
+    const title = textSegments(result.title, 'page title')
+    const text = textSegments(result.text, 'page content')
+    const elements = Array.isArray(result.elements) ? result.elements.map(item => {
+      const element = record(item)
+      const labels = textSegments(element?.label, 'element label')
+      return { element, labels }
+    }) : undefined
+    return {
+      segments: [...title, ...text, ...elements?.flatMap(({ labels }) => labels) ?? []],
+      admissible: isExternalTool,
+      render: visible => ({ ...result, title: joinVisible(title, visible), text: joinVisible(text, visible),
+        ...(elements && { elements: elements.map(({ element, labels }) => labels.some(segment => segment.blocked)
+          ? { notice: quarantined } : { ...element, label: joinVisible(labels, visible) }) }) }),
+    }
   }
-}
-
-function sampled<T>(items: readonly T[]): readonly T[] {
-  if (items.length <= batchLimit) return items
-  return Array.from({ length: batchLimit }, (_, index) => items[Math.floor(index * (items.length - 1) / (batchLimit - 1))]!)
+  if (tool === 'process_output' && result.ok === true && Array.isArray(result.frames)) {
+    const segments: Segment[] = []
+    const frames = result.frames.map(item => {
+      const row = record(item)
+      const stream = row?.stream === 'stderr' ? 'stderr' : 'stdout'
+      const parts = row ? textSegments(row.text, stream) : []
+      segments.push(...parts)
+      return { row, item, parts }
+    })
+    return {
+      segments,
+      admissible: false,
+      render: visible => ({ ...result, frames: frames.map(({ row, item, parts }) => row
+        ? parts.some(part => part.blocked) ? { ...row, text: quarantined } : { ...row, text: parts.map(visible).join('') }
+        : item) }),
+    }
+  }
+  if (tool === 'run_project_command' && (typeof result.stdout === 'string' || typeof result.stderr === 'string')) {
+    const stdout = textSegments(result.stdout, 'stdout')
+    const stderr = textSegments(result.stderr, 'stderr')
+    return {
+      segments: [...stdout, ...stderr],
+      admissible: false,
+      render: visible => ({ ...result,
+        ...(typeof result.stdout === 'string' && { stdout: stdout.map(visible).join('') }),
+        ...(typeof result.stderr === 'string' && { stderr: stderr.map(visible).join('') }),
+      }),
+    }
+  }
+  return undefined
 }
 
 async function rankFiles(judgment: LocalJudgment, event: EventDraft, operationId: string, tool: string, goal: string,
@@ -147,36 +229,17 @@ async function rankFiles(judgment: LocalJudgment, event: EventDraft, operationId
   const pathOf = (entry: unknown) => typeof entry === 'string' ? entry : record(entry)?.path
   const paths = [...new Set(hits.map(pathOf).filter((path): path is string => typeof path === 'string'))]
   if (paths.length < 2) return result
-  const choices = sampled(paths)
-  const verdicts = await judgment.decideBatch(event, 'files.locate', { goal, tool, candidateCount: paths.length },
-    choices.map(path => ({ baseline: false, label: basename(path).slice(0, 160) })), [operationId], { signal })
-  const matches = new Set(choices.filter((_, index) => verdicts[index]))
+  const batches = chunkArray(paths, batchLimit)
+  const batchVerdicts = await mapLimited(batches, batchConcurrency, batch =>
+    judgment.decideBatch(event, 'files.locate', { goal, tool, candidateCount: paths.length },
+      batch.map(path => ({ baseline: false, label: basename(path).slice(0, 160) })), [operationId], { signal }))
+  const matches = new Set<string>()
+  batches.forEach((batch, batchIndex) => {
+    const verdicts = batchVerdicts[batchIndex] ?? []
+    batch.forEach((path, itemIndex) => { if (verdicts[itemIndex]) matches.add(path) })
+  })
   if (!matches.size) return result
   return { ...result, [field]: [...hits.filter(hit => matches.has(pathOf(hit) as string)), ...hits.filter(hit => !matches.has(pathOf(hit) as string))] }
-}
-
-function localAdmission(tool: string, result: Output): ExternalText | undefined {
-  const field = tool === 'search_content' ? 'matches' : tool === 'process_output' ? 'frames' : undefined
-  if (!field || !Array.isArray(result[field]) || result.ok !== true) return
-  const seen = new Set<string>()
-  const entries = result[field].map(row => {
-    const text = typeof row?.text === 'string' ? row.text : ''
-    const repeated = seen.has(text)
-    seen.add(text)
-    const finding = /\b(?:fail(?:ed|ure)?|error|warn(?:ing)?|fatal|panic|exception|diagnostics?)\b/iu.test(text)
-    const stream = row?.stream === 'stderr' ? 'stderr' : 'stdout'
-    const segment: Segment = {
-      field: field === 'matches' && typeof row?.path === 'string' ? basename(row.path).slice(0, 120)
-        : stream + (repeated ? ', repeated line' : ', ordinary line'),
-      text,
-      alwaysRetain: field === 'frames' && (stream === 'stderr' || finding),
-    }
-    return { row, segment }
-  })
-  return {
-    segments: entries.map(({ segment }) => segment),
-    render: visible => ({ ...result, [field]: entries.map(({ row, segment }) => ({ ...row, text: visible(segment) })) }),
-  }
 }
 
 export async function judgeToolResult(judgment: LocalJudgment, archive: ToolEvidenceArchive, event: EventDraft, operationId: string,
@@ -186,42 +249,54 @@ export async function judgeToolResult(judgment: LocalJudgment, archive: ToolEvid
   const ranked = await rankFiles(judgment, event, operationId, tool, goal, result, signal)
   const injectionMode = judgment.mode('tool.injection', event.taskId)
   const admissionMode = judgment.mode('tool.admission', event.taskId)
-  const external = externalText(tool, ranked)
-  if (!external && admissionMode === 'off') return { value: ranked }
-  const output = external ?? (admissionMode !== 'off' ? localAdmission(tool, ranked) : undefined)
+  const output = inspectableText(tool, ranked)
   if (!output?.segments.length || signal.aborted) return { value: ranked }
-  const { segments } = output
+  const { segments, admissible } = output
   const bytes = segments.reduce((sum, segment) => sum + Buffer.byteLength(segment.text), 0)
-  if (external) {
-    // Deterministic matches are never reversed by a judge and remain active across off/shadow/active modes.
-    const known = segments.map(segment => knownInjection.test(segment.text))
-    for (let index = 1; index < segments.length; index++) {
-      const previous = segments[index - 1]
-      const current = segments[index]
-      const left = previous.text.slice(-120)
-      const right = current.text.slice(0, 120)
-      if (previous.group === current.group && !knownInjection.test(left) && !knownInjection.test(right) &&
-        knownInjection.test(left + right)) {
-        known[index - 1] = true
-        known[index] = true
-      }
-    }
-    segments.forEach((segment, index) => { if (known[index]) segment.blocked = true })
-    if (injectionMode !== 'off') {
-      const sample = sampled(segments.map((segment, index) => ({ segment, index })))
-      const verdicts = await judgment.decideBatch(event, 'tool.injection', { tool, bytes, candidateCount: segments.length },
-        sample.map(({ segment, index }) => ({ baseline: known[index], label: segment.field, excerpt: segment.text })), [operationId], { signal })
-      if (injectionMode === 'active' && !signal.aborted && judgment.mode('tool.injection', event.taskId) === 'active') {
-        sample.forEach(({ segment }, index) => { if (verdicts[index]) segment.blocked = true })
-      }
+  // Deterministic regex scan covers every segment and seam boundary across off/shadow/active modes.
+  const known = segments.map(segment => knownInjection.test(segment.text))
+  for (let index = 1; index < segments.length; index++) {
+    const previous = segments[index - 1]!
+    const current = segments[index]!
+    const left = previous.text.slice(-seamOverlapChars)
+    const right = current.text.slice(0, seamOverlapChars)
+    if (previous.group === current.group && !knownInjection.test(left) && !knownInjection.test(right) &&
+      knownInjection.test(left + right)) {
+      known[index - 1] = true
+      known[index] = true
     }
   }
-  if (admissionMode !== 'off' && bytes >= minAdmissionBytes && !signal.aborted) {
-    const sample = sampled(segments.filter(segment => !segment.blocked && !segment.alwaysRetain))
-    const decisions = await judgment.decideBatch(event, 'tool.admission', { goal, tool, bytes, candidateCount: segments.length },
-      sample.map(segment => ({ baseline: true, label: segment.field, excerpt: external ? segment.text : undefined })), [operationId], { signal })
-    if (canReplay && judgment.mode('tool.admission', event.taskId) === 'active') {
-      sample.forEach((segment, index) => { segment.dismissed = decisions[index] === false })
+  segments.forEach((segment, index) => { if (known[index]) segment.blocked = true })
+  if (injectionMode !== 'off' && !signal.aborted) {
+    const entries = segments.map((segment, index) => {
+      const prev = index > 0 ? segments[index - 1] : undefined
+      const excerpt = prev && prev.group === segment.group
+        ? prev.text.slice(-seamOverlapChars) + segment.text
+        : segment.text
+      return { segment, baseline: known[index]!, label: segment.field, excerpt }
+    })
+    const batches = chunkArray(entries, batchLimit)
+    const batchVerdicts = await mapLimited(batches, batchConcurrency, batch =>
+      judgment.decideBatch(event, 'tool.injection', { tool, bytes, candidateCount: segments.length },
+        batch.map(({ baseline, label, excerpt }) => ({ baseline, label, excerpt })), [operationId], { signal }))
+    if (injectionMode === 'active' && !signal.aborted && judgment.mode('tool.injection', event.taskId) === 'active') {
+      batches.forEach((batch, batchIndex) => {
+        const verdicts = batchVerdicts[batchIndex] ?? []
+        batch.forEach(({ segment }, itemIndex) => { if (verdicts[itemIndex]) segment.blocked = true })
+      })
+    }
+  }
+  if (admissible && admissionMode !== 'off' && bytes >= minAdmissionBytes && !signal.aborted) {
+    const candidates = segments.filter(segment => !segment.blocked)
+    const batches = chunkArray(candidates, batchLimit)
+    const batchDecisions = await mapLimited(batches, batchConcurrency, batch =>
+      judgment.decideBatch(event, 'tool.admission', { goal, tool, bytes, candidateCount: candidates.length },
+        batch.map(segment => ({ baseline: true, label: segment.field, excerpt: segment.text })), [operationId], { signal }))
+    if (canReplay && !signal.aborted && judgment.mode('tool.admission', event.taskId) === 'active') {
+      batches.forEach((batch, batchIndex) => {
+        const decisions = batchDecisions[batchIndex] ?? []
+        batch.forEach((segment, itemIndex) => { segment.dismissed = decisions[itemIndex] === false })
+      })
     }
   }
   if (signal.aborted || !segments.some(segment => segment.blocked || segment.dismissed)) return { value: ranked }
@@ -232,7 +307,7 @@ export async function judgeToolResult(judgment: LocalJudgment, archive: ToolEvid
   if (!id) return { value: hasQuarantine ? { ...fullVisible,
     evidenceNote: 'Suspicious text was withheld. Local evidence could not be saved.' } : ranked }
   const visible = output.render(segment => segment.blocked ? quarantined
-    : segment.dismissed ? '[Excerpt omitted.]' : segment.text)
+    : segment.dismissed ? omittedNotice : segment.text)
   return { value: { ...visible, evidenceId: id,
     evidenceNote: 'Use read_tool_evidence with the evidenceId for the retained output. Quarantined text is withheld.' }, archiveId: id }
 }

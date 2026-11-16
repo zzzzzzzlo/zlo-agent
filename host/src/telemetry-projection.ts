@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { verificationVerdict } from '../../shared/contracts/domain.ts'
 import type { VerificationResult } from '../../shared/contracts/domain.ts'
-import { jevModel, jevReasons, judgmentPoints } from '../../shared/contracts/jev.ts'
+import { jevModel, jevReasons, judgmentPoints, retiredJudgmentPointIds } from '../../shared/contracts/jev.ts'
 import type { TelemetryEvent, TelemetryTask, TelemetryVerification } from '../../shared/contracts/observatory.ts'
 import { approvalKinds } from '../../shared/contracts/tool-approval.ts'
 import type { AgentEvent } from './contracts/domain.ts'
@@ -13,7 +13,7 @@ const reasons = 'user_stop host_shutdown process_interrupted model_error model_i
 const roles = ['root', 'team', 'worker'] as const
 const accessLevels = ['read', 'write', 'trusted'] as const
 const verificationEvidence = 'workspace_text_file_exists workspace_file_contains_expected_text workspace_command_passed project_command_exit_zero project_command_not_authorized project_command_previous_result project_command_effect_unknown workspace_command_not_authorized workspace_write_active verification_interrupted workspace_command_unavailable workspace_command_failed workspace_file_unavailable workspace_file_missing_expected_text node_unknown_effect'.split(' ')
-const points = judgmentPoints.map(({ id }) => id)
+const points = [...judgmentPoints.map(({ id }) => id), ...retiredJudgmentPointIds]
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu
 const hashPattern = /^sha256:[0-9a-f]{64}$/u
 
@@ -71,14 +71,14 @@ function judgment(p: Record<string, unknown>) {
   const input = obj(p.features)
   const features: Record<string, unknown> = {}
   for (const key of ['nodeCount', 'nodeOrdinal', 'goalLength', 'evidenceCount', 'artifactCount', 'completedChildren', 'replanCount',
-    'failedCount', 'writeCount', 'toolCount', 'length']) features[key] = num(input[key])
+    'failedCount', 'writeCount', 'toolCount', 'length', 'attemptCount']) features[key] = num(input[key])
   for (const key of ['teamCandidate', 'hasDependencies', 'nonEmptyGoal', 'independent', 'requested', 'checked', 'checkPassed',
     'checkConfigured', 'hasWrite', 'isRootChild', 'initial']) features[key] = bool(input[key])
   features.role = oneOf(input.role, roles)
   features.access = oneOf(input.access, accessLevels)
   features.status = oneOf(input.status, ['missing', ...states])
   features.tool = oneOf(input.tool, ['web_search', 'web_fetch', 'browser_snapshot', 'process_output',
-    'search_files', 'search_content', 'read_text_file', 'git_diff'])
+    'run_project_command', 'search_files', 'search_content', 'read_text_file', 'git_diff'])
   if (Array.isArray(input.candidates)) features.candidates = list(input.candidates, 8).map(value => {
     const c = obj(value)
     return { index: num(c.index), providerKey: ref(c.providerKey), modelKey: ref(c.modelKey), contextWindow: num(c.contextWindow),

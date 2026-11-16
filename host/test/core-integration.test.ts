@@ -167,8 +167,9 @@ test('Phase 2 judges run at real tool, worker, and turn boundaries with bounded 
         assert.ok(JSON.stringify(evidence).includes(publicText))
         return 'The files were written. I still need a local verification pass.'
       }
-      assert.match(prompt, rootPasses === 2 ? /Before closing/ : /Continue any unfinished work/)
+      assert.match(prompt, /Before closing/)
       assert.equal(ok(await call('web_fetch', {})), false)
+      assert.ok(ok(await call('edit_text_file', { path: 'src/root.txt', oldText: 'root artifact', newText: 'verified root artifact' })))
       assert.ok(ok(await call('read_text_file', { path: 'src/root.txt' })))
       return 'Verified the current root file.'
     } catch (error) { scriptError = error; throw error }
@@ -177,7 +178,7 @@ test('Phase 2 judges run at real tool, worker, and turn boundaries with bounded 
     const { questions } = JSON.parse(String(init?.body)) as { questions: Record<string, { instructions: string }> }
     return Response.json({ model: 'jev-1.14.0', usage: { input_tokens: 38, output_tokens: 8 },
       answers: Object.fromEntries(Object.entries(questions).map(([id, question]) => {
-        const supportsFollowUp = /At this completion boundary|Did the agent stop before/i.test(question.instructions)
+        const supportsFollowUp = /At this completion claim/i.test(question.instructions)
         const workerDone = /Worker delivered/i.test(String(init?.body))
         const flagPatch = /reported changes appear unrelated/i.test(question.instructions)
         return [id, { type: 'noul', noul: (supportsFollowUp && !workerDone) || flagPatch ? 0.99 : 0.01 }]
@@ -187,17 +188,17 @@ test('Phase 2 judges run at real tool, worker, and turn boundaries with bounded 
   try {
     const { settings } = await host.managementCommand({ schemaVersion: 1, type: 'getJevStatus' }) as JevStatus
     for (const { id } of phaseTwoJudgmentPoints) settings.modes[id] = 'active'
+    settings.modes['turn.completion'] = 'active'
     await host.managementCommand({ schemaVersion: 1, type: 'saveJevSettings', settings: { ...settings, enabled: true } })
     const { taskId } = await host.createTask({ requestId: 'phase-2', cwd: env.workspace, goal: 'Write scoped artifacts', workspaceAccess: 'write' })
     await host.idle()
     assert.ifError(scriptError)
-    assert.equal(rootPasses, 3)
+    assert.equal(rootPasses, 2)
     assert.equal(host.getTask(taskId).verification?.verdict, 'unverified')
     const evaluated = host.events(taskId).filter(event => event.type === 'judgment.evaluated' && event.payload.requestSent)
     const actual = new Set(evaluated.map(event => event.payload.id))
-    assert.deepEqual(actual, new Set(phaseTwoJudgmentPoints.map(({ id }) => id)))
-    assert.equal(evaluated.filter(event => event.payload.id === 'turn.completion').length, 1)
-    assert.equal(evaluated.filter(event => event.payload.id === 'turn.continue' && event.payload.output === true).length, 1)
+    assert.deepEqual(actual, new Set([...phaseTwoJudgmentPoints.map(({ id }) => id), 'turn.completion']))
+    assert.equal(evaluated.filter(event => event.payload.id === 'turn.completion' && event.payload.output === true).length, 1)
     assert.ok(!JSON.stringify(evaluated).includes(publicText.slice(0, 100)))
   } finally {
     await host.close()
@@ -542,7 +543,7 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
     const phaseOneDecisions = events.filter(item => item.type === 'judgment.evaluated' && phaseOneIds.has(String(item.payload.id)))
     const decisions = new Set(phaseOneDecisions.map(item => item.payload.id))
     assert.deepEqual([...decisions].sort(), ['collaboration.mode', 'context.relevance', 'delegation.worth',
-      'handoff.sufficiency', 'model.task_fit', 'task.replan'])
+      'model.task_fit', 'task.replan', 'turn.completion'])
     for (const decision of phaseOneDecisions) {
       const { baseline, output, candidates, features, resultLink } = decision.payload
       assert.ok(Array.isArray(candidates) && candidates.includes(baseline) && candidates.includes(output))
@@ -554,8 +555,10 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
       if (decision.payload.id === 'collaboration.mode' || decision.payload.id === 'task.replan') {
         assert.ok(events.some(item => item.type === 'task.plan_changed' && item.correlationId === link.planRequestId))
       }
-      if (decision.payload.id === 'handoff.sufficiency') {
-        assert.ok(events.some(item => item.type === 'task.node_settled' && item.taskAttemptId === link.taskAttemptId))
+      if (decision.payload.id === 'turn.completion') {
+        assert.ok(decision.taskNodeId === task.rootNodeId
+          ? events.some(item => item.type === 'task.state_changed' && item.payload.status === 'succeeded')
+          : events.some(item => item.type === 'task.node_settled' && item.taskAttemptId === link.taskAttemptId))
       }
     }
     const teams = events.filter(item => item.type === 'agent.started' && item.payload.role === 'team')

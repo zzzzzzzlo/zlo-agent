@@ -342,7 +342,7 @@ function judgmentLinks(events: TelemetryEvent[]) {
     const node = text(link?.taskNodeId) ?? event.taskNodeId
     const attempt = text(link?.taskAttemptId) ?? event.taskAttemptId
     const candidates = [plan ? plans.get(plan) : undefined, receipt ? receipts.get(receipt) : undefined]
-    if ((point === 'handoff.sufficiency' || point === 'swarm.patch') && node && attempt) candidates.push(settlements.get(`${node}:${attempt}`))
+    if ((point === 'handoff.sufficiency' || point === 'turn.completion' || point === 'swarm.patch') && node && attempt) candidates.push(settlements.get(`${node}:${attempt}`))
     if (agent && point === 'memory.capture') candidates.push((related.get(`${agent}:memory.captured`) ?? [])
       .find(candidate => candidate.seq > event.seq))
     const toolDecision = ['tool.admission', 'tool.injection', 'files.locate'].includes(point ?? '')

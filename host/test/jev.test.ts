@@ -55,7 +55,17 @@ test('System One routes keep credentials bound to the exact endpoint and preserv
     assert.equal(migrated?.enabled, true)
     assert.equal(migrated?.modes['collaboration.mode'], 'shadow')
     assert.equal(migrated?.modes['tool.admission'], 'off')
-    assert.equal(Object.keys(migrated?.modes ?? {}).length, 16)
+    assert.equal(Object.keys(migrated?.modes ?? {}).length, judgmentPoints.length)
+    const oldSixteenModes = {
+      'collaboration.mode': 'shadow', 'delegation.worth': 'off', 'model.task_fit': 'off', 'context.relevance': 'off',
+      'handoff.sufficiency': 'off', 'task.replan': 'off', 'input.preflight': 'off', 'task.frame': 'off',
+      'skills.disclosure': 'off', 'tool.admission': 'off', 'memory.capture': 'off', 'files.locate': 'off',
+      'tool.injection': 'off', 'turn.completion': 'shadow', 'turn.continue': 'active', 'swarm.patch': 'off',
+    }
+    assert.equal(parseJevSettings({ ...original, modes: oldSixteenModes }), undefined)
+    const migratedSixteen = parseJevSettings({ ...original, modes: oldSixteenModes }, true)
+    assert.equal(migratedSixteen?.modes['turn.completion'], 'active')
+    assert.equal(Object.keys(migratedSixteen?.modes ?? {}).length, judgmentPoints.length)
     const openCode = { ...original, enabled: true, provider: 'opencode' as const, endpoint: openCodeJudgeEndpoint,
       model: openCodeFreeJudgeModel, modes: { ...original.modes, [point]: 'shadow' as const } }
     const custom = { ...openCode, provider: 'custom' as const, endpoint: 'https://example.com/v1/systemone', model: 'vendor/decision-2' }
@@ -181,15 +191,22 @@ test('Jev falls back on transport failure, malformed or uncertain decisions, inv
   }
 })
 
-test('Jev persists task budget, tests with synthetic evidence and isolates per-point configuration changes', async () => {
+test('Jev enforces no local request limit, supports smart circuit breakers and 64k-scale evidence, and isolates per-point changes', async () => {
   const started = Promise.withResolvers<void>()
   const release = Promise.withResolvers<void>()
   let waiting = false
   let calls = 0
+  let sawLargeGoal = false
+  let sawLargeSummary = false
   const { store, settings, last, decide } = fixture(async (_url, init) => {
     calls++
     const { state } = JSON.parse(String(init?.body))
     if (state.sample) assert.deepEqual(state, { sample: 'The build passed.' })
+    if (typeof state.goal === 'string' && state.goal.length === 2400) sawLargeGoal = true
+    if (typeof state.summary === 'string' && state.summary.length > 4000) {
+      sawLargeSummary = true
+      assert.ok(!state.summary.includes(key))
+    }
     if (waiting) { started.resolve(); await release.promise }
     return valid()
   })
@@ -200,7 +217,7 @@ test('Jev persists task budget, tests with synthetic evidence and isolates per-p
     next.enabled = true
     next.modes[point] = 'active'
     settings.save({ ...next, modes: { ...next.modes } })
-    for (let i = 0; i < 29; i++) assert.equal(await decide(), false)
+    for (let i = 0; i < 65; i++) assert.equal(await decide(), false)
     waiting = true
     const unaffected = decide()
     await started.promise
@@ -224,11 +241,40 @@ test('Jev persists task budget, tests with synthetic evidence and isolates per-p
     assert.equal(last().mode, 'off')
     settings.save(next)
     assert.equal(await decide(), false)
-    assert.equal(await decide(), false)
-    assert.equal(await decide(), true)
-    assert.equal(last().fallbackReason, 'budget_exhausted')
-    assert.equal(calls, 33)
+    const bigGoal = 'G'.repeat(2400)
+    const bigSummary = 'S'.repeat(5000) + ' ' + key
+    assert.equal(await decide({ goal: bigGoal, summary: bigSummary }), false)
+    assert.equal(sawLargeGoal, true)
+    assert.equal(sawLargeSummary, true)
+    assert.equal(calls, 69)
   } finally { store.close() }
+})
+
+test('Jev fast circuit-breaks permanent/config errors and resets cleanly on test() or credential updates', async () => {
+  for (const [status, expectedReason] of [[401, 'unauthorized'], [402, 'billing'], [404, 'invalid_model']] as const) {
+    let calls = 0
+    let recover = false
+    const { store, settings, last, decide } = fixture(async () => {
+      calls++
+      return recover ? valid() : new Response(key, { status })
+    })
+    try {
+      const { settings: next } = settings.status()
+      settings.save({ ...next, enabled: true, modes: { ...next.modes, [point]: 'active' } })
+      assert.equal(await decide(), true)
+      assert.equal(last().fallbackReason, expectedReason)
+      assert.equal(last().requestSent, true)
+      assert.equal(await decide(), true)
+      assert.equal(last().fallbackReason, expectedReason)
+      assert.equal(last().requestSent, false)
+      assert.equal(calls, 1)
+      recover = true
+      const probed = await settings.test()
+      assert.equal(probed.connection.state, 'connected')
+      assert.equal(await decide(), false)
+      assert.equal(calls, 3)
+    } finally { store.close() }
+  }
 })
 
 test('P1-5: Jev aborts hung HTTP 200 body streams on deadline and circuit-breaks consecutive timeouts', async () => {

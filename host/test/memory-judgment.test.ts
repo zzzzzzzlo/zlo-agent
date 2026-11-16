@@ -132,7 +132,7 @@ test('judgment enforces baseline and allowed choices across off, shadow and acti
   try {
     const calls: string[] = []
     const judgment = new LocalJudgment(store, {
-      modes: { 'collaboration.mode': 'shadow', 'delegation.worth': 'active', 'handoff.sufficiency': 'active' },
+      modes: { 'collaboration.mode': 'shadow', 'delegation.worth': 'active', 'turn.completion': 'active' },
       judge: {
         async evaluate(request) {
           calls.push(request.id)
@@ -149,8 +149,8 @@ test('judgment enforces baseline and allowed choices across off, shadow and acti
       privatePrompt: secret, nodeCount: 2, nodeOrdinal: 1, teamCandidate: true, hasDependencies: false,
     }, 'worker', ['worker', 'team'], ['node-1', secret]), 'worker')
     assert.equal(await judgment.decide(event, 'delegation.worth', {}, false, [false]), false)
-    assert.equal(await judgment.decide(event, 'handoff.sufficiency', {}, true, [false, true]), true)
-    assert.deepEqual(calls, ['collaboration.mode', 'delegation.worth', 'handoff.sufficiency'])
+    assert.equal(await judgment.decide(event, 'turn.completion', {}, true, [false, true]), true)
+    assert.deepEqual(calls, ['collaboration.mode', 'delegation.worth', 'turn.completion'])
     const payloads = store.events('task').map(({ payload }) => payload)
     assert.deepEqual(payloads.map(({ judgeStatus }) => judgeStatus), ['baseline', 'valid', 'invalid', 'failed'])
     assert.equal(payloads[1].shadow, 'team')
