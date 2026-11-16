@@ -56,7 +56,7 @@ npm.cmd --prefix observatory start
 | Tools | 按持久化操作回执统计失败率。文件修改次数以去重目标为分母，目标使用本机密钥及工作区作用域生成的 HMAC 摘要。视觉首轮零错率和轮数使用 `visual.preview_finished` 的实际渲染结果，缺少错误计数时保留未知。 |
 | Context | `context.compacted` 记录压缩前后估算 Token；预留记录请求的输入估算、输出与任务上限；Scope Context 的字节数和预算来自召回埋点。 |
 | Memory | 采集及召回按事件数量、注入数量与观测耗时计算。注入表示进入上下文，实际是否影响决策、单独模型费用未知。 |
-| Judgment | 按十六个决策点、模式、特征版本聚合，提供 Shadow 分歧率与 Judge 异常回退率对比用于晋升决策。 |
+| Judgment | 按决策 ID、模式和特征版本聚合，提供 Shadow 分歧率与 Judge 异常回退率。当前注册 14 个决策点，历史记录沿用采集时的 ID。 |
 | Reliability | Host 结束原因、停止和恢复、回执核对、模型输出恢复、序号缺口及未配对项。 |
 | Security | 读取记录的权限变化、批准与拒绝、策略拦截及高风险回执。 |
 | Evaluation | 按当前选中的 TaskRun 和评估创建时间汇总独立确定性/AI 评估通过率，提供 `0–5` 三维均分。Host 确定性验收使用单独的指标。 |

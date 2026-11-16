@@ -9,6 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { _electron as electron } from 'playwright-core'
+import { judgmentPoints, retiredJudgmentPointIds } from '../../shared/contracts/jev.ts'
 
 const appPath = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const require = createRequire(import.meta.url)
@@ -713,7 +714,7 @@ test('Windows Electron settings persist a custom provider and expose its model a
     }
   })
 
-test('Windows Electron configures Jev through Main, shows sixteen points and protects the credential',
+test('Windows Electron configures Jev through Main, shows the registered points and protects the credential',
   { skip: process.platform !== 'win32', timeout: 60000 }, async () => {
     const data = await mkdtemp(join(tmpdir(), 'zlo-electron-jev-'))
     const key = 'synthetic-jev-desktop-canary'
@@ -737,8 +738,12 @@ test('Windows Electron configures Jev through Main, shows sixteen points and pro
       }
       const models = await openJev(page)
       const actual = () => page.evaluate(() => window.agentManagement.getJevStatus())
-      assert.equal(Object.keys((await actual()).settings.modes).length, 16)
-      assert.ok(Object.values((await actual()).settings.modes).every(mode => mode === 'off'))
+      const registered = judgmentPoints.map(point => point.id)
+      const initialModes = (await actual()).settings.modes
+      assert.deepEqual(Object.keys(initialModes).sort(), [...registered].sort())
+      assert.ok(Object.values(initialModes).every(mode => mode === 'off'))
+      for (const point of registered) await models.getByText(point, { exact: true }).waitFor()
+      for (const point of retiredJudgmentPointIds) assert.equal(await models.getByText(point, { exact: true }).count(), 0)
       await models.getByRole('button', { name: '添加 API Key' }).click()
       await models.getByText('API Key 已加密保存，待测试').waitFor()
       assert.ok(!(await readFile(join(data, 'jev-credentials.bin'))).includes(Buffer.from(key)))
@@ -748,12 +753,14 @@ test('Windows Electron configures Jev through Main, shows sixteen points and pro
       await models.getByRole('combobox', { name: '模型适配模式' }).selectOption('active')
       await models.getByRole('checkbox', { name: '启用工具输出筛选' }).check()
       await models.getByRole('combobox', { name: '工具输出筛选模式' }).selectOption('active')
+      await models.getByRole('checkbox', { name: '启用完成与交付审查' }).check()
       await models.getByRole('button', { name: '保存 Jev 设置' }).click()
       await eventually(async () => (await actual()).settings.enabled)
       assert.equal((await actual()).settings.modes['collaboration.mode'], 'shadow')
       assert.equal((await actual()).settings.modes['model.task_fit'], 'active')
       assert.equal((await actual()).settings.modes['task.replan'], 'off')
       assert.equal((await actual()).settings.modes['tool.admission'], 'active')
+      assert.equal((await actual()).settings.modes['turn.completion'], 'shadow')
       assert.ok(!JSON.stringify(await actual()).includes(key))
       assert.ok(!(await page.content()).includes(key))
       await app.close()
@@ -763,6 +770,7 @@ test('Windows Electron configures Jev through Main, shows sixteen points and pro
       assert.equal(await restoredModels.getByRole('checkbox', { name: '全局启用 Jev' }).isChecked(), true)
       assert.equal(await restoredModels.getByRole('combobox', { name: '模型适配模式' }).inputValue(), 'active')
       assert.equal(await restoredModels.getByRole('combobox', { name: '工具输出筛选模式' }).inputValue(), 'active')
+      assert.equal(await restoredModels.getByRole('combobox', { name: '完成与交付审查模式' }).inputValue(), 'shadow')
       await app.evaluate(({ dialog }) => { dialog.showMessageBox = async () => ({ response: 1 }) })
       await restoredModels.getByRole('combobox', { name: '判定供应商' }).selectOption('opencode')
       assert.equal(await restoredModels.getByLabel('API Endpoint').inputValue(), 'https://opencode.ai/inference/systemone/v1/systemone')
