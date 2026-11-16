@@ -80,7 +80,7 @@ export function startDashboard(options: { port: number; token: string; database:
       const evaluations = database.jobs()
       const metrics = buildMetrics(tasks, events, Date.now(), filter, { usdToCnyRate, evaluations })
       const selected = new Set(metrics.taskIds)
-      json(res, { tasks: tasks.filter(task => selected.has(task.id)), metrics, evaluations, usdToCnyRate, health: collector.health() })
+      json(res, { tasks: tasks.filter(task => selected.has(task.id)), metrics, usdToCnyRate, health: collector.health() })
       return
     }
     const trace = tracePath.exec(url.pathname)

@@ -307,7 +307,7 @@ test('expanded completion metrics measure Pass@1, self-repair, steering, edit ch
     { schemaVersion: 1, id: 'r7', seq: 7, occurredAt: iso(70), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-1', agentRunId: 'ar1', correlationId: 'res-fail', type: 'model.reservation_settled', payload: { status: 'settled', actualTokens: 40, estimatedCostUsd: 0.01 } },
     { schemaVersion: 1, id: 'r8', seq: 8, occurredAt: iso(70), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-1', agentRunId: 'ar1', correlationId: 'res-fail', type: 'model.usage', payload: { input: 20, output: 10, cacheRead: 10, cacheWrite: 0, estimatedCostUsd: 0.01 } },
     { schemaVersion: 1, id: 'r9', seq: 9, occurredAt: iso(75), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-1', agentRunId: 'ar1', type: 'agent.finished', payload: { role: 'root', status: 'failed' } },
-    { schemaVersion: 1, id: 'r10', seq: 10, occurredAt: iso(110), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-2', agentRunId: 'ar2', type: 'visual.round_finished', payload: { round: 1, rendered: true, runtimeErrors: 0 } },
+    { schemaVersion: 1, id: 'r10', seq: 10, occurredAt: iso(110), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-2', agentRunId: 'ar2', type: 'visual.preview_finished', payload: { round: 1, rendered: true, runtimeErrors: 0 } },
     { schemaVersion: 1, id: 'r11', seq: 11, occurredAt: iso(200), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-2', agentRunId: 'ar2', type: 'task.state_changed', payload: { status: 'succeeded' } },
   ]
   const evals = [{
@@ -345,4 +345,15 @@ test('expanded completion metrics measure Pass@1, self-repair, steering, edit ch
   assert.equal(byId.get('eval.completion_score')?.value, 5)
   assert.equal(byId.get('eval.correctness_score')?.value, 4)
   assert.equal(byId.get('eval.quality_score')?.value, 5)
+
+  const missingErrors = t2Events.map(event => event.type === 'visual.preview_finished'
+    ? { ...event, payload: { round: 1, rendered: true } } : event)
+  const partial = buildMetrics([task2], missingErrors)
+  assert.equal(partial.domains.tools.find(metric => metric.id === 'tool.visual_clean_rate')?.quality, 'unknown')
+  assert.equal(partial.domains.task.find(metric => metric.id === 'task.rigor_visual')?.value, 0)
+
+  const noMatchingTasks = buildMetrics([s1.task, task2], [...s1.events, ...t2Events], now + 400,
+    { model: 'unrelated-model' }, { evaluations: evals })
+  assert.equal(noMatchingTasks.domains.evaluation.find(metric => metric.id === 'eval.runs')?.value, 0)
+  assert.equal(noMatchingTasks.domains.evaluation.find(metric => metric.id === 'eval.pass_rate')?.value, null)
 })

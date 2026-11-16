@@ -177,9 +177,9 @@ export class LocalStore {
           sum(json_extract(e.event, '$.payload.output')) FILTER (WHERE json_extract(e.event, '$.type') = 'model.usage') AS output,
           sum(json_extract(e.event, '$.payload.cacheRead')) FILTER (WHERE json_extract(e.event, '$.type') = 'model.usage') AS cacheRead,
           sum(json_extract(e.event, '$.payload.cacheWrite')) FILTER (WHERE json_extract(e.event, '$.type') = 'model.usage') AS cacheWrite,
-          max(CASE WHEN json_extract(e.event, '$.type') = 'visual.round_finished'
+          max(CASE WHEN json_extract(e.event, '$.type') = 'visual.preview_finished'
             AND json_extract(e.event, '$.payload.rendered') = 1
-            AND coalesce(json_extract(e.event, '$.payload.runtimeErrors'), 0) = 0 THEN 1 ELSE 0 END) AS cleanVisual,
+            AND json_extract(e.event, '$.payload.runtimeErrors') = 0 THEN 1 ELSE 0 END) AS cleanVisual,
           count(*) FILTER (WHERE json_extract(e.event, '$.type') = 'model.output_recovery') AS outputRecoveries,
           count(*) FILTER (WHERE json_extract(e.event, '$.type') = 'task.resumed') AS resumes,
           count(*) FILTER (WHERE json_extract(e.event, '$.type') IN ('task.instruction_added', 'instruction.applied')) AS steerEvents,

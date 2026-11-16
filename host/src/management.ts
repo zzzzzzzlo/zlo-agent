@@ -13,6 +13,7 @@ import { redactProcessOutput } from './workspace-process.ts'
 export const providers: readonly ProviderId[] = ['openai', 'anthropic', 'google', 'deepseek']
 export const managementEventTypes = [
   'agent.started', 'agent.finished', 'model.route_changed', 'tool.approval_resolved', 'tool.started', 'model.usage', 'memory.recalled',
+  'task.created', 'task.state_changed', 'task.stopped', 'task.node_started', 'task.node_settled', 'task.worker_settled',
 ] as const
 export function providerId(value: unknown): ProviderId {
   if (typeof value !== 'string' || !providers.includes(value as ProviderId)) invalid('Unknown provider')
@@ -118,9 +119,12 @@ export function taskView(task: TaskSnapshot, events: AgentEvent[], operations: O
       typeof payload.status === 'string' && ['succeeded', 'failed', 'stopped', 'blocked', 'needs_reconciliation'].includes(payload.status)) {
       const current = nodeTimings.get(task.rootNodeId) ?? {}
       nodeTimings.set(task.rootNodeId, { ...current, finishedAt: timestamp })
+    } else if (event.type === 'task.state_changed' && payload.status === 'running' && timestamp !== undefined) {
+      const current = nodeTimings.get(task.rootNodeId)
+      nodeTimings.set(task.rootNodeId, { startedAt: current?.startedAt ?? timestamp })
     } else if (event.type === 'task.node_started' && taskNodeId && timestamp !== undefined) {
-      const current = nodeTimings.get(taskNodeId) ?? {}
-      nodeTimings.set(taskNodeId, { ...current, startedAt: current.startedAt ?? timestamp })
+      const current = nodeTimings.get(taskNodeId)
+      nodeTimings.set(taskNodeId, { startedAt: current?.startedAt ?? timestamp })
     } else if ((event.type === 'task.node_settled' || event.type === 'task.worker_settled') && taskNodeId && timestamp !== undefined) {
       const current = nodeTimings.get(taskNodeId) ?? {}
       nodeTimings.set(taskNodeId, { ...current, finishedAt: timestamp })

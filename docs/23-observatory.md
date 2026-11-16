@@ -45,21 +45,21 @@ npm.cmd --prefix observatory start
 
 ## 指标与 Trace
 
-首页展示 24 项核心指标，二级页面显示明细和样本覆盖。每项指标的单位、定义、样本数或分母由 `buildMetrics` 的定义和 API 输出提供。时间范围选中 TaskRun 后，任务结果和 DAG 使用完整运行快照，事件及调用指标按时间、角色和模型过滤。
+首页展示核心指标，二级页面显示明细和样本覆盖。每项指标的单位、定义、样本数或分母由 `buildMetrics` 的定义和 API 输出提供。时间范围选中 TaskRun 后，任务结果和 DAG 使用完整运行快照，事件及调用指标按时间、角色和模型过滤。
 
 | 领域 | 采集来源与计算 |
 | --- | --- |
 | Task | `verification.finished.executionStatus` 达到验收阶段的当前尝试 / 选中已结束 Run。包含确定性验收率、首轮一次通过率 (Pass@1)、挫败自主修复率、人工纠偏介入率、T0-T3 验证证据强度分级、返工重试 Token 损耗率与失败率。停止和阻塞单列。 |
 | Task DAG | 权威节点和依赖边、计划变更及尝试事件，含多节点子目标达成率。关键路径按最近结算的节点尝试与显式依赖计算，不把父节点和并行分支叠加。 |
-| Multi-Agent | `agent.started/finished` 配对 AgentRun，节点开始和结算配对委派。计算并发峰值、累计耗时与区间并集墙钟之比（多 Agent 并行加速比 `agents.parallel_speedup`）。 |
+| Multi-Agent | `agent.started/finished` 配对 AgentRun，节点开始和结算配对委派。计算并发峰值与运行重叠倍数（历史指标 ID `agents.parallel_speedup`），后者是已结束生命周期总长度除以区间并集长度，包含 Agent 的等待时间。 |
 | Model | 以预留、核销和用量的相关 ID 配对。统计输入、输出、缓存读写与提示词缓存命中率；目录美元估价按 `ZLO_USD_TO_CNY_RATE` 折算人民币成本及单次确定性达标成本；未覆盖费用和实际账单未知。 |
-| Tools | 按持久化操作回执与不漏路径的 SHA-256 目标摘要统计失败率、文件修改折腾指数（写入次/目标文件数）及前端视觉闭环首轮零错率与收敛轮数。 |
+| Tools | 按持久化操作回执统计失败率。文件修改次数以去重目标为分母，目标使用本机密钥及工作区作用域生成的 HMAC 摘要。视觉首轮零错率和轮数使用 `visual.preview_finished` 的实际渲染结果，缺少错误计数时保留未知。 |
 | Context | `context.compacted` 记录压缩前后估算 Token；预留记录请求的输入估算、输出与任务上限；Scope Context 的字节数和预算来自召回埋点。 |
 | Memory | 采集及召回按事件数量、注入数量与观测耗时计算。注入表示进入上下文，实际是否影响决策、单独模型费用未知。 |
 | Judgment | 按十六个决策点、模式、特征版本聚合，提供 Shadow 分歧率与 Judge 异常回退率对比用于晋升决策。 |
 | Reliability | Host 结束原因、停止和恢复、回执核对、模型输出恢复、序号缺口及未配对项。 |
 | Security | 读取记录的权限变化、批准与拒绝、策略拦截及高风险回执。 |
-| Evaluation | 汇总独立确定性/AI 评估通过率及 `0–5` 三维均分（与 Host 确定性验收结论严格分离）。 |
+| Evaluation | 按当前选中的 TaskRun 和评估创建时间汇总独立确定性/AI 评估通过率，提供 `0–5` 三维均分。Host 确定性验收使用单独的指标。 |
 
 `measured` 表示当前样本的直接计量，`estimated` 表示来源或计算本身为估算，`unknown` 表示没有完整可确认数据，`not_applicable` 表示样本明确不适用。估算价格与用量覆盖并列，缺失价格不作为零。Trace 时间线按 TaskRun、Attempt、Node、AgentRun、父 AgentRun 和相关 ID 连接原始投影；详情链接可定位单条事件。任务墙钟跨度、模型请求累计时长、模型时间覆盖、Agent 时间覆盖和依赖等待分别计算。
 

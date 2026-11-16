@@ -148,7 +148,9 @@ function safePayload(type: string, p: Record<string, unknown>): Record<string, u
       return { id: ref(p.id), tool: label(p.tool), effect: oneOf(p.effect, ['read', 'write']), status, managed: bool(p.managed), approved: bool(p.approved),
         reason: oneOf(p.reason, ['policy', 'approval_safety', 'repeated_failure', 'approval_unattended', 'tool_result_failed', 'tool_exception', 'nonzero_exit', 'tool_cancelled']),
         approvalKind: oneOf(p.approvalKind, approvalKinds), automatic: bool(p.automatic),
-        ...(type === 'tool.finished' && Array.isArray(p.targetDigests) ? { targetDigests: refs(p.targetDigests) } : {}) }
+        ...(type === 'tool.finished' && Array.isArray(p.targetDigests) ? {
+          targetDigests: list(p.targetDigests, 12).filter(value => typeof value === 'string' && hashPattern.test(value)),
+        } : {}) }
     case 'task.permissions_changed': return { access: oneOf(p.access, accessLevels), previousAccess: oneOf(p.previousAccess, accessLevels) }
     case 'operation.reconciliation_required': case 'operation.reconciliation_checked':
     case 'operation.reconciliation_acknowledged': case 'task.reconciliation_resolved': return { status, reason,

@@ -222,7 +222,13 @@ function modelMetrics(spans: TraceSpan[], complete: boolean, usdToCnyRate: numbe
   ]
 }
 
-const fileWriteTools = new Set(['create_text_file', 'edit_text_file', 'delete_text_file', 'apply_patch'])
+const fileWriteTools = new Set(['create_text_file', 'edit_text_file', 'delete_file', 'apply_patch'])
+
+function cleanPreview(event: TelemetryEvent): boolean | undefined {
+  if (event.payload.rendered === false) return false
+  const errors = quantity(event.payload.runtimeErrors)
+  return event.payload.rendered === true && errors !== undefined ? errors === 0 : undefined
+}
 
 function toolMetrics(spans: TraceSpan[], complete: boolean, includeVisual = false, events: TelemetryEvent[] = []): Metric[] {
   const finished = spans.filter(span => span.end)
@@ -252,18 +258,15 @@ function toolMetrics(spans: TraceSpan[], complete: boolean, includeVisual = fals
   if (includeVisual) {
     const byTask = new Map<string, TelemetryEvent[]>()
     for (const event of events) {
-      if (event.type !== 'visual.round_finished') continue
+      if (event.type !== 'visual.preview_finished') continue
       const list = byTask.get(event.taskId) ?? []
       list.push(event)
       byTask.set(event.taskId, list)
     }
-    const cleanFirst = [...byTask.values()].filter(list => {
-      const first = [...list].sort((a, b) => (quantity(a.payload.round) ?? a.seq) - (quantity(b.payload.round) ?? b.seq))[0]
-      return first?.payload.rendered === true && (quantity(first.payload.runtimeErrors) ?? 0) === 0
-    }).length
+    const firstPreviews = [...byTask.values()].map(list => cleanPreview(list.reduce((first, event) => event.seq < first.seq ? event : first)))
     visualMetrics.push(
-      rate('tool.visual_clean_rate', 'Visual first-render clean rate', cleanFirst, byTask.size,
-        'Visual verification runs whose first preview rendered cleanly with zero runtime errors.', complete),
+      rate('tool.visual_clean_rate', 'Visual first-render clean rate', firstPreviews.filter(value => value === true).length, byTask.size,
+        'Visual runs whose first selected preview rendered with a recorded zero runtime errors.', complete && firstPreviews.every(value => value !== undefined)),
       values('tool.visual_mean_rounds', 'Mean visual iterations', 'count', [...byTask.values()].map(list => list.length),
         'Average preview-feedback rounds per visual run.', { complete, aggregate: 'mean' }),
     )
@@ -414,8 +417,7 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
       if (passed) selfRepairedRuns++
     }
     if (passed) {
-      const hasCleanVisual = trace.events.some(event => event.type === 'visual.round_finished' &&
-        event.payload.rendered === true && (quantity(event.payload.runtimeErrors) ?? 0) === 0)
+      const hasCleanVisual = trace.events.some(event => event.type === 'visual.preview_finished' && cleanPreview(event) === true)
       if (trace.task.verification?.basis === 'project_command') rigorCommand++
       else if (hasCleanVisual) rigorVisual++
       else rigorPath++
@@ -466,22 +468,22 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
   const succeededNodes = nodes.filter(node => node.status === 'succeeded').length
   const totalAgentWorkMs = agentSpans.reduce((sum, span) => sum + (span.durationMs ?? 0), 0)
   const totalAgentWallMs = selections.reduce((sum, selection) => sum + (wallTime(selection.spans.filter(span => span.kind === 'agent')) ?? 0), 0)
-  const agentSpeedupKnown = complete && !agentSpans.some(span => span.end && span.durationMs === null)
+  const agentSpeedupKnown = complete && !agentSpans.some(span => !span.end || span.durationMs === null)
   const parallelSpeedup = !agentSpans.length
-    ? metric('agents.parallel_speedup', 'Multi-agent parallel speedup', 'ratio',
+    ? metric('agents.parallel_speedup', 'Agent lifecycle overlap ratio', 'ratio',
       'Sum of agent lifecycle durations divided by union wall-clock coverage across runs.', null,
       complete ? 'not_applicable' : 'unknown', 0, 0)
     : !agentSpeedupKnown || totalAgentWallMs <= 0
-      ? metric('agents.parallel_speedup', 'Multi-agent parallel speedup', 'ratio',
+      ? metric('agents.parallel_speedup', 'Agent lifecycle overlap ratio', 'ratio',
         'Sum of agent lifecycle durations divided by union wall-clock coverage across runs.', null, 'unknown', 0, agentSpans.length)
-      : metric('agents.parallel_speedup', 'Multi-agent parallel speedup', 'ratio',
-        'Sum of agent lifecycle durations divided by union wall-clock coverage across runs (> 1.0x indicates effective concurrency).',
+      : metric('agents.parallel_speedup', 'Agent lifecycle overlap ratio', 'ratio',
+        'Summed lifecycle durations divided by their union, including time agents spend waiting.',
         Number((totalAgentWorkMs / totalAgentWallMs).toFixed(2)), 'measured', agentSpans.length, selections.length)
 
-  const selectedTaskIds = new Set(taskRuns.map(task => task.id))
+  const selectedTaskRuns = new Map(taskRuns.map(task => [task.id, task.taskRunId]))
   const completedEvaluations = (options.evaluations ?? [])
-    .filter(job => job.status === 'completed' && job.result && (!filters.taskId || job.taskId === filters.taskId) &&
-      (selectedTaskIds.size === 0 ? !filters.taskId && !filters.status : selectedTaskIds.has(job.taskId)))
+    .filter(job => job.status === 'completed' && job.result && selectedTaskRuns.get(job.taskId) === job.taskRunId &&
+      within(job.createdAt, filters))
   const evalResults = completedEvaluations.map(job => job.result as EvaluationResult)
   const evalUsesModel = evalResults.some(item => item.method === 'model')
   const scoreAxis = (axis: 'completion' | 'correctness' | 'quality', id: string, label: string) =>

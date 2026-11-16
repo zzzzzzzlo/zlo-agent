@@ -1,6 +1,6 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto'
+import { createHmac, randomBytes, randomUUID } from 'node:crypto'
 
-const fileWriteTools = new Set(['create_text_file', 'edit_text_file', 'delete_text_file', 'apply_patch'])
+const fileWriteTools = new Set(['create_text_file', 'edit_text_file', 'delete_file', 'apply_patch'])
 
 let lastTaskMs = 0
 let lastTaskSeq = 0
@@ -1035,8 +1035,19 @@ export class TaskEngine {
         ? changedPaths?.slice(0, 12).filter(path => typeof path === 'string' && path.length <= 256) : undefined
       const rawTargets = status === 'succeeded' && operation.effect === 'write' && fileWriteTools.has(operation.tool)
         ? (paths?.length ? paths : operation.target ? [operation.target] : []) : []
-      const targetDigests = rawTargets.length
-        ? [...new Set(rawTargets.map(path => 'sha256:' + createHash('sha256').update(path).digest('hex')))] : undefined
+      let targetDigests: string[] | undefined
+      if (rawTargets.length) {
+        const task = this.get(event.taskId)
+        let key = this.#db.get<string>('task-private', 'file-target-digest-key')
+        if (!key) {
+          key = randomBytes(32).toString('hex')
+          this.#db.put('task-private', 'file-target-digest-key', key)
+        }
+        targetDigests = [...new Set(rawTargets.map(path => {
+          const scope = JSON.stringify([task.cwd, operation.worktreeId ?? null, path])
+          return 'sha256:' + createHmac('sha256', key).update(scope).digest('hex')
+        }))]
+      }
       this.#db.put('operations', id, { ...operation, status, ...(paths?.length ? { changedPaths: paths } : {}) })
       this.#db.append({ ...event, taskRunId: operation.taskRunId, taskAttemptId: operation.attemptId, taskNodeId: operation.taskNodeId,
         type: 'tool.finished', payload: { id, tool: operation.tool, status, reason, ...(targetDigests ? { targetDigests } : {}) } })

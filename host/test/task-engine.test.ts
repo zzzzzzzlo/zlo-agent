@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -11,6 +12,31 @@ import { TaskEngine } from '../src/task-engine.ts'
 import { telemetryEvent } from '../src/telemetry-projection.ts'
 
 const check = { path: 'demo.txt', contains: 'verified by zlo agent' }
+
+test('file operation telemetry correlates targets within a workspace without disclosing the path or its plain hash', () => {
+  const store = new LocalStore(':memory:')
+  try {
+    const engine = new TaskEngine(store)
+    const path = 'src/example.ts'
+    function settle(cwd: string, taskName: string, tool: string) {
+      const { taskId } = engine.create({ requestId: taskName, goal: 'Change project files', cwd, workspaceAccess: 'write' })
+      const task = engine.start(taskId)
+      const event = { taskId, taskAttemptId: task.attemptId, taskNodeId: task.rootNodeId, type: '', payload: {} }
+      const id = taskId + ':file'
+      engine.beginTool(taskId, event, id, tool, 'write', path)
+      engine.finishTool(event, id, 'succeeded')
+      return telemetryEvent(store.events(taskId).findLast(item => item.type === 'tool.finished')!)
+    }
+    const write = settle('workspace-one', 'write-one', 'create_text_file')
+    const remove = settle('workspace-one', 'remove-one', 'delete_file')
+    const other = settle('workspace-two', 'write-two', 'create_text_file')
+    assert.equal(JSON.stringify(write).includes(path), false)
+    assert.equal(JSON.stringify(write).includes(createHash('sha256').update(path).digest('hex')), false)
+    assert.match((write.payload.targetDigests as string[])[0]!, /^sha256:[a-f0-9]{64}$/)
+    assert.deepEqual(write.payload.targetDigests, remove.payload.targetDigests)
+    assert.notDeepEqual(write.payload.targetDigests, other.payload.targetDigests)
+  } finally { store.close() }
+})
 
 test('TaskEngine rejects illegal transitions, stale plans and reused request IDs', () => {
   const store = new LocalStore(':memory:')

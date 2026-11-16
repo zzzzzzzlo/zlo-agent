@@ -113,7 +113,7 @@ export function overviewVisualCockpit(data) {
     ], '暂无已结束任务'),
     el('div', { className: 'viz-kpis-inline' },
       el('div', {}, el('span', { text: '子目标达成率' }), el('strong', { text: fmtPct(get('dag.node_completion_rate')) })),
-      el('div', {}, el('span', { text: '多 Agent 加速比' }), el('strong', { text: typeof get('agents.parallel_speedup') === 'number' ? numFmt.format(get('agents.parallel_speedup')) + 'x' : '—' })),
+      el('div', {}, el('span', { text: 'Agent 运行重叠倍数' }), el('strong', { text: typeof get('agents.parallel_speedup') === 'number' ? numFmt.format(get('agents.parallel_speedup')) + 'x' : '—' })),
       el('div', {}, el('span', { text: '独立评估通过率' }), el('strong', { text: fmtPct(get('eval.pass_rate')) })),
     ),
   )
