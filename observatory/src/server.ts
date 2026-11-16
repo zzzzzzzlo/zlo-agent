@@ -1,4 +1,5 @@
 import { readFile } from 'node:fs/promises'
+import { resolveUsdToCnyRate } from '../../shared/contracts/currency.ts'
 import type { TelemetryEvent } from '../../shared/contracts/observatory.ts'
 import { bearer, bodyRecord, HttpError, json, listenLoopback, validLocalToken } from '../../shared/loopback-http.ts'
 import { isTaskId } from './collector.ts'
@@ -10,7 +11,7 @@ import { buildTrace } from './trace.ts'
 
 const assets = new Map([
   ['/', 'index.html'], ['/index.html', 'index.html'], ['/styles.css', 'styles.css'], ['/dashboard.js', 'dashboard.js'],
-  ['/components.js', 'components.js'], ['/trace-view.js', 'trace-view.js'], ['/evaluation-view.js', 'evaluation-view.js'],
+  ['/components.js', 'components.js'], ['/charts.js', 'charts.js'], ['/trace-view.js', 'trace-view.js'], ['/evaluation-view.js', 'evaluation-view.js'],
 ])
 const contentType: Record<string, string> = { html: 'text/html', css: 'text/css', js: 'text/javascript' }
 const tracePath = /^\/api\/tasks\/([^/]+)$/u
@@ -75,9 +76,11 @@ export function startDashboard(options: { port: number; token: string; database:
         ? new Map(tasks.map(task => [task.id, database.cursor(task.id)]))
         : database.cursors()
       const events = cachedEventsForTasks(tasks.map(task => task.id), cursors)
-      const metrics = buildMetrics(tasks, events, Date.now(), filter)
+      const usdToCnyRate = resolveUsdToCnyRate()
+      const evaluations = database.jobs()
+      const metrics = buildMetrics(tasks, events, Date.now(), filter, { usdToCnyRate, evaluations })
       const selected = new Set(metrics.taskIds)
-      json(res, { tasks: tasks.filter(task => selected.has(task.id)), metrics, health: collector.health() })
+      json(res, { tasks: tasks.filter(task => selected.has(task.id)), metrics, evaluations, usdToCnyRate, health: collector.health() })
       return
     }
     const trace = tracePath.exec(url.pathname)

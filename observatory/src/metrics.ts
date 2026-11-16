@@ -1,6 +1,9 @@
+import { resolveUsdToCnyRate, usdToCny } from '../../shared/contracts/currency.ts'
 import type { ModelRoute } from '../../shared/contracts/domain.ts'
 import type { TelemetryEvent, TelemetryTask } from '../../shared/contracts/observatory.ts'
 import { judgmentPoints } from '../../shared/contracts/jev.ts'
+import type { EvaluationJob } from './database.ts'
+import type { EvaluationResult } from './evaluation.ts'
 import { buildTrace, object, peakConfirmedAgents, providerUsage, quantity, text, unionDuration } from './trace.ts'
 import type { TaskTrace, TraceSpan } from './trace.ts'
 
@@ -8,11 +11,16 @@ export interface Metric {
   id: string
   label: string
   value: number | null
-  unit: 'count' | 'ms' | 'tokens' | 'USD' | 'percent' | 'bytes'
+  unit: 'count' | 'ms' | 'tokens' | 'CNY' | 'USD' | 'percent' | 'bytes' | 'ratio' | 'score'
   quality: 'measured' | 'estimated' | 'unknown' | 'not_applicable'
   description: string
   samples?: number
   population?: number
+}
+
+export interface MetricOptions {
+  usdToCnyRate?: number
+  evaluations?: EvaluationJob[]
 }
 
 interface MetricGroup {
@@ -64,10 +72,19 @@ function values(id: string, label: string, unit: Unit, inputs: NumericSample[], 
 }
 
 function rate(id: string, label: string, numerator: number, denominator: number, description: string,
-  known = true): Metric {
-  const quality = !known ? 'unknown' : denominator ? 'measured' : 'not_applicable'
-  return metric(id, label, 'percent', description, quality === 'measured' ? 100 * numerator / denominator : null,
+  options: boolean | { known?: boolean; estimated?: boolean } = true): Metric {
+  const known = typeof options === 'boolean' ? options : (options.known ?? true)
+  const estimated = typeof options === 'boolean' ? false : (options.estimated ?? false)
+  const quality = !known ? 'unknown' : denominator ? (estimated ? 'estimated' : 'measured') : 'not_applicable'
+  return metric(id, label, 'percent', description,
+    quality === 'measured' || quality === 'estimated' ? 100 * numerator / denominator : null,
     quality, numerator, denominator)
+}
+
+function cnyValues(id: string, label: string, usdInputs: NumericSample[], description: string, rateValue: number,
+  options: { complete?: boolean } = {}): Metric {
+  const converted = usdInputs.map(sample => sample == null || !Number.isFinite(sample) ? sample : usdToCny(sample, rateValue))
+  return values(id, label, 'CNY', converted, description, { complete: options.complete, estimated: true })
 }
 
 function absent(id: string, label: string, unit: Unit, description: string): Metric {
@@ -137,10 +154,29 @@ function wallTime(spans: TraceSpan[]): number | null {
   }))
 }
 
-function modelMetrics(spans: TraceSpan[], complete: boolean): Metric[] {
+function modelMetrics(spans: TraceSpan[], complete: boolean, usdToCnyRate: number, verifiedTasks?: number): Metric[] {
   const { requested, usage } = canonicalModels(spans)
   const token = (id: string, label: string, key: string) => values(id, label, 'tokens',
     usage.map(span => quantity(span.detail[key])), 'Provider-reported usage for requests with this breakdown.', { complete })
+  const inputSum = usage.reduce((sum, span) => sum + (quantity(span.detail.input) ?? 0), 0)
+  const cacheReadSum = usage.reduce((sum, span) => sum + (quantity(span.detail.cacheRead) ?? 0), 0)
+  const cacheWriteSum = usage.reduce((sum, span) => sum + (quantity(span.detail.cacheWrite) ?? 0), 0)
+  const cacheDenominator = inputSum + cacheReadSum + cacheWriteSum
+  const pricedCny = usage.flatMap(span => {
+    const usd = quantity(span.detail.estimatedCostUsd)
+    return usd !== undefined ? [usdToCny(usd, usdToCnyRate)] : []
+  })
+  const costPerVerified = verifiedTasks === undefined
+    ? undefined
+    : verifiedTasks === 0
+      ? metric('model.cost_per_verified_task', 'Cost per verified task', 'CNY',
+        'Estimated CNY spend divided by deterministically verified tasks.', null, complete ? 'not_applicable' : 'unknown', 0, 0)
+      : !pricedCny.length
+        ? metric('model.cost_per_verified_task', 'Cost per verified task', 'CNY',
+          'Estimated CNY spend divided by deterministically verified tasks.', null, 'unknown', 0, requested.length)
+        : metric('model.cost_per_verified_task', 'Cost per verified task', 'CNY',
+          'Estimated CNY spend divided by deterministically verified tasks; partial pricing coverage retains sample denominator.',
+          Number((pricedCny.reduce((sum, v) => sum + v, 0) / verifiedTasks).toFixed(10)), 'estimated', pricedCny.length, requested.length)
   return [
     count('model.requests', 'Model requests', requested.length, 'Recorded budget reservations. Historical unpaired usage is excluded.',
       complete && !spans.some(span => span.status === 'unpaired')),
@@ -151,8 +187,12 @@ function modelMetrics(spans: TraceSpan[], complete: boolean): Metric[] {
     }), 'Settled provider total, or historical usage where no competing settlement exists. Four token components are counted once.', { complete }),
     token('model.input', 'Uncached input', 'input'), token('model.output', 'Output tokens', 'output'),
     token('model.cache_read', 'Cache read tokens', 'cacheRead'), token('model.cache_write', 'Cache write tokens', 'cacheWrite'),
-    values('model.cost', 'Estimated model cost', 'USD', usage.map(span => quantity(span.detail.estimatedCostUsd)),
-      'Known per-request catalog estimates. Coverage is priced samples over observed requests; actual billing is unavailable.', { complete, estimated: true }),
+    rate('model.cache_hit_rate', 'Prompt cache hit rate', cacheReadSum, cacheDenominator,
+      'Cache read tokens divided by total prompt input tokens (uncached input + cache read + cache write).', complete),
+    cnyValues('model.cost', 'Estimated model cost (CNY)', usage.map(span => quantity(span.detail.estimatedCostUsd)),
+      `Known catalog estimates converted to CNY at 1 USD ≈ ${usdToCnyRate} CNY. Actual provider billing is unavailable.`,
+      usdToCnyRate, { complete }),
+    ...(costPerVerified ? [costPerVerified] : []),
     values('model.mean_latency', 'Mean request latency', 'ms', requested.map(span => span.durationMs),
       'Mean elapsed time from model.request_started to confirmed settlement. Unknown settlements are excluded.', { complete, aggregate: 'mean' }),
     values('model.p95_latency', 'P95 request latency', 'ms', requested.map(span => span.durationMs),
@@ -182,7 +222,9 @@ function modelMetrics(spans: TraceSpan[], complete: boolean): Metric[] {
   ]
 }
 
-function toolMetrics(spans: TraceSpan[], complete: boolean): Metric[] {
+const fileWriteTools = new Set(['create_text_file', 'edit_text_file', 'delete_text_file', 'apply_patch'])
+
+function toolMetrics(spans: TraceSpan[], complete: boolean, includeVisual = false, events: TelemetryEvent[] = []): Metric[] {
   const finished = spans.filter(span => span.end)
   const failed = finished.filter(span => span.status === 'failed')
   const unique = new Set<string>()
@@ -193,11 +235,47 @@ function toolMetrics(spans: TraceSpan[], complete: boolean): Metric[] {
     if (unique.has(key)) repeats++
     unique.add(key)
   }
+  const fileWrites = finished.filter(span => span.status === 'succeeded' && fileWriteTools.has(span.name))
+  const allHaveDigests = fileWrites.length > 0 && fileWrites.every(span => Array.isArray(span.detail.targetDigests) && span.detail.targetDigests.length > 0)
+  const distinctTargets = allHaveDigests ? new Set(fileWrites.flatMap(span => span.detail.targetDigests as string[])).size : 0
+  const editChurn = !fileWrites.length
+    ? metric('tool.edit_churn_ratio', 'File edit churn ratio', 'ratio',
+      'Succeeded file-write tool calls divided by distinct modified file digests.', null, complete ? 'not_applicable' : 'unknown', 0, 0)
+    : !complete || !allHaveDigests || distinctTargets === 0
+      ? metric('tool.edit_churn_ratio', 'File edit churn ratio', 'ratio',
+        'Target path digests are unavailable for legacy or incomplete streams.', null, 'unknown', 0, fileWrites.length)
+      : metric('tool.edit_churn_ratio', 'File edit churn ratio', 'ratio',
+        'Succeeded file-write tool calls divided by distinct modified file digests.', Number((fileWrites.length / distinctTargets).toFixed(2)),
+        'measured', fileWrites.length, distinctTargets)
+
+  const visualMetrics: Metric[] = []
+  if (includeVisual) {
+    const byTask = new Map<string, TelemetryEvent[]>()
+    for (const event of events) {
+      if (event.type !== 'visual.round_finished') continue
+      const list = byTask.get(event.taskId) ?? []
+      list.push(event)
+      byTask.set(event.taskId, list)
+    }
+    const cleanFirst = [...byTask.values()].filter(list => {
+      const first = [...list].sort((a, b) => (quantity(a.payload.round) ?? a.seq) - (quantity(b.payload.round) ?? b.seq))[0]
+      return first?.payload.rendered === true && (quantity(first.payload.runtimeErrors) ?? 0) === 0
+    }).length
+    visualMetrics.push(
+      rate('tool.visual_clean_rate', 'Visual first-render clean rate', cleanFirst, byTask.size,
+        'Visual verification runs whose first preview rendered cleanly with zero runtime errors.', complete),
+      values('tool.visual_mean_rounds', 'Mean visual iterations', 'count', [...byTask.values()].map(list => list.length),
+        'Average preview-feedback rounds per visual run.', { complete, aggregate: 'mean' }),
+    )
+  }
+
   return [
     count('tool.calls', 'Tool calls', spans.length, 'Started tool receipts, including open managed operations.', complete),
     count('tool.failed', 'Failed tool receipts', failed.length, 'Receipts explicitly settled as failed.', complete),
     rate('tool.failure_rate', 'Tool failure rate', failed.length, finished.length,
       'Failed receipts divided by settled receipts. Interrupted and unknown-effect receipts are visible separately.', complete),
+    editChurn,
+    ...visualMetrics,
     values('tool.mean_latency', 'Mean tool settlement time', 'ms', spans.map(span => span.durationMs),
       'From receipt start to settlement, including managed processes. May include reporting delay after interruption.', { complete, aggregate: 'mean' }),
     values('tool.p95_latency', 'P95 tool settlement time', 'ms', spans.map(span => span.durationMs),
@@ -217,25 +295,30 @@ function toolMetrics(spans: TraceSpan[], complete: boolean): Metric[] {
   ]
 }
 
-function judgmentMetrics(events: TelemetryEvent[], complete: boolean): Metric[] {
+function judgmentMetrics(events: TelemetryEvent[], complete: boolean, usdToCnyRate: number): Metric[] {
   const shadow = events.filter(({ payload }) => {
     const outcomes = object(payload.batch)?.judgeOutput
     return payload.mode === 'shadow' && (payload.shadow !== undefined ||
       (Array.isArray(outcomes) && outcomes.some(item => typeof item === 'boolean')))
   })
   const shadowDifferent = shadow.filter(({ payload }) => payload.disagreement ?? payload.shadow !== payload.baseline).length
+  const fallbacks = events.filter(event => event.payload.mode !== 'off' && event.payload.judgeStatus && event.payload.judgeStatus !== 'baseline' && event.payload.judgeStatus !== 'valid').length
+  const activeJudgeAttempts = events.filter(event => event.payload.mode !== 'off' && event.payload.judgeStatus && event.payload.judgeStatus !== 'baseline').length
   const external = events.filter(event => event.payload.requestSent ??
     (event.payload.mode !== 'off' && event.payload.judgeStatus !== 'baseline'))
   return [
     count('judgment.decisions', 'Judgment decisions', events.length, 'Recorded evaluations across all registered judgment points.', complete),
     rate('judgment.shadow_disagreement', 'Shadow disagreement', shadowDifferent, shadow.length,
       'Shadow results different from the rule baseline, divided by evaluations with a recorded shadow result.', complete),
+    rate('judgment.fallback_rate', 'Judge fallback rate', fallbacks, activeJudgeAttempts,
+      'Non-baseline Jev evaluations that timed out, failed, returned invalid output, or were throttled.', complete),
     count('judgment.active_changes', 'Active selection changes', events.filter(event => event.payload.mode === 'active' &&
       (event.payload.disagreement ?? event.payload.output !== event.payload.baseline)).length, 'Active selections different from the rule baseline.', complete),
     values('judgment.mean_latency', 'Mean judgment latency', 'ms', events.map(event => quantity(event.payload.elapsedMs)),
       'Mean elapsed time recorded by the Judgment Kernel, including local rules.', { complete, aggregate: 'mean' }),
-    values('judgment.cost', 'Estimated judgment cost', 'USD', external.map(event => quantity(object(event.payload.usage)?.estimatedCostUsd)),
-      'Estimated cost reported by a configured Judge. These costs exclude task and evaluation requests.', { complete, estimated: true }),
+    cnyValues('judgment.cost', 'Estimated judgment cost (CNY)', external.map(event => quantity(object(event.payload.usage)?.estimatedCostUsd)),
+      `Estimated Judge cost converted to CNY at 1 USD ≈ ${usdToCnyRate} CNY. Excludes task and evaluation requests.`,
+      usdToCnyRate, { complete }),
     values('judgment.tokens', 'Judgment tokens', 'tokens', external.map(event => {
       const usage = object(event.payload.usage)
       const input = quantity(usage?.input)
@@ -269,15 +352,17 @@ function peakAgents(spans: TraceSpan[], traces: TaskTrace[]): number {
 const terminalStatuses = new Set(['succeeded', 'failed', 'stopped', 'blocked', 'needs_reconciliation'])
 const accessLevels: Record<string, number> = { read: 0, write: 1, trusted: 2 }
 const overviewIds = [
-  'task.runs', 'task.execution_rate', 'task.failure_rate', 'task.verified_rate', 'task.wall_clock',
-  'dag.nodes', 'dag.critical_path', 'agents.runs', 'agents.peak',
-  'model.requests', 'model.tokens', 'model.cache_read', 'model.cost', 'model.mean_latency',
-  'tool.calls', 'tool.failure_rate', 'context.compactions', 'memory.injected',
-  'judgment.decisions', 'judgment.shadow_disagreement', 'reliability.resumed', 'reliability.missing_events',
-  'security.approvals_denied', 'tool.unknown_effect',
+  'task.runs', 'task.execution_rate', 'task.verified_rate', 'task.first_pass_verified_rate', 'task.self_repair_rate',
+  'task.strong_verified_rate', 'task.failure_rate', 'task.steering_rate', 'task.rework_token_share', 'task.wall_clock',
+  'dag.nodes', 'dag.node_completion_rate', 'dag.critical_path', 'agents.runs', 'agents.peak', 'agents.parallel_speedup',
+  'model.requests', 'model.tokens', 'model.cache_hit_rate', 'model.cost', 'model.cost_per_verified_task', 'model.mean_latency',
+  'tool.calls', 'tool.failure_rate', 'tool.edit_churn_ratio', 'tool.unknown_effect',
+  'judgment.decisions', 'judgment.shadow_disagreement', 'eval.pass_rate',
 ]
 
-export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], asOf = Date.now(), filters: MetricFilters = {}) {
+export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], asOf = Date.now(), filters: MetricFilters = {},
+  options: MetricOptions = {}) {
+  const usdToCnyRate = options.usdToCnyRate && options.usdToCnyRate > 0 ? options.usdToCnyRate : resolveUsdToCnyRate()
   const inputByTask = groups(input, event => event.taskId)
   const selections = tasks.filter(task => (!filters.taskId || filters.taskId === task.id) && (!filters.status || filters.status === task.status))
     .flatMap(task => {
@@ -307,6 +392,70 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
     return false
   })
   const verified = ended.filter(({ task }) => task.verification?.verdict === 'verified' && task.verification.passed === true).length
+  let firstPassVerified = 0
+  let challengedRuns = 0
+  let selfRepairedRuns = 0
+  let rigorCommand = 0
+  let rigorVisual = 0
+  let rigorPath = 0
+  const supersededAttemptsByTask = new Map<string, Set<string>>()
+  for (const trace of ended) {
+    const passed = trace.task.verification?.verdict === 'verified' && trace.task.verification.passed === true
+    const hasSteerOrResume = trace.events.some(event =>
+      event.type === 'task.instruction_added' || event.type === 'instruction.applied' || event.type === 'task.resumed')
+    const hasStopIntent = trace.events.some(event => event.type === 'task.stop_requested')
+    const hasReplans = trace.nodes.some(node => (node.replans ?? 0) > 0)
+    const hadToolFailure = trace.spans.some(span => span.kind === 'tool' && span.status === 'failed')
+    const hadOutputRecovery = trace.events.some(event => event.type === 'model.output_recovery')
+    const hadInternalRetry = trace.task.attemptCount > 1 && !trace.events.some(event => event.type === 'task.resumed')
+    if (passed && trace.task.attemptCount === 1 && !hasReplans && !hasSteerOrResume && !hasStopIntent) firstPassVerified++
+    if ((hadToolFailure || hadOutputRecovery || hadInternalRetry || hasReplans) && !hasSteerOrResume) {
+      challengedRuns++
+      if (passed) selfRepairedRuns++
+    }
+    if (passed) {
+      const hasCleanVisual = trace.events.some(event => event.type === 'visual.round_finished' &&
+        event.payload.rendered === true && (quantity(event.payload.runtimeErrors) ?? 0) === 0)
+      if (trace.task.verification?.basis === 'project_command') rigorCommand++
+      else if (hasCleanVisual) rigorVisual++
+      else rigorPath++
+    }
+  }
+  for (const trace of traces) {
+    const winners = new Set<string>()
+    const losers = new Set<string>()
+    const rootLatest = trace.task.attempts.filter(attempt => attempt.nodeId === trace.task.rootNodeId)
+      .sort((left, right) => left.startedAt.localeCompare(right.startedAt)).at(-1)
+    if (trace.task.status === 'succeeded' && rootLatest?.status === 'succeeded') winners.add(rootLatest.id)
+    for (const node of trace.task.nodes) {
+      if (node.status === 'succeeded' && node.attemptId) winners.add(node.attemptId)
+    }
+    for (const attempt of trace.task.attempts) {
+      if (!winners.has(attempt.id) && attempt.status !== 'running' &&
+        (attempt.status === 'failed' || attempt.status === 'interrupted' || attempt.status === 'unknown_effect' || terminalStatuses.has(trace.task.status))) {
+        losers.add(attempt.id)
+      }
+    }
+    supersededAttemptsByTask.set(trace.task.id, losers)
+  }
+  const steeredRuns = traces.filter(trace => trace.events.some(event =>
+    event.type === 'task.instruction_added' || event.type === 'instruction.applied' ||
+    event.type === 'task.resumed' || event.type === 'task.stop_requested')).length
+  const canonicalUsageSpans = canonicalModels(modelSpans).usage
+  let attributedTokens = 0
+  let reworkTokens = 0
+  let reworkKnown = complete
+  const eventTaskById = new Map(input.map(event => [event.id, event.taskId]))
+  for (const span of canonicalUsageSpans) {
+    const actual = quantity(span.detail.actualTokens)
+    const historical = providerUsage(span.detail)
+    const total = actual ?? (historical ? Object.values(historical).reduce((sum, value) => sum + value, 0) : undefined)
+    if (total === undefined) continue
+    const taskIdForSpan = span.eventIds.length ? eventTaskById.get(span.eventIds[0]) : undefined
+    if (!span.taskAttemptId || !taskIdForSpan) { reworkKnown = false; continue }
+    attributedTokens += total
+    if (supersededAttemptsByTask.get(taskIdForSpan)?.has(span.taskAttemptId)) reworkTokens += total
+  }
   const observed = (id: string, label: string, type: string, description: string) =>
     count(id, label, occurrences(events, type).length, description, complete)
   const durations = (id: string, label: string, input: NumericSample[], description: string) =>
@@ -314,6 +463,32 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
   const counts = (id: string, label: string, input: NumericSample[], description: string) =>
     values(id, label, 'count', input, description, { complete })
   const nodes = traces.flatMap(trace => trace.nodes)
+  const succeededNodes = nodes.filter(node => node.status === 'succeeded').length
+  const totalAgentWorkMs = agentSpans.reduce((sum, span) => sum + (span.durationMs ?? 0), 0)
+  const totalAgentWallMs = selections.reduce((sum, selection) => sum + (wallTime(selection.spans.filter(span => span.kind === 'agent')) ?? 0), 0)
+  const agentSpeedupKnown = complete && !agentSpans.some(span => span.end && span.durationMs === null)
+  const parallelSpeedup = !agentSpans.length
+    ? metric('agents.parallel_speedup', 'Multi-agent parallel speedup', 'ratio',
+      'Sum of agent lifecycle durations divided by union wall-clock coverage across runs.', null,
+      complete ? 'not_applicable' : 'unknown', 0, 0)
+    : !agentSpeedupKnown || totalAgentWallMs <= 0
+      ? metric('agents.parallel_speedup', 'Multi-agent parallel speedup', 'ratio',
+        'Sum of agent lifecycle durations divided by union wall-clock coverage across runs.', null, 'unknown', 0, agentSpans.length)
+      : metric('agents.parallel_speedup', 'Multi-agent parallel speedup', 'ratio',
+        'Sum of agent lifecycle durations divided by union wall-clock coverage across runs (> 1.0x indicates effective concurrency).',
+        Number((totalAgentWorkMs / totalAgentWallMs).toFixed(2)), 'measured', agentSpans.length, selections.length)
+
+  const selectedTaskIds = new Set(taskRuns.map(task => task.id))
+  const completedEvaluations = (options.evaluations ?? [])
+    .filter(job => job.status === 'completed' && job.result && (!filters.taskId || job.taskId === filters.taskId) &&
+      (selectedTaskIds.size === 0 ? !filters.taskId && !filters.status : selectedTaskIds.has(job.taskId)))
+  const evalResults = completedEvaluations.map(job => job.result as EvaluationResult)
+  const evalUsesModel = evalResults.some(item => item.method === 'model')
+  const scoreAxis = (axis: 'completion' | 'correctness' | 'quality', id: string, label: string) =>
+    values(id, label, 'score', evalResults.map(item => quantity(item.scores?.[axis]?.score)),
+      'Mean 0-5 independent evaluation rubric score (null scores excluded).',
+      { complete: true, estimated: true, aggregate: 'mean' })
+
   const judgment = occurrences(events, 'judgment.evaluated')
   const compactions = occurrences(events, 'context.compacted')
   const contextBuilds = occurrences(events, 'context.built')
@@ -344,10 +519,23 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
       rate('task.failure_rate', 'Task failure rate', failed, ended.length, 'Runs in failed state divided by succeeded, failed, stopped, blocked or reconciliation runs.'),
       rate('task.verified_rate', 'Deterministic verification rate', verified, ended.length,
         'Runs with verified verdict and a passed deterministic check divided by all runs in an end state.'),
+      rate('task.first_pass_verified_rate', 'First-pass verified rate', firstPassVerified, ended.length,
+        'Ended runs verified deterministically on the initial attempt without replans or user intervention (Pass@1).', complete),
+      rate('task.self_repair_rate', 'Autonomous self-repair rate', selfRepairedRuns, challengedRuns,
+        'Runs facing tool failures, replans, output recovery, or automatic retries without user steering/resume that recovered to verified.', complete),
+      rate('task.steering_rate', 'User intervention rate', steeredRuns, traces.length,
+        'Runs receiving user steering instructions, stop intents, or resumes divided by selected runs.', complete),
+      rate('task.strong_verified_rate', 'Strong-evidence verified rate', rigorCommand + rigorVisual, ended.length,
+        'Verified runs backed by project command execution (T3) or clean visual preview checks (T2).', complete),
+      count('task.rigor_command', 'Command-verified runs (T3)', rigorCommand, 'Runs verified by an authorized project command exit code 0.', complete),
+      count('task.rigor_visual', 'Visual-verified runs (T2)', rigorVisual, 'Verified runs with clean zero-error browser preview checks.', complete),
+      count('task.rigor_path', 'Path-verified runs (T1)', rigorPath, 'Verified runs checked via static file existence/text inspection.', complete),
       count('task.unverified', 'Unverified task runs', ended.filter(({ task }) => task.verification?.verdict === 'unverified').length,
         'Host explicitly recorded unverified. Independent AI evaluations are excluded.'),
       count('task.verification_failed', 'Failed deterministic checks', ended.filter(({ task }) => task.verification?.verdict === 'failed').length,
         'Runs with a failed Host verification verdict.'),
+      rate('task.rework_token_share', 'Rework & retry token share', reworkTokens, attributedTokens,
+        'Provider tokens spent on failed, interrupted, or superseded attempts divided by total attempt-attributed tokens.', reworkKnown),
       durations('task.wall_clock', 'Mean task wall time', ended.map(trace => trace.timing.wallClockMs),
         'Mean elapsed time from task creation to latest end state, including waits, pauses and retries.'),
       count('task.root_retries', 'Root retries', taskRetries, 'Root attempt count minus the first attempt, per run.'),
@@ -356,6 +544,8 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
     ],
     dag: [
       count('dag.nodes', 'Delegated DAG nodes', nodes.length, 'Nodes in current Task DAG snapshots, excluding the root.'),
+      rate('dag.node_completion_rate', 'DAG subgoal completion rate', succeededNodes, nodes.length,
+        'Succeeded delegated nodes divided by all planned nodes across selected runs.'),
       count('dag.dependencies', 'DAG dependencies', nodes.reduce((sum, node) => sum + node.dependencies.length, 0),
         'Explicit dependency edges in current DAG snapshots.'),
       count('dag.replanned', 'Node replans', nodes.reduce((sum, node) => sum + (node.replans ?? 0), 0), 'Recorded per-node replan counts.'),
@@ -373,6 +563,7 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
       count('agents.runs', 'Agent runs', agentSpans.length, 'Started Root, Team and Worker runs.', complete),
       count('agents.peak', 'Peak observed agents', peakAgents(agentSpans, traces),
         'Complete TaskRun streams use lifecycle event order. Across tasks or through gaps only confirmed overlaps count.', complete),
+      parallelSpeedup,
       count('agents.delegations', 'Delegated attempts', delegationSpans.length, 'Recorded node starts including retries.', complete),
       count('agents.deliveries', 'Completed deliveries', delegationSpans.filter(span => span.status === 'succeeded').length,
         'Node attempts with a succeeded handoff. Deterministic verification is counted separately.', complete),
@@ -385,8 +576,8 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
         'Sum of completed agent lifecycle intervals, including concurrent lifecycles.', { complete }),
       absent('agents.pure_compute', 'Agent compute time', 'ms', 'Host does not instrument CPU or idle time inside an AgentRun.'),
     ],
-    models: modelMetrics(modelSpans, complete),
-    tools: toolMetrics(toolSpans, complete),
+    models: modelMetrics(modelSpans, complete, usdToCnyRate, verified),
+    tools: toolMetrics(toolSpans, complete, true, events),
     context: [
       count('context.compactions', 'Context compactions', compactions.length, 'Completed compactions reported by the runtime.', complete),
       values('context.before', 'Mean tokens before compaction', 'tokens', compactions.map(event => quantity(event.payload.tokensBefore)),
@@ -400,8 +591,8 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
       values('context.model_input_estimate', 'Mean request context estimate', 'tokens', modelSpans.filter(span => span.status !== 'unpaired')
         .map(span => quantity(span.detail.estimatedInputTokens)), 'Host’s conservative estimate of input size before a model request.',
       { complete, aggregate: 'mean', estimated: true }),
-      values('context.compaction_cost', 'Estimated compaction cost', 'USD', compactionRequests.map(span => quantity(span.detail.estimatedCostUsd)),
-        'Subtotal of priced model reservations attributed to context compaction.', { complete, estimated: true }),
+      cnyValues('context.compaction_cost', 'Estimated compaction cost (CNY)', compactionRequests.map(span => quantity(span.detail.estimatedCostUsd)),
+        `Subtotal of priced compaction calls converted at 1 USD ≈ ${usdToCnyRate} CNY.`, usdToCnyRate, { complete }),
     ],
     memory: [
       count('memory.capture_events', 'Memory capture events', captures.length, 'Observed durable memory captures.', complete),
@@ -414,9 +605,9 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
         'Elapsed time reported for memory capture when instrumented.'),
       durations('memory.recall_latency', 'Mean memory recall latency', recalls.map(event => quantity(event.payload.elapsedMs)),
         'Elapsed time for scoped recall, relevance judgment and selection when instrumented.'),
-      absent('memory.cost', 'Memory model cost', 'USD', 'Host does not separately price memory retrieval or attribute inference spend to injected memory.'),
+      absent('memory.cost', 'Memory model cost (CNY)', 'CNY', 'Host does not separately price memory retrieval or attribute inference spend to injected memory.'),
     ],
-    judgment: judgmentMetrics(judgment, complete),
+    judgment: judgmentMetrics(judgment, complete, usdToCnyRate),
     reliability: [
       observed('reliability.stop_requested', 'Stop requests', 'task.stop_requested', 'Accepted stop intents.'),
       observed('reliability.stopped', 'Stopped transitions', 'task.stopped', 'Observed Task stop transitions.'),
@@ -457,6 +648,14 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
         toolDenials.filter(event => event.payload.reason === 'approval_safety').length, 'Tool requests that could not be safely shown for approval.', complete)
         : absent('security.approval_safety_blocks', 'Approval safety blocks', 'count', 'No recorded tool denials with reason coverage.'),
     ],
+    evaluation: [
+      count('eval.runs', 'Completed evaluations', evalResults.length, 'Completed deterministic or independent AI evaluation jobs in selection.'),
+      rate('eval.pass_rate', 'Evaluation pass rate', evalResults.filter(item => item.verdict === 'pass').length, evalResults.length,
+        'Independent evaluations concluding pass divided by completed evaluations.', { known: true, estimated: evalUsesModel }),
+      scoreAxis('completion', 'eval.completion_score', 'Mean completion score (0-5)'),
+      scoreAxis('correctness', 'eval.correctness_score', 'Mean correctness score (0-5)'),
+      scoreAxis('quality', 'eval.quality_score', 'Mean quality score (0-5)'),
+    ],
   }
   const all = new Map(Object.values(domains).flat().map(item => [item.id, item]))
   const eventsById = new Map(traces.flatMap(trace => trace.events.map(event => [event.id, event] as const)))
@@ -470,7 +669,7 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
       const { model: route } = group[0]
       const role = text(group[0].detail.role)
       return { key, label: route ? `${route.provider} / ${route.model}` : 'Unattributed model usage',
-        provider: route?.provider, model: route?.model, role, metrics: modelMetrics(group, complete), references: spanReferences(group) }
+        provider: route?.provider, model: route?.model, role, metrics: modelMetrics(group, complete, usdToCnyRate), references: spanReferences(group) }
     })
   const tools: MetricGroup[] = [...groups(toolSpans, span => span.name)]
     .map(([name, group]) => ({ key: name, label: name, metrics: toolMetrics(group, complete), references: spanReferences(group) }))
@@ -479,12 +678,12 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
     const point = text(group[0].payload.id)
     const mode = text(group[0].payload.mode)
     return { key, label: point ?? 'Unknown decision point', point, mode,
-      featureSchemaVersion: quantity(group[0].payload.featureSchemaVersion), metrics: judgmentMetrics(group, complete), references: eventReferences(group) }
+      featureSchemaVersion: quantity(group[0].payload.featureSchemaVersion), metrics: judgmentMetrics(group, complete, usdToCnyRate), references: eventReferences(group) }
   })
   for (const { id: point } of judgmentPoints) {
     if (!judgments.some(group => group.point === point)) {
-      judgments.push({ key: point, label: point, point, metrics: judgmentMetrics([], complete), references: [] })
+      judgments.push({ key: point, label: point, point, metrics: judgmentMetrics([], complete, usdToCnyRate), references: [] })
     }
   }
-  return { taskIds: taskRuns.map(task => task.id), overview: overviewIds.map(id => all.get(id)!), domains, models, tools, judgments }
+  return { taskIds: taskRuns.map(task => task.id), overview: overviewIds.map(id => all.get(id)!), domains, models, tools, judgments, usdToCnyRate }
 }

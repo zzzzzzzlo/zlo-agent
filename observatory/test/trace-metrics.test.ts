@@ -102,15 +102,23 @@ test('metrics count provider usage and costs once, preserve coverage, and separa
   const { task, events } = scenario()
   const metrics = buildMetrics([task], events)
   const byId = new Map(Object.values(metrics.domains).flat().map(metric => [metric.id, metric]))
-  assert.equal(metrics.overview.length, 24)
-  assert.equal(Object.keys(metrics.domains).length, 10)
+  assert.equal(metrics.overview.length, 29)
+  assert.equal(Object.keys(metrics.domains).length, 11)
   assert.equal(byId.get('task.execution_rate')?.value, 100)
   assert.equal(byId.get('task.verified_rate')?.value, 0)
+  assert.equal(byId.get('task.first_pass_verified_rate')?.value, 0)
+  assert.equal(byId.get('task.self_repair_rate')?.value, 0)
+  assert.equal(byId.get('task.steering_rate')?.value, 0)
+  assert.equal(byId.get('task.rework_token_share')?.value, 0)
   assert.equal(byId.get('task.unverified')?.value, 1)
+  assert.equal(byId.get('dag.node_completion_rate')?.value, 100)
+  assert.equal(byId.get('agents.parallel_speedup')?.value, 2.16)
   assert.equal(byId.get('model.requests')?.value, 3)
   assert.equal(byId.get('model.tokens')?.value, 53)
   assert.equal(byId.get('model.cache_read')?.value, 7)
-  assert.equal(byId.get('model.cost')?.value, 0.01)
+  assert.equal(Number(byId.get('model.cache_hit_rate')?.value?.toFixed(2)), 20.59)
+  assert.equal(byId.get('model.cost')?.value, 0.072)
+  assert.equal(byId.get('model.cost')?.unit, 'CNY')
   assert.equal(byId.get('model.cost')?.quality, 'estimated')
   assert.equal(byId.get('model.cost')?.samples, 1)
   assert.equal(byId.get('model.cost')?.population, 3)
@@ -121,7 +129,8 @@ test('metrics count provider usage and costs once, preserve coverage, and separa
   assert.equal(byId.get('context.budget')?.value, 65536)
   assert.equal(byId.get('memory.injected')?.value, 2)
   assert.equal(byId.get('judgment.shadow_disagreement')?.value, 100)
-  assert.equal(byId.get('judgment.cost')?.value, 0.005)
+  assert.equal(byId.get('judgment.cost')?.value, 0.036)
+  assert.equal(byId.get('judgment.cost')?.unit, 'CNY')
   assert.equal(byId.get('security.approvals_denied')?.value, 1)
   assert.equal(byId.get('security.policy_denials')?.quality, 'unknown')
   assert.equal(metrics.judgments.length, 16)
@@ -215,7 +224,7 @@ test('explicit reservation correlation survives a missing settlement without gue
   assert.ok(span.eventIds.includes(usage.id))
   const metrics = buildMetrics([task], partial)
   assert.equal(metrics.domains.models.find(metric => metric.id === 'model.tokens')?.value, 53)
-  assert.equal(metrics.domains.models.find(metric => metric.id === 'model.cost')?.value, 0.01)
+  assert.equal(metrics.domains.models.find(metric => metric.id === 'model.cost')?.value, 0.072)
   assert.ok(metrics.models.some(group => group.references.some(reference => reference.eventId === reservation.id)))
 })
 
@@ -248,4 +257,92 @@ test('redacted operation identifiers still link delegation decisions and approva
   assert.deepEqual(trace.judgments.find(result => result.eventId === judgment.id)?.linkedEventIds, [toolFinished.id])
   const metrics = buildMetrics([task], events, now + 260, { from: now + 246 })
   assert.equal(metrics.domains.security.find(metric => metric.id === 'security.approval_gated_tools')?.value, 1)
+})
+
+test('expanded completion metrics measure Pass@1, self-repair, steering, edit churn, visual cleanliness, rework waste, CNY unit cost, and evaluations', () => {
+  const s1 = scenario()
+  s1.task.id = 'task-pass1'
+  s1.task.taskRunId = 'run-pass1'
+  for (const e of s1.events) {
+    e.taskId = s1.task.id
+    e.taskRunId = s1.task.taskRunId
+    e.id = 'p1-' + e.id
+  }
+  s1.events = s1.events.filter(e => e.type !== 'tool.started' && e.type !== 'tool.finished')
+  s1.task.verification = { verdict: 'verified', passed: true, basis: 'project_command', evidence: 'workspace_command_passed' }
+  const digestA = 'sha256:' + '1'.repeat(64)
+  s1.events.push(
+    { schemaVersion: 1, id: 'p1-t1', seq: s1.events.length + 1, occurredAt: iso(131), taskId: s1.task.id, taskRunId: s1.task.taskRunId,
+      agentRunId: 'agent-root', taskNodeId: 'root', taskAttemptId: 'r1', type: 'tool.started', payload: { id: 'op-w1', tool: 'create_text_file', effect: 'write' } },
+    { schemaVersion: 1, id: 'p1-t2', seq: s1.events.length + 2, occurredAt: iso(132), taskId: s1.task.id, taskRunId: s1.task.taskRunId,
+      agentRunId: 'agent-root', taskNodeId: 'root', taskAttemptId: 'r1', type: 'tool.finished',
+      payload: { id: 'op-w1', tool: 'create_text_file', status: 'succeeded', targetDigests: [digestA] } },
+    { schemaVersion: 1, id: 'p1-t3', seq: s1.events.length + 3, occurredAt: iso(133), taskId: s1.task.id, taskRunId: s1.task.taskRunId,
+      agentRunId: 'agent-root', taskNodeId: 'root', taskAttemptId: 'r1', type: 'tool.started', payload: { id: 'op-w2', tool: 'edit_text_file', effect: 'write' } },
+    { schemaVersion: 1, id: 'p1-t4', seq: s1.events.length + 4, occurredAt: iso(134), taskId: s1.task.id, taskRunId: s1.task.taskRunId,
+      agentRunId: 'agent-root', taskNodeId: 'root', taskAttemptId: 'r1', type: 'tool.finished',
+      payload: { id: 'op-w2', tool: 'edit_text_file', status: 'succeeded', targetDigests: [digestA] } },
+  )
+  // Fix contiguous seqs after filtering
+  s1.events.sort((a, b) => a.occurredAt.localeCompare(b.occurredAt)).forEach((e, idx) => { e.seq = idx + 1 })
+  s1.task.cursor = s1.events.length
+
+  // Task 2: self-repaired (tool failed + failed attempt 1 = 40 tokens, retry succeeded = 60 tokens), verified visually (T2)
+  const task2: TelemetryTask = {
+    id: 'task-repair', taskRunId: 'run-repair', rootNodeId: 'root', status: 'succeeded', attemptCount: 2, planVersion: 1,
+    cursor: 11, route, verification: { verdict: 'verified', passed: true, basis: 'workspace_path', evidence: 'workspace_text_file_exists' },
+    nodes: [],
+    attempts: [
+      { id: 'r2-1', nodeId: 'root', startedAt: iso(10), finishedAt: iso(80), status: 'failed' },
+      { id: 'r2-2', nodeId: 'root', startedAt: iso(90), finishedAt: iso(200), status: 'succeeded' },
+    ],
+  }
+  const t2Events: TelemetryEvent[] = [
+    { schemaVersion: 1, id: 'r1', seq: 1, occurredAt: iso(10), taskId: task2.id, taskRunId: task2.taskRunId, type: 'task.created', payload: { status: 'ready' } },
+    { schemaVersion: 1, id: 'r2', seq: 2, occurredAt: iso(12), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-1', agentRunId: 'ar1', type: 'agent.started', payload: { role: 'root', route } },
+    { schemaVersion: 1, id: 'r3', seq: 3, occurredAt: iso(20), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-1', agentRunId: 'ar1', type: 'tool.started', payload: { id: 'op-f', tool: 'read_text_file', effect: 'read' } },
+    { schemaVersion: 1, id: 'r4', seq: 4, occurredAt: iso(25), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-1', agentRunId: 'ar1', type: 'tool.finished', payload: { id: 'op-f', tool: 'read_text_file', status: 'failed' } },
+    { schemaVersion: 1, id: 'r5', seq: 5, occurredAt: iso(40), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-1', agentRunId: 'ar1', correlationId: 'res-fail', type: 'model.reserved', payload: { route, kind: 'prompt', estimatedTokens: 50 } },
+    { schemaVersion: 1, id: 'r6', seq: 6, occurredAt: iso(45), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-1', agentRunId: 'ar1', type: 'model.request_started', payload: {} },
+    { schemaVersion: 1, id: 'r7', seq: 7, occurredAt: iso(70), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-1', agentRunId: 'ar1', correlationId: 'res-fail', type: 'model.reservation_settled', payload: { status: 'settled', actualTokens: 40, estimatedCostUsd: 0.01 } },
+    { schemaVersion: 1, id: 'r8', seq: 8, occurredAt: iso(70), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-1', agentRunId: 'ar1', correlationId: 'res-fail', type: 'model.usage', payload: { input: 20, output: 10, cacheRead: 10, cacheWrite: 0, estimatedCostUsd: 0.01 } },
+    { schemaVersion: 1, id: 'r9', seq: 9, occurredAt: iso(75), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-1', agentRunId: 'ar1', type: 'agent.finished', payload: { role: 'root', status: 'failed' } },
+    { schemaVersion: 1, id: 'r10', seq: 10, occurredAt: iso(110), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-2', agentRunId: 'ar2', type: 'visual.round_finished', payload: { round: 1, rendered: true, runtimeErrors: 0 } },
+    { schemaVersion: 1, id: 'r11', seq: 11, occurredAt: iso(200), taskId: task2.id, taskRunId: task2.taskRunId, taskAttemptId: 'r2-2', agentRunId: 'ar2', type: 'task.state_changed', payload: { status: 'succeeded' } },
+  ]
+  const evals = [{
+    id: 'eval-1', taskId: s1.task.id, taskRunId: s1.task.taskRunId, status: 'completed' as const,
+    createdAt: iso(300), automatic: false,
+    result: {
+      id: 'eval-1', taskId: s1.task.id, taskRunId: s1.task.taskRunId, startedAt: iso(300), finishedAt: iso(310),
+      durationMs: 10, status: 'completed', method: 'model', rubricVersion: 'zlo-evaluation-v1', rounds: 1,
+      verdict: 'pass', evidence: ['artifact:0'], issues: [], unknowns: [],
+      scores: {
+        completion: { score: 5, rationale: 'ok', evidence: ['artifact:0'] },
+        correctness: { score: 4, rationale: 'good', evidence: ['artifact:0'] },
+        quality: { score: 5, rationale: 'clean', evidence: ['artifact:0'] },
+      },
+      usage: { inputTokens: 10, outputTokens: 5, estimatedCostUsd: 0.001, complete: true },
+    },
+  }]
+  const metrics = buildMetrics([s1.task, task2], [...s1.events, ...t2Events], now + 400, {}, { evaluations: evals })
+  const byId = new Map(Object.values(metrics.domains).flat().map(m => [m.id, m]))
+  assert.equal(byId.get('task.first_pass_verified_rate')?.value, 50)
+  assert.equal(byId.get('task.self_repair_rate')?.value, 100)
+  assert.equal(byId.get('task.rigor_command')?.value, 1)
+  assert.equal(byId.get('task.rigor_visual')?.value, 1)
+  assert.equal(byId.get('task.strong_verified_rate')?.value, 100)
+  assert.equal(byId.get('tool.edit_churn_ratio')?.value, 2)
+  assert.equal(byId.get('tool.visual_clean_rate')?.value, 100)
+  assert.equal(byId.get('tool.visual_mean_rounds')?.value, 1)
+  // s1 total tokens = 53 (all kept), task2 rework = 40 -> 40 / 93 = 43.01%
+  assert.equal(Number(byId.get('task.rework_token_share')?.value?.toFixed(2)), 43.01)
+  // Total CNY cost = (0.01 + 0.01) * 7.2 = 0.144 CNY across 2 verified tasks -> 0.072 CNY/task
+  assert.equal(byId.get('model.cost')?.value, 0.144)
+  assert.equal(byId.get('model.cost_per_verified_task')?.value, 0.072)
+  assert.equal(byId.get('eval.runs')?.value, 1)
+  assert.equal(byId.get('eval.pass_rate')?.value, 100)
+  assert.equal(byId.get('eval.completion_score')?.value, 5)
+  assert.equal(byId.get('eval.correctness_score')?.value, 4)
+  assert.equal(byId.get('eval.quality_score')?.value, 5)
 })

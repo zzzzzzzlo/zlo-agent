@@ -134,6 +134,7 @@ function projectSpans(events: TelemetryEvent[]) {
       if (!span || span.end) { unpairedEvents++; continue }
       finishSpan(span, event)
       if (payload.reason !== undefined) span.detail.reason = payload.reason
+      if (Array.isArray(payload.targetDigests)) span.detail.targetDigests = payload.targetDigests
     } else if (type === 'task.node_started' && taskAttemptId && !delegation.has(taskAttemptId)) {
       const span = makeSpan(event, taskAttemptId, 'delegation', text(payload.role) ?? 'Delegation')
       span.detail = { role: payload.role, parentNodeId: payload.parentNodeId }
