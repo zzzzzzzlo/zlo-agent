@@ -201,3 +201,39 @@ test('large cumulative usage does not shorten requests while delegated request c
     store.close()
   }
 })
+
+test('P1-5: model.task_fit baseline keeps parent model when parent is already cheaper than alternatives across off/shadow/active', async () => {
+  const cheapParent = { provider: 'authorized', model: 'cheap-parent' }
+  const expensiveAlt = { provider: 'authorized', model: 'expensive-alt' }
+  const execution: AgentExecution = {
+    async open() { throw new Error('Unexpected open') },
+    async validateRoute(route) {
+      if (route.provider !== 'authorized' || (route.model !== cheapParent.model && route.model !== expensiveAlt.model)) {
+        throw new Error('Unavailable')
+      }
+    },
+    async discoverModels() {
+      return [
+        { route: cheapParent, estimatedCost: 1, contextWindow: 32_768, input: ['text'], reasoning: false },
+        { route: expensiveAlt, estimatedCost: 10, contextWindow: 65_536, input: ['text'], reasoning: true },
+      ]
+    },
+  }
+  for (const mode of ['off', 'shadow', 'active'] as const) {
+    const store = new LocalStore(':memory:')
+    try {
+      const judgment = new LocalJudgment(store, {
+        modes: { 'model.task_fit': mode },
+        judge: { async evaluate() { return { output: 1 } } },
+      })
+      const scheduler = new LocalModelScheduler(execution, store, judgment)
+      const route = await scheduler.allocate(event, cheapParent, undefined, true, 'Quick file read')
+      if (mode === 'active') assert.deepEqual(route, expensiveAlt)
+      else assert.deepEqual(route, cheapParent)
+      const [evaluated] = store.events('task')
+      assert.equal(evaluated.payload.baseline, 0)
+    } finally {
+      store.close()
+    }
+  }
+})

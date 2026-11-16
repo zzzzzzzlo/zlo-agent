@@ -82,6 +82,7 @@ export class MultiAgentOrchestrator {
   readonly #extensions: ProfileRuntime
   readonly #approval: ToolApprovalBroker
   readonly #approvalMode: (task: TaskSnapshot) => ToolApprovalMode
+  readonly #approvalContext?: (taskId: string) => { conversationId?: string; conversationTitle?: string } | undefined
   readonly #toolEvidence: ToolEvidenceArchive
   readonly #resolveWorkspace?: (workspace: CodingWorkspace, taskId: string, id: string, signal: AbortSignal) => Promise<CodingWorkspace | undefined>
   readonly #sessions: string
@@ -99,6 +100,7 @@ export class MultiAgentOrchestrator {
     extensions: ProfileRuntime
     approval: ToolApprovalBroker
     approvalMode?: (task: TaskSnapshot) => ToolApprovalMode
+    approvalContext?: (taskId: string) => { conversationId?: string; conversationTitle?: string } | undefined
     mode?: HarnessMode
     resolveWorkspace?: (workspace: CodingWorkspace, taskId: string, id: string, signal: AbortSignal) => Promise<CodingWorkspace | undefined>
     onOutput?: (event: EventDraft, delta: string) => void
@@ -115,6 +117,7 @@ export class MultiAgentOrchestrator {
     this.#extensions = ports.extensions
     this.#approval = ports.approval
     this.#approvalMode = ports.approvalMode ?? (() => 'ask')
+    this.#approvalContext = ports.approvalContext
     this.#toolEvidence = new ToolEvidenceArchive(this.#db)
     this.#resolveWorkspace = ports.resolveWorkspace
     this.#sessions = ports.sessions
@@ -142,6 +145,38 @@ export class MultiAgentOrchestrator {
       if (proposal.tools.some(name => !allowed.has(name))) throw new Error('Requested tool is outside the effective capability scope')
     }
     return scope
+  }
+
+  async validatePlan(taskId: string, workspace: CodingWorkspace, proposals: NodeProposal[]): Promise<void> {
+    if (!Array.isArray(proposals) || !proposals.length) throw new Error('Invalid plan size')
+    const task = this.#tasks.get(taskId)
+    const rootScope = this.#capabilities.root(task.workspaceAccess, Boolean(task.check))
+    const currentRoute = this.rootRoute(taskId) ?? task.route
+    const teamScopes = new Map<string, CapabilityScope>()
+    for (const existing of task.nodes ?? []) {
+      if (existing.role === 'team' && existing.parentNodeId === task.rootNodeId) {
+        teamScopes.set(existing.id, this.#childScope(workspace, rootScope, existing, 'team'))
+      }
+    }
+    for (const proposal of proposals) {
+      if (!proposal || typeof proposal !== 'object') throw new Error('Invalid node proposal')
+      const role = proposal.role ?? (proposal.teamKey ? 'team' : 'worker')
+      if (role !== 'team' && role !== 'worker') throw new Error('Invalid Agent role')
+      if (!proposal.parentNodeId || proposal.parentNodeId === task.rootNodeId) {
+        const scope = this.#childScope(workspace, rootScope, proposal, role)
+        if (role === 'team' && typeof proposal.ref === 'string') teamScopes.set(proposal.ref, scope)
+      } else {
+        const parentScope = teamScopes.get(proposal.parentNodeId)
+        if (!parentScope || role !== 'worker') throw new Error('Invalid nested node scope')
+        this.#childScope(workspace, parentScope, proposal, 'worker')
+      }
+      if (proposal.route) {
+        if (currentRoute && !this.#scheduler.canSwitch(currentRoute, proposal.route)) {
+          throw new Error('Cross-provider delegation is not authorized')
+        }
+        await this.#scheduler.validateRoute(proposal.route)
+      }
+    }
   }
 
   subscribeOutput(sink: (event: OutputEvent) => void | Promise<void>): () => void {
@@ -281,7 +316,8 @@ export class MultiAgentOrchestrator {
     }
     const evidence = new Set<string>()
     const artifacts = new Set<string>()
-    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence, () => stalled.abort(), () => this.#approvalMode(task))
+    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence, () => stalled.abort(),
+      () => this.#approvalMode(task), this.#approvalContext)
     let followUp: TurnFollowUp | undefined
     let session: ExecutionSession | undefined
     let unwatch: (() => Promise<void>) | undefined
@@ -424,22 +460,29 @@ export class MultiAgentOrchestrator {
           }))).slice(0, 4000)] : []),
         ]
         const target = workspaceTarget(node.check ?? (scope.path ? undefined : task.check))
+        const scopedFilter = scope.path ? (entry: { kind: string; text: string }) => {
+          const match = /^Confirmed workspace operation \S+ on (.+)$/u.exec(entry.text)
+          if (!match) return false
+          const filePath = match[1]!
+          return filePath === scope.path || filePath.startsWith(scope.path + '/')
+        } : undefined
         const prompt = await this.#context.build(event, {
-          scope: scope.path || node.worktreeId ? JSON.stringify([memoryScope(task, session.route), scope.path, node.worktreeId])
-            : memoryScope(task, session.route),
+          scope: memoryScope(task, session.route),
+          filter: scopedFilter,
           goal: node.goal, constraints,
           artifactRefs: target ? [target] : [], availableTools: tools.map(tool => tool.name), signal,
         })
         signal.throwIfAborted()
         let outcome = await session.run(advice.hint ? prompt + '\n\n' + advice.hint : prompt)
-        if (outcome.status === 'completed' && !signal.aborted) {
-          const receipts = await toolRun.waitForDeferred(signal)
-          if (receipts.length && !signal.aborted) {
-            await session.checkpoint()
-            outcome = await session.run(deferredResultPrompt(receipts))
-            if (outcome.status === 'completed' && !signal.aborted) await toolRun.waitForDeferred(signal)
+        const drainDeferred = async () => {
+          for (let round = 0; round < 3 && outcome.status === 'completed' && !signal.aborted; round++) {
+            const receipts = await toolRun.waitForDeferred(signal)
+            if (!receipts.length || signal.aborted) break
+            await session!.checkpoint()
+            outcome = await session!.run(deferredResultPrompt(receipts))
           }
         }
+        await drainDeferred()
         const attempted = new Set<TurnFollowUp['id']>()
         while (!signal.aborted && outcome.status === 'completed' &&
           !blockingWrite() &&
@@ -449,7 +492,7 @@ export class MultiAgentOrchestrator {
           if (!followUp || signal.aborted) break
           await session.checkpoint()
           outcome = await session.run(followUp.nudge)
-          if (outcome.status === 'completed' && !signal.aborted) await toolRun.waitForDeferred(signal)
+          await drainDeferred()
         }
         followUp = undefined
         executionCompleted = outcome.status === 'completed'
@@ -476,7 +519,10 @@ export class MultiAgentOrchestrator {
             resultStatus: hardEvidence && accepted ? 'succeeded' : 'failed',
             executionStatus: 'completed',
             summary: outcome.text.slice(0, 1600), artifactRefs: [...artifacts], evidenceRefs: [...evidence],
-            remainingRisks: [...(hardEvidence && accepted ? [] : ['verification_failed']), ...(review ? ['patch_scope_review'] : [])],
+            remainingRisks: [
+              ...(!hardEvidence ? ['verification_failed'] : !accepted ? ['handoff_insufficient'] : []),
+              ...(review ? ['patch_scope_review'] : []),
+            ],
           }
         }
       }
@@ -543,7 +589,8 @@ export class MultiAgentOrchestrator {
 
   async run(task: TaskSnapshot, workspace: CodingWorkspace, stopSignal: AbortSignal): Promise<Outcome> {
     const stalled = new AbortController()
-    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence, () => stalled.abort(), () => this.#approvalMode(task))
+    const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence, () => stalled.abort(),
+      () => this.#approvalMode(task), this.#approvalContext)
     const budget = new AbortController()
     const signal = AbortSignal.any([stopSignal, budget.signal, stalled.signal])
     const agentKey = task.conversationId ?? task.id
@@ -563,7 +610,7 @@ export class MultiAgentOrchestrator {
     let outputFailed = false
     let textProduced = false
     let streamed = false
-    let reportedDeferredResult = false
+    let deferredResultRounds = 0
     let followUp: TurnFollowUp | undefined
     let advice: Awaited<ReturnType<typeof preflight>> = {}
     const attempted = new Set<TurnFollowUp['id']>()
@@ -683,11 +730,14 @@ export class MultiAgentOrchestrator {
         try {
           const requestId = 'plan:' + event.agentRunId + ':' + receiptId(id)
           const planned: NodeProposal[] = []
+          const teamScopes = new Map<string, CapabilityScope>()
+          for (const existing of this.#tasks.get(task.id).nodes ?? []) {
+            if (existing.role === 'team' && existing.parentNodeId === task.rootNodeId) {
+              teamScopes.set(existing.id, this.#childScope(workspace, rootScope, existing, 'team'))
+            }
+          }
           for (const proposal of proposals) {
             if (!proposal || typeof proposal !== 'object') throw new Error('Invalid node proposal')
-            if (!proposal.parentNodeId || proposal.parentNodeId === task.rootNodeId) {
-              this.#childScope(workspace, rootScope, proposal, proposal.role ?? (proposal.teamKey ? 'team' : 'worker'))
-            }
             if (proposal.route && !this.#scheduler.canSwitch(session.route, proposal.route)) {
               throw new Error('Cross-provider delegation is not authorized')
             }
@@ -697,7 +747,16 @@ export class MultiAgentOrchestrator {
               { goal: proposal.goal, parentGoal: task.goal, nodeCount: proposals.length, nodeOrdinal: planned.length,
                 teamCandidate, hasDependencies: Boolean(proposal.dependencies?.length), dependencyCount: proposal.dependencies?.length },
               baseline, !proposal.role && teamCandidate ? ['worker', 'team'] : [baseline], [task.rootNodeId], { planRequestId: requestId, signal })
-            planned.push({ ...proposal, role, ...(role === 'worker' ? { teamKey: undefined } : {}) })
+            const effectiveProposal: NodeProposal = { ...proposal, role, ...(role === 'worker' ? { teamKey: undefined } : {}) }
+            if (!effectiveProposal.parentNodeId || effectiveProposal.parentNodeId === task.rootNodeId) {
+              const scope = this.#childScope(workspace, rootScope, effectiveProposal, role)
+              if (role === 'team' && typeof effectiveProposal.ref === 'string') teamScopes.set(effectiveProposal.ref, scope)
+            } else {
+              const parentTeamScope = teamScopes.get(effectiveProposal.parentNodeId)
+              if (!parentTeamScope || role !== 'worker') throw new Error('Invalid nested node scope')
+              this.#childScope(workspace, parentTeamScope, effectiveProposal, 'worker')
+            }
+            planned.push(effectiveProposal)
           }
           if (!this.#capabilities.enabled('propose_task_plan') || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Planning interrupted' }
           const current = this.#tasks.get(task.id)
@@ -958,8 +1017,8 @@ export class MultiAgentOrchestrator {
           queuedSteers.clear()
           const receipts = await toolRun.waitForDeferred(signal)
           if (signal.aborted) break
-          if (receipts.length && !reportedDeferredResult) {
-            reportedDeferredResult = true
+          if (receipts.length && deferredResultRounds < 4) {
+            deferredResultRounds++
             nextPrompt = deferredResultPrompt(receipts)
             continue
           }
@@ -970,7 +1029,21 @@ export class MultiAgentOrchestrator {
             this.#judgment.mode('turn.continue', task.id) !== 'off')) {
             followUp = await reviewTurn(this.#judgment, event, { goal: task.goal, summary: result.text, checkConfigured: Boolean(task.check),
               operations: this.#tasks.operations(task.id), completedReceipts: this.#completedReceipts(event), attempted, signal })
-            if (followUp && !signal.aborted && !hasUnknownWrite()) {
+            if (signal.aborted) break
+            const postReview = this.#tasks.get(task.id)
+            const arrivedDuringReview = postReview.instructions.some((item) => !item.delivered) ||
+              this.#tasks.runnableNodes(task.id).length > 0 ||
+              (!conversationId && postReview.route && !sameRoute(postReview.route, session.route))
+            if (arrivedDuringReview) {
+              followUp = undefined
+              if (hasUnknownWrite()) {
+                outcome = { status: 'completed', route: session.route, textProduced, event }
+                break
+              }
+              nextPrompt = 'Continue the current task using the updates in this turn.'
+              continue
+            }
+            if (followUp && !hasUnknownWrite()) {
               nextPrompt = followUp.nudge
               continue
             }

@@ -189,3 +189,20 @@ test('P1-3 & P1-4: manager supports async spawnChild re-evaluation on restart an
     assert.deepEqual(await manager.start(), { state: 'ready', mode: 'faux' })
   }
 })
+
+test('P1-6: invalid or oversized tool.approval frame immediately replies approved=false instead of stalling Host', async (t) => {
+  const entries: DiagnosticEntry[] = []
+  const manager = new HostProcessManager({
+    mode: 'faux',
+    requestTimeoutMs: 1_500,
+    spawnChild: () => startFixture('ready'),
+    diagnostic: (entry) => entries.push(entry),
+  })
+  t.after(() => manager.shutdown())
+  await manager.start()
+  const decision = await manager.request<{ approved: boolean }>({
+    schemaVersion: 1, type: 'resumeConversation', conversationId: 'c1', requestId: 'r1',
+  })
+  assert.deepEqual(decision, { approved: false })
+  assert.ok(entries.some(entry => entry.code === 'desktop.host_protocol_invalid'))
+})

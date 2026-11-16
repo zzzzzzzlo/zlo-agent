@@ -203,6 +203,15 @@ export class LocalAgentHost {
         onOutput: (event, delta) => this.#conversations.recordDelta(event, delta),
         onCheckpoint: (taskId) => this.#conversations.checkpointOutput(taskId),
         approvalMode: (task) => task.conversationId ? this.#conversations.get(task.conversationId).toolApprovalMode ?? 'ask' : 'ask',
+        approvalContext: (taskId) => {
+          const conversationId = this.#engine.get(taskId).conversationId
+          if (!conversationId) return undefined
+          try {
+            return { conversationId, conversationTitle: this.#conversations.get(conversationId).title }
+          } catch {
+            return { conversationId }
+          }
+        },
       })
       this.#recover()
     } catch (error) {
@@ -597,8 +606,7 @@ export class LocalAgentHost {
     const tasks = conversation ? this.#conversations.recentTaskIds(conversation.id, 20).map(id => this.#engine.get(id)) : []
     const memory: ManagedMemory | undefined = conversation ? { entries: [], recalls: [] } : undefined
     if (conversation && memory) {
-      const providers = new Set<string>([...management.providers, 'chatgpt'])
-      if (conversation.route) providers.add(conversation.route.provider)
+      const providers = this.#conversationMemoryProviders(conversation)
       for (const provider of providers) {
         for (const { id, kind, text, version, updatedAt } of this.#memory.list(management.conversationScope(conversation, provider))) {
           memory.entries.push({ id, kind, text, version, updatedAt })
@@ -695,11 +703,33 @@ export class LocalAgentHost {
     return this.#conversations.get(conversation.id)
   }
 
+  #conversationMemoryProviders(conversation: ConversationSummary): Set<string> {
+    const providers = new Set<string>([
+      ...management.providers,
+      'chatgpt',
+      'xai',
+      ...(this.#store.get<string[]>('conversation-memory-providers', conversation.id) ?? []),
+    ])
+    if (conversation.route) providers.add(conversation.route.provider)
+    const activeRoute = this.#orchestrator.conversationRoute(conversation.id)
+    if (activeRoute) providers.add(activeRoute.provider)
+    for (const taskId of this.#conversations.recentTaskIds(conversation.id, 50)) {
+      try {
+        const task = this.#engine.get(taskId)
+        if (task.route) providers.add(task.route.provider)
+        for (const item of this.#store.eventsOfTypes(taskId, ['agent.started', 'model.route_changed'])) {
+          const route = item.payload.route as { provider?: unknown } | undefined
+          if (typeof route?.provider === 'string' && route.provider) providers.add(route.provider)
+        }
+      } catch { /* Historical task lookup is best-effort. */ }
+    }
+    return providers
+  }
+
   #removeMemory(conversationId: string, ids: unknown): number {
     const conversation = this.#conversations.get(management.id(conversationId))
     const selected = management.memoryIds(ids)
-    const providers = new Set<string>([...management.providers, 'chatgpt'])
-    if (conversation.route) providers.add(conversation.route.provider)
+    const providers = this.#conversationMemoryProviders(conversation)
     return [...providers].reduce((count, provider) => count +
       this.#memory.remove(management.conversationScope(conversation, provider), selected), 0)
   }
@@ -924,13 +954,22 @@ export class LocalAgentHost {
       case 'resume': return this.resume(command.taskId, command.requestId)
       case 'addInstruction': return this.addInstruction(command.taskId, command.requestId, command.text)
       case 'addTask': return this.addTask(command.taskId, command.requestId, command.goal, command.expectedVersion, command.dependencies)
-      case 'proposePlan':
+      case 'proposePlan': {
+        this.#assertStandaloneTask(command.taskId)
+        if (!this.#profile.delegation) throw new Error('The profile disables delegation')
+        const existing = this.#engine.recorded<ReturnType<TaskEngine['proposePlan']>>(
+          command.requestId, ['proposePlan', command.taskId, command.expectedVersion, command.nodes])
+        if (existing) return existing
+        const task = this.#engine.get(command.taskId)
+        const workspace = this.#workspace(task.cwd)
+        await this.#orchestrator.validatePlan(command.taskId, workspace, command.nodes)
+        this.#assertWritable()
+        return this.#engine.proposePlan(command.taskId, command.requestId, command.expectedVersion, command.nodes)
+      }
       case 'replanNode':
         this.#assertStandaloneTask(command.taskId)
         if (!this.#profile.delegation) throw new Error('The profile disables delegation')
-        return command.type === 'proposePlan'
-          ? this.#engine.proposePlan(command.taskId, command.requestId, command.expectedVersion, command.nodes)
-          : this.#engine.replanNode(command.taskId, command.requestId, command.expectedVersion, command.nodeId, command.update)
+        return this.#engine.replanNode(command.taskId, command.requestId, command.expectedVersion, command.nodeId, command.update)
       case 'requestModelSwitch': return this.requestModelSwitch(command.taskId, command.requestId, command.route)
       case 'createConversation': return this.createConversation(command)
       case 'listConversations': return this.listConversations()
@@ -1010,7 +1049,11 @@ export class LocalAgentHost {
       const confirmedOperation = operations.some(item => item.status === 'succeeded')
       const access = this.#capabilities.root(snapshot.workspaceAccess, Boolean(snapshot.check)).access
       const verification = snapshot.worker?.status === 'failed'
-        ? { passed: false, evidence: 'worker_verification_failed' }
+        ? {
+          passed: false,
+          evidence: snapshot.worker.result?.remainingRisks.includes('handoff_insufficient')
+            ? 'worker_handoff_rejected' : 'worker_verification_failed',
+        }
         : snapshot.nodes?.some(node => node.status !== 'succeeded')
           ? { passed: false, evidence: 'dag_not_converged' }
         : snapshot.check?.command && !this.#capabilities.enabled('run_project_command')
@@ -1050,12 +1093,21 @@ export class LocalAgentHost {
   }
 
   async #captureMemory(task: TaskSnapshot, route: ModelRoute, event: EventDraft, signal: AbortSignal): Promise<void> {
-    const writes = this.#engine.operations(task.id).filter(item => item.effect === 'write' && item.status === 'succeeded')
-    const entries = writes.filter(item => item.target).slice(-12).map(item => ({
-      kind: 'fact' as const,
-      text: 'Confirmed workspace operation ' + item.tool + ' on ' + item.target,
-      sourceRefs: [item.id],
-    }))
+    const failedNodes = new Set<string>([
+      ...(task.worker && task.worker.status !== 'succeeded' ? [task.worker.id] : []),
+      ...(task.nodes ?? []).filter(node => node.status !== 'succeeded').map(node => node.id),
+    ])
+    const writes = this.#engine.operations(task.id).filter(item =>
+      item.effect === 'write' && item.status === 'succeeded' && (!item.taskNodeId || !failedNodes.has(item.taskNodeId)))
+    const entries = writes.flatMap(item => {
+      const targets = item.target ? [item.target] : (item.changedPaths ?? [])
+      return targets.map(target => ({
+        kind: 'fact' as const,
+        key: 'op:' + item.tool + ':' + createHash('sha256').update(target).digest('hex').slice(0, 24),
+        text: 'Confirmed workspace operation ' + item.tool + ' on ' + target,
+        sourceRefs: [item.id],
+      }))
+    }).slice(-12)
     const scope = memoryScope(task, route)
     const experiences = task.check && task.verification?.passed ? [{
       kind: 'experience' as const,
@@ -1066,9 +1118,16 @@ export class LocalAgentHost {
     if (this.#judgment.mode('memory.capture', task.id) === 'off') {
       this.#memory.capture(event, scope, entries)
       if (experiences.length) this.#memory.capture(event, scope, experiences)
-      return
+    } else {
+      await this.#memory.captureReviewed(event, scope, [...entries, ...experiences], task.goal, this.#judgment, signal)
     }
-    await this.#memory.captureReviewed(event, scope, [...entries, ...experiences], task.goal, this.#judgment, signal)
+    if (task.conversationId && (entries.length || experiences.length)) {
+      const known = new Set(this.#store.get<string[]>('conversation-memory-providers', task.conversationId) ?? [])
+      if (!known.has(route.provider)) {
+        known.add(route.provider)
+        this.#store.transaction(() => this.#store.put('conversation-memory-providers', task.conversationId!, [...known]))
+      }
+    }
   }
 
   async idle(): Promise<void> {

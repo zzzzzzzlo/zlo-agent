@@ -19,12 +19,32 @@ if (variant !== 'no-ready' && variant !== 'pi-ready') {
   process.stdout.write(ready.slice(0, 11))
   setTimeout(() => process.stdout.write(ready.slice(11)), 25)
 }
+let pendingInvalidApprovalReply = null
 const lines = createInterface({ input: process.stdin })
 for await (const line of lines) {
   const request = JSON.parse(line)
   switch (request.type) {
     case 'initializeProviderKeys':
       if (variant === 'pi-ready') process.stdout.write(ready)
+      break
+    case 'resolveToolApproval':
+      if (pendingInvalidApprovalReply) {
+        response(pendingInvalidApprovalReply, request.decision)
+        pendingInvalidApprovalReply = null
+      }
+      break
+    case 'resumeConversation':
+      pendingInvalidApprovalReply = request
+      output({
+        kind: 'tool.approval',
+        request: {
+          id: '11111111-1111-4111-8111-111111111111',
+          kind: 'shell',
+          tool: 'shell_exec',
+          detail: 'x'.repeat(9000),
+          workspace: 'D:\\workspace',
+        },
+      })
       break
     case 'listConversations':
       setTimeout(() => response(request, ['first']), 25)

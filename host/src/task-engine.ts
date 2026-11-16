@@ -827,10 +827,13 @@ export class TaskEngine {
         }
         if (!completed) accepted = { ...result, resultStatus: 'failed', remainingRisks: [...result.remainingRisks, verification.evidence] }
       } else if (result?.resultStatus === 'failed') {
-        verification = {
-          passed: false, verdict: 'failed', basis: verification?.basis ?? 'handoff',
-          evidence: verification && !verification.passed ? verification.evidence : 'node_handoff_rejected',
-        }
+        verification = verification && confirmedCheck(verification)
+          ? normalizeVerification(verification)
+          : {
+            passed: false, verdict: 'failed',
+            basis: verification && !verification.passed ? (verification.basis ?? 'handoff') : 'handoff',
+            evidence: verification && !verification.passed ? verification.evidence : 'node_handoff_rejected',
+          }
       }
       const settled: WorkerNode = { ...node, status: accepted?.resultStatus ?? 'ready', result: accepted, verification }
       const parent = nodes.find(({ suspendedFor }) => suspendedFor === nodeId)

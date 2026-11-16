@@ -304,8 +304,9 @@ export class PiExecution implements AgentExecution {
     model ??= await this.resolveModel(modelRuntime, previousRoute && { provider: previousRoute.provider, model: previousRoute.modelId })
     const ref = { id: manager.getSessionId(), path }
     const traceId = config.correlationId ?? randomUUID()
-    const chatGpt = !!config.route && isChatGptProvider(config.route.provider)
-    const route = { provider: chatGpt ? config.route!.provider : model.provider, model: model.id }
+    const effectiveProvider = config.route?.provider ?? previousRoute?.provider
+    const chatGpt = !!effectiveProvider && isChatGptProvider(effectiveProvider)
+    const route = { provider: chatGpt ? effectiveProvider : model.provider, model: model.id }
     let stopping = false
     const pendingImages = new Map<string, ToolImage[]>()
     const vision = model.input.includes('image')

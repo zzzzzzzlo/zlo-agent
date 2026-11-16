@@ -145,15 +145,25 @@ export class JevFailure extends Error {
 
 type Questions = Record<string, { type: 'noul'; instructions: string }>
 
-async function readAnswer(response: Response): Promise<Record<string, unknown>> {
+async function readAnswer(response: Response, signal: AbortSignal): Promise<Record<string, unknown>> {
+  if (signal.aborted) throw new JevFailure('timeout', true)
   const reader = response.body?.getReader()
   if (!reader) throw new JevFailure('invalid_response', true)
   const decoder = new TextDecoder()
   let size = 0
   let json = ''
+  let onAbort: (() => void) | undefined
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => {
+      void reader.cancel().catch(() => {})
+      reject(new JevFailure('timeout', true))
+    }
+    if (signal.aborted) onAbort()
+    else signal.addEventListener('abort', onAbort, { once: true })
+  })
   try {
     while (true) {
-      const chunk = await reader.read()
+      const chunk = await Promise.race([reader.read(), aborted])
       if (chunk.done) break
       size += chunk.value.byteLength
       if (size > responseLimit) throw new JevFailure('invalid_response', true)
@@ -161,9 +171,11 @@ async function readAnswer(response: Response): Promise<Record<string, unknown>> 
     }
     return record(JSON.parse(json + decoder.decode()))
   } catch (error) {
+    if (signal.aborted) throw new JevFailure('timeout', true)
     if (error instanceof JevFailure) throw error
     throw new JevFailure('invalid_response', true)
   } finally {
+    if (onAbort) signal.removeEventListener('abort', onAbort)
     void reader.cancel().catch(() => {})
     reader.releaseLock()
   }
@@ -245,7 +257,7 @@ export class JevJudge implements Judge {
         : response.status === 429 ? 'rate_limited' : response.status === 402 ? 'billing'
           : response.status === 404 ? 'invalid_model' : 'unavailable', true)
     }
-    const result = await readAnswer(response)
+    const result = await readAnswer(response, signal)
     const model = result.model
     if (!jevModel(model) || (this.#key !== '' && model.includes(this.#key))) throw new JevFailure('invalid_response', true)
     const answers = record(result.answers)

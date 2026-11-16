@@ -59,9 +59,13 @@ function normalizedCandidate(candidate: MemoryCandidate): MemoryCandidate | unde
   return { kind: candidate.kind, text, sourceRefs, ...(candidate.key ? { key: candidate.key } : {}) }
 }
 
+const memoryStopwords = new Set([
+  'confirmed', 'workspace', 'operation', 'on', 'in', 'to', 'of', 'for', 'the', 'and', 'with', 'from', 'by', 'at', 'as', 'is', 'are', 'an',
+])
+
 function terms(text: string): Set<string> {
   const words = text.normalize('NFKC').toLowerCase().match(/\p{Script=Han}|(?:(?!\p{Script=Han})[\p{L}\p{N}])+/gu) ?? []
-  return new Set(words.filter((word) => word.length > 1 || /\p{Script=Han}/u.test(word)).slice(0, 256))
+  return new Set(words.filter((word) => (word.length > 1 && !memoryStopwords.has(word)) || /\p{Script=Han}/u.test(word)).slice(0, 256))
 }
 
 function similarity(query: Set<string>, text: string): number {
@@ -183,6 +187,7 @@ export interface ContextOptions {
   constraints?: string[]
   artifactRefs?: string[]
   availableTools?: string[]
+  filter?: (entry: MemoryEntry) => boolean
   /** Conservative token budget, charged one unit per UTF-8 byte. */
   budget?: number
   signal?: AbortSignal
@@ -223,7 +228,10 @@ export class ScopedContext {
       if (append((hasArtifacts ? '' : '\n\nRelevant artifacts:') + '\n- ' + JSON.stringify(ref))) hasArtifacts = true
     }
     const recallStart = performance.now()
-    const candidates = this.#memory.recall(options.scope, options.goal)
+    const recalled = options.filter
+      ? this.#memory.recall(options.scope, options.goal).filter(options.filter)
+      : this.#memory.recall(options.scope, options.goal)
+    const candidates = recalled
       .map((entry) => ({ entry, line: '\n- ' + entry.kind + ': ' + JSON.stringify(entry.text) }))
       .filter(({ line }) => Buffer.byteLength(recalledHeading + line) <= remaining)
     const choices = candidates.length ? candidates.map((_, index) => index) : [-1]

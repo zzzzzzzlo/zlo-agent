@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import { ShieldAlert } from 'lucide-react'
 import type { ApprovalKind, ToolApprovalRequest } from '../../../../shared/contracts/tool-approval.ts'
+import { useWorkspace } from '../../stores/workspace.ts'
 
 const titles: Record<ApprovalKind, string> = {
   shell: '运行系统命令', destructive: '确认文件操作', git: '修改 Git 仓库',
@@ -10,13 +11,20 @@ const titles: Record<ApprovalKind, string> = {
 function details(request: ToolApprovalRequest): string {
   try {
     const input = JSON.parse(request.detail)
-    if (request.kind === 'shell' && typeof input?.command === 'string') return input.command
+    if (request.kind === 'shell' && typeof input?.command === 'string') {
+      const meta: string[] = []
+      if (typeof input.shell === 'string' && input.shell) meta.push(`Shell: ${input.shell}`)
+      if (typeof input.path === 'string' && input.path && input.path !== '.') meta.push(`子目录: ${input.path}`)
+      if (typeof input.timeoutMs === 'number' && Number.isFinite(input.timeoutMs)) meta.push(`超时: ${Math.round(input.timeoutMs / 1000)}s`)
+      return meta.length ? `[${meta.join(' · ')}]\n${input.command}` : input.command
+    }
     return JSON.stringify(input, null, 2)
   } catch { return request.detail }
 }
 
 export function ToolApprovalCard() {
   const api = window.agentToolApprovals
+  const sessions = useWorkspace(state => state.sessions)
   const [requests, setRequests] = useState<ToolApprovalRequest[]>([])
   const [responding, setResponding] = useState<string>()
   const [failed, setFailed] = useState<string>()
@@ -33,6 +41,8 @@ export function ToolApprovalCard() {
   }, [api])
   const request = requests[0]
   if (!api || !request) return null
+  const sessionLabel = request.conversationTitle
+    || (request.conversationId ? sessions.find(item => item.id === request.conversationId)?.title || request.conversationId : undefined)
 
   function decide(approved: boolean) {
     if (!api || !request || responding === request.id) return
@@ -50,6 +60,7 @@ export function ToolApprovalCard() {
         <div><h2>{titles[request.kind]}</h2><span className="mono">{request.tool}</span></div>
         {requests.length > 1 && <small>待处理 {requests.length} 项</small>}
       </header>
+      {sessionLabel && <p className="approval-workspace" title={sessionLabel}>会话：{sessionLabel}</p>}
       <p className="approval-workspace" title={request.workspace}>{request.workspace}</p>
       <pre className="approval-command" tabIndex={0}>{details(request)}</pre>
       {request.kind === 'shell' && <p className="approval-risk">命令以当前 Windows 用户权限运行，可访问工作区以外的资源。</p>}

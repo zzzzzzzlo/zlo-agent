@@ -1,7 +1,7 @@
 import { mkdirSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { app, BrowserWindow, ipcMain, session, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, session, shell } from 'electron'
 import type { IpcMainInvokeEvent } from 'electron'
 import { windowChannels } from '../window-api'
 import { localDirectory } from './agent-input.ts'
@@ -127,10 +127,21 @@ app.whenReady().then(() => {
   ipcMain.handle(windowChannels.close, (event) => windowFor(event).close())
   ipcMain.handle(windowChannels.maximized, (event) => windowFor(event).isMaximized())
   ipcMain.handle(windowChannels.openExternalLink, async (event, value: unknown) => {
-    windowFor(event)
+    const window = windowFor(event)
     if (typeof value !== 'string' || value.length > 2048) return
     const url = URL.parse(value)
     if (!url || (url.protocol !== 'https:' && url.protocol !== 'http:') || url.username || url.password) return
+    const { response } = await dialog.showMessageBox(window, {
+      type: 'question',
+      title: '打开外部链接',
+      message: '是否在系统默认浏览器中打开外部链接？',
+      detail: url.href,
+      buttons: ['取消', '打开链接'],
+      defaultId: 0,
+      cancelId: 0,
+      noLink: true,
+    })
+    if (response !== 1 || window.isDestroyed()) return
     await shell.openExternal(url.href)
   })
   ipcMain.handle(windowChannels.toggleMaximize, (event) => {

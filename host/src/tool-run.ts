@@ -68,18 +68,21 @@ export class ToolRun {
   readonly #archive?: ToolEvidenceArchive
   readonly #onRepeatedFailure: () => void
   readonly #approvalMode: () => ToolApprovalMode
+  readonly #approvalContext?: (taskId: string) => { conversationId?: string; conversationTitle?: string } | undefined
   readonly #evidenceAccess = new Map<string, () => boolean>()
   readonly #failures = new Map<string, { count: number; paths: string[] }>()
   #closed = false
 
   constructor(tasks: TaskEngine, approval: ToolApprovalBroker, judgment?: LocalJudgment, archive?: ToolEvidenceArchive,
-    onRepeatedFailure: () => void = () => {}, approvalMode: () => ToolApprovalMode = () => 'ask') {
+    onRepeatedFailure: () => void = () => {}, approvalMode: () => ToolApprovalMode = () => 'ask',
+    approvalContext?: (taskId: string) => { conversationId?: string; conversationTitle?: string } | undefined) {
     this.#tasks = tasks
     this.#approval = approval
     this.#judgment = judgment
     this.#archive = archive
     this.#onRepeatedFailure = onRepeatedFailure
     this.#approvalMode = approvalMode
+    this.#approvalContext = approvalContext
   }
 
   guard(tool: ExecutionTool, event: () => EventDraft, signal: AbortSignal, workspaceTool?: WorkspaceTool): ExecutionTool {
@@ -171,8 +174,14 @@ export class ToolRun {
             deny('approval_unattended')
             return { ok: false, error: 'This operation requires separate user approval. Unattended mode declined it; use an already authorized alternative.' }
           } else {
+            let contextMeta: { conversationId?: string; conversationTitle?: string } | undefined
+            try {
+              contextMeta = this.#approvalContext?.(ref.taskId) ?? { conversationId: this.#tasks.get(ref.taskId).conversationId }
+            } catch { /* Approval metadata is best-effort. */ }
             const approval = await this.#approval.request({
               kind: approvalKind, tool: tool.name, detail, workspace: workspace.root,
+              ...(contextMeta?.conversationId ? { conversationId: contextMeta.conversationId } : {}),
+              ...(contextMeta?.conversationTitle ? { conversationTitle: contextMeta.conversationTitle } : {}),
               ...(approvalKind === 'export' && target ? { suggestedName: basename(target) } : {}),
             }, combined, ref.taskId)
             const approved = approval.approved && !this.#closed && !combined.aborted && authorize(input)

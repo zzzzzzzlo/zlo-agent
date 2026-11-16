@@ -129,3 +129,38 @@ test('Git inspection tools use read accounting and Windows case-variant commit p
   assert.equal(committed.ok, true)
   assert.equal(git(root, ['status', '--porcelain']), '')
 })
+
+test('P1-6: concurrent git_commit calls across two isolated worktrees serialize cleanly without repository lock collisions', async context => {
+  const { workspace, worktrees, tools, run } = await fixture(context)
+  const wtA = await run('git_worktree', { branch: 'zlo/parallel-a' })
+  const wtB = await run('git_worktree', { branch: 'zlo/parallel-b' })
+  assert.ok(wtA.worktreeId && wtB.worktreeId)
+  const pathA = await worktrees.resolve(workspace, 'task-one', wtA.worktreeId)
+  const pathB = await worktrees.resolve(workspace, 'task-one', wtB.worktreeId)
+  assert.ok(pathA && pathB)
+  await writeFile(join(pathA, 'parallel-a.txt'), 'from worktree A\n')
+  await writeFile(join(pathB, 'parallel-b.txt'), 'from worktree B\n')
+
+  const [commitA, commitB] = await Promise.all([
+    run('git_commit', { message: 'Commit A', paths: ['parallel-a.txt'], worktreeId: wtA.worktreeId }),
+    run('git_commit', { message: 'Commit B', paths: ['parallel-b.txt'], worktreeId: wtB.worktreeId }),
+  ])
+  assert.equal(commitA.ok, true, commitA.error)
+  assert.equal(commitB.ok, true, commitB.error)
+  assert.notEqual(commitA.commit, commitB.commit)
+
+  // Also verify two isolated CodingWorkspace instances (as used by parallel Worker nodes) serialize cleanly
+  await writeFile(join(pathA, 'parallel-a2.txt'), 'second from A\n')
+  await writeFile(join(pathB, 'parallel-b2.txt'), 'second from B\n')
+  const toolsA = createGitTools(new CodingWorkspace(pathA), worktrees)
+  const toolsB = createGitTools(new CodingWorkspace(pathB), worktrees)
+  const ctxA: ToolInvocationContext = { taskId: 'task-one', agentRunId: 'worker-a', defer() {}, onCleanup() {} }
+  const ctxB: ToolInvocationContext = { taskId: 'task-one', agentRunId: 'worker-b', defer() {}, onCleanup() {} }
+  const [isolatedA, isolatedB] = await Promise.all([
+    toolsA.find(t => t.name === 'git_commit')!.execute('a2', { message: 'Isolated A2', paths: ['parallel-a2.txt'] }, undefined, ctxA) as Promise<{ ok: boolean; error?: string }>,
+    toolsB.find(t => t.name === 'git_commit')!.execute('b2', { message: 'Isolated B2', paths: ['parallel-b2.txt'] }, undefined, ctxB) as Promise<{ ok: boolean; error?: string }>,
+  ])
+  assert.equal(isolatedA.ok, true, isolatedA.error)
+  assert.equal(isolatedB.ok, true, isolatedB.error)
+  void tools
+})

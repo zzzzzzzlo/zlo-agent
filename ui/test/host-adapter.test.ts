@@ -314,3 +314,43 @@ test('P1-6: cancel dispatches stopConversation immediately even while another wo
     adapter.dispose()
   }
 })
+
+test('P1-6: retrying send after a transient steer error when the old turn has finished dispatches sendMessage instead of stale steerConversation', async () => {
+  const storeFactory = await loadWorkspaceFactory()
+  let steerCalls = 0
+  let sendCalls = 0
+  const { api, emit } = testApi(async () => ({ ...history(10), turns: [{ ...turn, status: 'running' }] }))
+  api.steerConversation = async () => {
+    steerCalls++
+    const transient = Object.assign(new Error('Host temporarily busy'), { code: 'HOST_UNAVAILABLE' })
+    throw transient
+  }
+  api.sendMessage = async (input) => {
+    sendCalls++
+    return { conversationId: input.conversationId, taskId: 'fresh-task', seq: 12 }
+  }
+  const adapter = new HostAgentAdapter(api)
+  const store = storeFactory(adapter, false)
+  const close = store.getState().initialize()
+  try {
+    await setImmediate()
+    store.getState().setDraft(conversation.id, '补充说明')
+    await store.getState().send()
+    assert.equal(steerCalls, 1)
+    assert.equal(sendCalls, 0)
+    assert.ok(store.getState().error)
+
+    // Meanwhile the active turn finishes!
+    emit({ ...event(11, 'turn.settled', { status: 'succeeded' }), taskId: turn.taskId })
+    assert.equal(store.getState().sessions[0].turns.at(-1)?.status, 'completed')
+
+    // Retrying the exact same draft now dispatches sendMessage (fresh turn) rather than steering the finished task!
+    await store.getState().send()
+    assert.equal(steerCalls, 1)
+    assert.equal(sendCalls, 1)
+    assert.equal(store.getState().drafts[conversation.id], '')
+  } finally {
+    close()
+    adapter.dispose()
+  }
+})

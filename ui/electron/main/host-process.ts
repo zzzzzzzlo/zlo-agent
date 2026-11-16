@@ -94,6 +94,9 @@ function approvalRequest(value: unknown): value is ToolApprovalRequest {
     approvalKinds.includes(value.kind as ApprovalKind) && typeof value.tool === 'string' &&
     /^[a-z0-9_]{1,80}$/u.test(value.tool) && typeof value.detail === 'string' && value.detail.length <= 8_000 &&
     typeof value.workspace === 'string' && value.workspace.length <= 4096 &&
+    (value.conversationId === undefined || (typeof value.conversationId === 'string' && /^[a-f0-9-]{36}$/iu.test(value.conversationId))) &&
+    (value.conversationTitle === undefined || (typeof value.conversationTitle === 'string' &&
+      !/[\u0000-\u001f\u007f]/u.test(value.conversationTitle) && value.conversationTitle.length <= 200)) &&
     (value.suggestedName === undefined || (typeof value.suggestedName === 'string' &&
       !/[\\/:\u0000-\u001f]/u.test(value.suggestedName) && value.suggestedName.length <= 260))
 }
@@ -409,8 +412,15 @@ export class HostProcessManager {
         return
       }
       emit(this.#events, message.event)
-    } else if (message.kind === 'tool.approval' && connection.state === 'ready' && approvalRequest(message.request)) {
-      this.#askToolApproval(connection, message.request)
+    } else if (message.kind === 'tool.approval' && connection.state === 'ready') {
+      if (approvalRequest(message.request)) {
+        this.#askToolApproval(connection, message.request)
+      } else if (isObject(message.request) && typeof message.request.id === 'string' && /^[a-f0-9-]{36}$/iu.test(message.request.id)) {
+        this.#log('desktop.host_protocol_invalid', connection.correlationId)
+        connection.child.stdin.write(JSON.stringify({
+          schemaVersion: 1, type: 'resolveToolApproval', approvalId: message.request.id, decision: { approved: false },
+        }) + '\n')
+      }
     } else if (message.kind === 'tool.approval_cancelled' && typeof message.approvalId === 'string') {
       connection.approvals.get(message.approvalId)?.abort()
     } else if (message.kind === 'result' || message.kind === 'error') {

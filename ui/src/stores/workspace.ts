@@ -333,9 +333,13 @@ export function createWorkspace(adapter: HostAgentAdapter | undefined, mock: boo
             set({ drafts })
             persist()
           }
-          if (pendingMessage?.conversationId !== conversationId || pendingMessage.text !== text) {
+          const latestSession = get().sessions.find(({ id }) => id === conversationId) ?? session
+          const latestTurn = latestSession?.turns.at(-1)
+          const busyTurnId = latestTurn && isBusy(latestTurn.status) ? latestTurn.id : undefined
+          const staleTask = pendingMessage && (('taskId' in pendingMessage ? pendingMessage.taskId : undefined) !== busyTurnId)
+          if (pendingMessage?.conversationId !== conversationId || pendingMessage.text !== text || staleTask) {
             const request = { conversationId, requestId: crypto.randomUUID(), text }
-            pendingMessage = current && isBusy(current.status) ? { ...request, taskId: current.id } : request
+            pendingMessage = busyTurnId ? { ...request, taskId: busyTurnId } : request
           }
           const request = pendingMessage
           try {

@@ -186,14 +186,14 @@ export async function judgeToolResult(judgment: LocalJudgment, archive: ToolEvid
   const ranked = await rankFiles(judgment, event, operationId, tool, goal, result, signal)
   const injectionMode = judgment.mode('tool.injection', event.taskId)
   const admissionMode = judgment.mode('tool.admission', event.taskId)
-  if (injectionMode === 'off' && admissionMode === 'off') return { value: ranked }
   const external = externalText(tool, ranked)
+  if (!external && admissionMode === 'off') return { value: ranked }
   const output = external ?? (admissionMode !== 'off' ? localAdmission(tool, ranked) : undefined)
   if (!output?.segments.length || signal.aborted) return { value: ranked }
   const { segments } = output
   const bytes = segments.reduce((sum, segment) => sum + Buffer.byteLength(segment.text), 0)
-  if (external && injectionMode !== 'off') {
-    // Deterministic matches are never reversed by a judge. The bounded sample covers the response edge-to-edge.
+  if (external) {
+    // Deterministic matches are never reversed by a judge and remain active across off/shadow/active modes.
     const known = segments.map(segment => knownInjection.test(segment.text))
     for (let index = 1; index < segments.length; index++) {
       const previous = segments[index - 1]
@@ -206,12 +206,14 @@ export async function judgeToolResult(judgment: LocalJudgment, archive: ToolEvid
         known[index] = true
       }
     }
-    const sample = sampled(segments.map((segment, index) => ({ segment, index })))
-    const output = await judgment.decideBatch(event, 'tool.injection', { tool, bytes, candidateCount: segments.length },
-      sample.map(({ segment, index }) => ({ baseline: known[index], label: segment.field, excerpt: segment.text })), [operationId], { signal })
-    if (canReplay && injectionMode === 'active' && !signal.aborted && judgment.mode('tool.injection', event.taskId) === 'active') {
-      sample.forEach(({ segment }, index) => { segment.blocked = output[index] })
-      segments.forEach((segment, index) => { segment.blocked ||= known[index] })
+    segments.forEach((segment, index) => { if (known[index]) segment.blocked = true })
+    if (injectionMode !== 'off') {
+      const sample = sampled(segments.map((segment, index) => ({ segment, index })))
+      const verdicts = await judgment.decideBatch(event, 'tool.injection', { tool, bytes, candidateCount: segments.length },
+        sample.map(({ segment, index }) => ({ baseline: known[index], label: segment.field, excerpt: segment.text })), [operationId], { signal })
+      if (injectionMode === 'active' && !signal.aborted && judgment.mode('tool.injection', event.taskId) === 'active') {
+        sample.forEach(({ segment }, index) => { if (verdicts[index]) segment.blocked = true })
+      }
     }
   }
   if (admissionMode !== 'off' && bytes >= minAdmissionBytes && !signal.aborted) {

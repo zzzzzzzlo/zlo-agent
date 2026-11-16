@@ -11,7 +11,46 @@ const worktreePattern = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/u
 const commitPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/u
 const branchSchema = { type: 'string', minLength: 1, maxLength: 96 }
 const idSchema = { type: 'string', minLength: 36, maxLength: 36 }
-const activeRepositories = new Set<string>()
+const repositoryQueues = new Map<string, Promise<void>>()
+const activeWorktrees = new Set<string>()
+
+async function acquireRepository(key: string, signal?: AbortSignal): Promise<(() => void) | undefined> {
+  if (signal?.aborted) return undefined
+  const previous = repositoryQueues.get(key) ?? Promise.resolve()
+  const current = Promise.withResolvers<void>()
+  const tail = previous.then(() => current.promise)
+  repositoryQueues.set(key, tail)
+  let released = false
+  const release = () => {
+    if (released) return
+    released = true
+    current.resolve()
+    if (repositoryQueues.get(key) === tail) repositoryQueues.delete(key)
+  }
+  if (signal) {
+    let onAbort: (() => void) | undefined
+    const aborted = new Promise<boolean>((resolve) => {
+      onAbort = () => resolve(true)
+      if (signal.aborted) resolve(true)
+      else signal.addEventListener('abort', onAbort, { once: true })
+    })
+    try {
+      if (await Promise.race([previous.then(() => false), aborted])) {
+        release()
+        return undefined
+      }
+    } finally {
+      if (onAbort) signal.removeEventListener('abort', onAbort)
+    }
+  } else {
+    await previous
+  }
+  if (signal?.aborted) {
+    release()
+    return undefined
+  }
+  return release
+}
 
 interface WorktreeRecord { version: 1; taskId: string; worktreeId: string; repository: string; branch: string }
 
@@ -322,7 +361,8 @@ export function createGitTools(workspace: CodingWorkspace, worktrees?: ManagedGi
         const input = object(raw)
         if (!input || Object.keys(input).some(key => !Object.hasOwn(properties, key)) ||
           required.some(key => !Object.hasOwn(input, key)) || signal?.aborted) return rejected('Invalid or interrupted Git request')
-        const release = workspace.acquireWrite()
+        const targetsWorktree = name === 'git_commit' && input.worktreeId !== undefined
+        const release = targetsWorktree ? () => {} : workspace.acquireWrite()
         if (!release) return rejected('Another workspace write is active')
         try {
           const primary = await hasPrimaryRepository(workspace)
@@ -330,10 +370,10 @@ export function createGitTools(workspace: CodingWorkspace, worktrees?: ManagedGi
             ? await worktrees?.linkedRepository(workspace, context.taskId, signal) : undefined
           if (!repository) return rejected('A primary repository or current task worktree is required')
           const key = process.platform === 'win32' ? repository.toLowerCase() : repository
-          if (activeRepositories.has(key)) return rejected('Another Git mutation is active in this repository')
-          activeRepositories.add(key)
+          const releaseRepository = await acquireRepository(key, signal)
+          if (!releaseRepository) return rejected('Invalid or interrupted Git request')
           try { return await execute(input, signal, context) }
-          finally { activeRepositories.delete(key) }
+          finally { releaseRepository() }
         } finally { release() }
       },
     }
@@ -361,10 +401,17 @@ export function createGitTools(workspace: CodingWorkspace, worktrees?: ManagedGi
         const path = worktrees && typeof input.worktreeId === 'string' && context &&
           await worktrees.resolve(workspace, context.taskId, input.worktreeId, signal)
         if (!path) return rejected('Worktree is unavailable to this task')
-        const linked = new CodingWorkspace(path)
-        const release = linked.acquireWrite()
-        if (!release) return rejected('Another worktree write is active')
-        try { return await commitFiles(linked, input, signal) } finally { release() }
+        const worktreeKey = process.platform === 'win32' ? path.toLowerCase() : path
+        if (activeWorktrees.has(worktreeKey)) return rejected('Another worktree write is active')
+        activeWorktrees.add(worktreeKey)
+        try {
+          const linked = new CodingWorkspace(path)
+          const release = linked.acquireWrite()
+          if (!release) return rejected('Another worktree write is active')
+          try { return await commitFiles(linked, input, signal) } finally { release() }
+        } finally {
+          activeWorktrees.delete(worktreeKey)
+        }
       }),
     tool('git_merge', 'Merge an exact local branch into the current clean primary workspace. Conflicts require reconciliation.',
       { branch: branchSchema }, ['branch'], async (input, signal) => {

@@ -224,3 +224,31 @@ test('a slow judge is aborted, bounded in flight, and cannot block future rule d
     store.close()
   }
 })
+
+test('P1-5: memory recall filters boilerplate stopwords and scoped context filters file facts by scopePath', async () => {
+  const store = new LocalStore(':memory:')
+  try {
+    const memory = new LocalMemory(store)
+    memory.capture(event, scope, [
+      { kind: 'fact', key: 'target:a', text: 'Confirmed workspace operation create_text_file on src/FeatureA.ts', sourceRefs: ['op-1'] },
+      { kind: 'fact', key: 'target:b', text: 'Confirmed workspace operation create_text_file on secret_notes/Note.md', sourceRefs: ['op-2'] },
+    ])
+    // Stopwords like "on", "in", "the", "workspace", "confirmed", "operation" do not trigger false-positive recalls.
+    assert.deepEqual(memory.recall(scope, 'what is going on in the workspace'), [])
+    assert.equal(memory.recall(scope, 'FeatureA').length, 1)
+
+    const context = new ScopedContext(memory, new LocalJudgment(store))
+    const scopedPrompt = await context.build(event, {
+      scope,
+      goal: 'Inspect FeatureA and secret_notes',
+      filter: (entry) => {
+        const match = /^Confirmed workspace operation \S+ on (.+)$/u.exec(entry.text)
+        return Boolean(match && (match[1] === 'src' || match[1]!.startsWith('src/')))
+      },
+    })
+    assert.match(scopedPrompt, /src\/FeatureA\.ts/)
+    assert.doesNotMatch(scopedPrompt, /secret_notes\/Note\.md/)
+  } finally {
+    store.close()
+  }
+})

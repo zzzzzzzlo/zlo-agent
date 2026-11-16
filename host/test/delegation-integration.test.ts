@@ -250,3 +250,147 @@ test('a delegated browser has its own session and returns image bytes through th
     assert.equal(screenshot?.status, 'succeeded')
   } finally { await host.close() }
 })
+
+test('P1-5: rejects out-of-scope nested Team plans, separates deterministic check from handoff.sufficiency, reports multiple deferred shells, and recalls custom-provider memory', {
+  timeout: 30_000,
+}, async t => {
+  const { cwd, directory } = await fixture(t)
+
+  // 1. Off / Shadow / Active semantics for handoff.sufficiency when deterministic node.check passes, plus nested Team scope check.
+  for (const mode of ['off', 'shadow', 'active'] as const) {
+    const modeCheck = { path: `src/checked-${mode}.txt`, contains: 'deterministic-pass' }
+    const modeDir = join(directory, 'handoff-' + mode)
+    const execution = new DelegationFixture(async (config, call) => {
+      if (config.role === 'root') {
+        const invalidNested = await call('propose_task_plan', {
+          nodes: [
+            { ref: 'team', role: 'team', teamKey: 'scoped', goal: 'Scoped team', access: 'write', scopePath: 'src', tools: ['create_text_file'] },
+            { ref: 'child', parentNodeId: 'team', goal: 'Out-of-scope tool', access: 'write', scopePath: 'src', tools: ['delete_file'] },
+          ],
+        })
+        assert.equal(invalidNested.ok, false)
+        const handoff = await call('delegate_task', {
+          goal: 'Create checked file', access: 'write', scopePath: 'src', tools: ['create_text_file'], check: modeCheck,
+        })
+        assert.equal(handoff.ok, mode !== 'active')
+        return 'Completed check run'
+      }
+      assert.equal((await call('create_text_file', { path: modeCheck.path, content: modeCheck.contains })).ok, true)
+      return ' terse summary '
+    })
+    const host = new LocalAgentHost({
+      directory: modeDir,
+      execution,
+      judgment: {
+        modes: { 'handoff.sufficiency': mode },
+        judge: {
+          async evaluate(req) {
+            if (req.id === 'handoff.sufficiency') return { output: false }
+            return { output: undefined }
+          },
+        },
+      },
+    })
+    try {
+      const { taskId } = await host.createTask({ requestId: 'handoff-' + mode, goal: 'Verify handoff semantics', cwd, workspaceAccess: 'write' })
+      await host.idle()
+      const worker = host.getTask(taskId).nodes?.[0]
+      assert.ok(worker)
+      // Deterministic check passed in every mode, so verification verdict remains 'verified' even if active handoff.sufficiency declines delivery!
+      assert.equal(worker.verification?.passed, true)
+      assert.equal(worker.verification?.verdict, 'verified')
+      if (mode === 'active') {
+        assert.equal(worker.status, 'failed')
+        assert.ok(worker.result?.remainingRisks.includes('handoff_insufficient'))
+        assert.ok(!worker.result?.remainingRisks.includes('verification_failed'))
+      } else {
+        assert.equal(worker.status, 'succeeded')
+      }
+    } finally {
+      await host.close()
+    }
+  }
+
+  // 2. Multiple deferred shell_exec rounds + custom provider memory visibility & deletion after model switch + approval conversation metadata.
+  const seenApprovals: { conversationId?: string; conversationTitle?: string; tool: string }[] = []
+  let rootRound = 0
+  const shellType = process.platform === 'win32' ? 'cmd' : 'sh'
+  const sleepCommand = process.platform === 'win32'
+    ? 'ping -n 2 127.0.0.1 >nul & echo deferred-done'
+    : 'sleep 0.1 && echo deferred-done'
+  await mkdir(join(cwd, 'src'), { recursive: true })
+  await writeFile(join(cwd, 'src', 'patched.ts'), 'export const x = 0\n', 'utf8')
+  const customRoute = { provider: 'custom-local', model: 'local-1' }
+  const switchedRoute = { provider: 'fake', model: 'coding' }
+  class CustomProviderFixture extends DelegationFixture {
+    override async validateRoute(route: { provider: string; model: string }) {
+      if (route.provider === customRoute.provider && route.model === customRoute.model) return
+      return super.validateRoute(route)
+    }
+    override async discoverModels(provider?: string) {
+      const base = await super.discoverModels(provider)
+      if (!provider || provider === customRoute.provider) {
+        base.push({ route: customRoute, contextWindow: 32_768, input: ['text'], reasoning: false })
+      }
+      return base
+    }
+  }
+  const multiRoundExec = new CustomProviderFixture(async (_config, call, prompt) => {
+    if (prompt.includes('patch-memory')) {
+      const patched = await call('apply_patch', {
+        edits: [{ path: 'src/patched.ts', oldText: 'export const x = 0', newText: 'export const x = 1' }],
+      })
+      assert.equal(patched.ok, true, patched.error)
+      return 'Applied patch'
+    }
+    rootRound++
+    if (rootRound <= 2) {
+      const started = await call('shell_exec', { shell: shellType, command: sleepCommand })
+      assert.equal(started.ok, true)
+      return 'Started background shell ' + rootRound
+    }
+    assert.match(prompt, /recorded result is now/)
+    return 'Observed both deferred shell completions'
+  })
+  const host = new LocalAgentHost({
+    directory: join(directory, 'deferred-and-memory'),
+    execution: multiRoundExec,
+    defaultRoute: customRoute,
+    approveTool: async (request) => {
+      seenApprovals.push({ conversationId: request.conversationId, conversationTitle: request.conversationTitle, tool: request.tool })
+      return { approved: true }
+    },
+  })
+  try {
+    const conv = await host.createConversation({
+      requestId: 'conv-1', title: '多轮后台与记忆会话', workspace: cwd, workspaceAccess: 'trusted',
+    })
+    await host.sendMessage({ requestId: 'msg-patch', conversationId: conv.id, text: 'patch-memory' })
+    await host.idle()
+    assert.deepEqual(multiRoundExec.errors, [])
+
+    // Switch default model to a different provider and verify custom-provider memories remain listed & deletable!
+    const currentPrefs = (await host.managementSnapshot(conv.id)).preferences
+    await host.saveAgentPreferences({ ...currentPrefs, defaultRoute: switchedRoute })
+    const another = await host.createConversation({
+      requestId: 'conv-2', title: '默认模型会话', workspace: cwd, workspaceAccess: 'trusted', route: switchedRoute,
+    })
+    await host.sendMessage({ requestId: 'msg-shells', conversationId: another.id, text: 'run two background shells' })
+    await host.idle()
+    assert.deepEqual(multiRoundExec.errors, [])
+    assert.equal(rootRound, 3)
+    assert.equal(seenApprovals.length, 2)
+    assert.ok(seenApprovals.every(item => item.conversationId === another.id && item.conversationTitle === '默认模型会话'))
+
+    const snapshot = await host.managementSnapshot(conv.id)
+    assert.equal(snapshot.memory?.entries.length, 1)
+    assert.match(snapshot.memory?.entries[0]?.text ?? '', /apply_patch on src\/patched\.ts/)
+    const deleted = await host.managementCommand({
+      schemaVersion: 1, type: 'deleteConversationMemory', conversationId: conv.id, ids: [snapshot.memory!.entries[0]!.id],
+    })
+    assert.equal(deleted, 1)
+    assert.equal((await host.managementSnapshot(conv.id)).memory?.entries.length, 0)
+  } finally {
+    await host.close()
+  }
+})

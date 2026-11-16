@@ -17,6 +17,8 @@ export interface ToolApprovalRequest {
   tool: string
   detail: string
   workspace: string
+  conversationId?: string
+  conversationTitle?: string
   suggestedName?: string
 }
 

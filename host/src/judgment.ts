@@ -367,8 +367,8 @@ export class LocalJudgment {
     let timer: ReturnType<typeof setTimeout> | undefined
     const timeout = new Promise<Candidate>((resolve) => {
       timer = setTimeout(() => {
-        resolve({ status: 'timed_out', reason: 'timeout' })
         controller.abort()
+        resolve({ status: 'timed_out', reason: 'timeout' })
       }, this.#timeoutMs)
     })
     try {

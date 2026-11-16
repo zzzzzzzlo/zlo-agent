@@ -230,3 +230,38 @@ test('Jev persists task budget, tests with synthetic evidence and isolates per-p
     assert.equal(calls, 33)
   } finally { store.close() }
 })
+
+test('P1-5: Jev aborts hung HTTP 200 body streams on deadline and circuit-breaks consecutive timeouts', async () => {
+  let calls = 0
+  let streamCancelled = false
+  const hungBodyFetch: typeof fetch = async () => {
+    calls++
+    const body = new ReadableStream<Uint8Array>({
+      pull() {
+        return new Promise(() => {})
+      },
+      cancel() {
+        streamCancelled = true
+      },
+    })
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } })
+  }
+  const { store, settings, last, decide } = fixture(hungBodyFetch, { timeoutMs: 35 })
+  try {
+    const { settings: next } = settings.status()
+    settings.save({ ...next, enabled: true, modes: { ...next.modes, [point]: 'active' } })
+    assert.equal(await decide(), true)
+    assert.equal(last().fallbackReason, 'timeout')
+    assert.equal(streamCancelled, true)
+    assert.equal(await decide(), true)
+    assert.equal(last().fallbackReason, 'timeout')
+    assert.equal(calls, 2)
+    // Third call hits the short consecutive-timeout cooldown immediately without issuing a network request.
+    assert.equal(await decide(), true)
+    assert.equal(last().fallbackReason, 'timeout')
+    assert.equal(last().requestSent, false)
+    assert.equal(calls, 2)
+  } finally {
+    store.close()
+  }
+})

@@ -97,11 +97,14 @@ export class LocalModelScheduler {
       alternativesForDecision.push(model)
     }
     const candidates = [requestedRoute, ...alternativesForDecision.map(({ route }) => route)]
+    const cheaperAlternative = independent && alternativesForDecision.length > 0 &&
+      alternativesForDecision[0]!.estimatedCost !== undefined &&
+      (requestedMetadata?.estimatedCost === undefined || alternativesForDecision[0]!.estimatedCost < requestedMetadata.estimatedCost)
     const selected = await this.#judgment.decide(event, 'model.task_fit', {
       candidates: [modelFeatures(requestedRoute, requestedMetadata), ...alternativesForDecision.map(model => modelFeatures(model.route, model))],
       independent, requested: Boolean(requested), goal,
     },
-      independent && candidates.length > 1 ? 1 : 0, candidates.map((_, index) => index), [], { signal })
+      cheaperAlternative ? 1 : 0, candidates.map((_, index) => index), [], { signal })
     const route = candidates[selected]!
     await this.validateRoute(route)
     return route

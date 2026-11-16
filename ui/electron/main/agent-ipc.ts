@@ -49,10 +49,10 @@ export function registerAgentIpc(options: {
   host.setToolApprover(async (request, signal) => {
     const window = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0]
     if (signal.aborted || !window || window.isDestroyed() || window.webContents.getURL() !== options.rendererUrl ||
-      pendingTrust.has(window.webContents) || !localDirectory(request.workspace)) return { approved: false }
+      !localDirectory(request.workspace)) return { approved: false }
     if (request.kind === 'export') {
       const contents = window.webContents
-      if (pendingExport.has(contents)) return { approved: false }
+      if (pendingExport.has(contents) || pendingTrust.has(contents)) return { approved: false }
       pendingExport.add(contents)
       try {
         const { canceled, filePath } = await dialog.showSaveDialog(window, {

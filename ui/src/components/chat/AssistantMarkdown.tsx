@@ -7,7 +7,7 @@ const components: Components = {
   table: ({ children }) => <div className="markdown-table" tabIndex={0} role="region" aria-label="回复表格"><table>{children}</table></div>,
   img: ({ alt }) => <span>{alt || '图片'}</span>,
   a: ({ href, children }) => href && window.desktopWindow?.openExternalLink
-    ? <a href={href} onClick={event => {
+    ? <a href={href} title={href} onClick={event => {
         event.preventDefault()
         void window.desktopWindow?.openExternalLink(href).catch(() => {})
       }}>{children}</a>
