@@ -91,7 +91,7 @@ export function startDashboard(options: { port: number; token: string; database:
       return
     }
     if (url.pathname === '/api/evaluations' && req.method === 'GET') {
-      json(res, { evaluations: database.jobs(), config: configuration() })
+      json(res, { evaluations: database.jobs(), config: configuration(), usdToCnyRate: resolveUsdToCnyRate() })
       return
     }
     if (url.pathname === '/api/evaluations' && req.method === 'POST') {

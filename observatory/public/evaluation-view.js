@@ -91,8 +91,14 @@ function listNotes(title, items) {
 }
 
 function scoreCard(job, name, value) {
+  const valid = Number.isFinite(value?.score)
+  const meter = el('div', { className: 'score-meter', attrs: { 'aria-hidden': 'true' } })
+  const fill = el('span')
+  fill.style.width = valid ? Math.max(0, Math.min(100, (value.score / 5) * 100)) + '%' : '0%'
+  meter.append(fill)
   return el('div', { className: 'score-card' }, el('h3', { text: name }),
-    el('strong', { text: Number.isFinite(value?.score) ? value.score + ' / 5' : '—' }),
+    el('strong', { text: valid ? value.score + ' / 5' : '—' }),
+    meter,
     value?.rationale && el('p', { text: value.rationale }),
     evidenceLinks(job, value?.evidence))
 }
@@ -107,14 +113,18 @@ function snapshotDetails(snapshot) {
     ])), listNotes('证据范围', snapshot.limitations))
 }
 
-function evaluationRecord(job, actions) {
+function cnyCost(usd, rate) {
+  return typeof usd === 'number' && Number.isFinite(usd) ? Number((usd * rate).toFixed(10)) : null
+}
+
+function evaluationRecord(job, actions, rate) {
   const result = job.result
   const resultDetails = result && el('div', { className: 'stack' },
     facts([
       ['评估方式', resultLabel(result)], ['评分规则', result.rubricVersion],
       ['评估模型', [result.provider, result.model].filter(Boolean).join(' / ') || '不适用'],
       ['输入 Token', formatNumber(result.usage?.inputTokens)], ['输出 Token', formatNumber(result.usage?.outputTokens)],
-      ['评估费用（估算 USD）', formatCurrency(result.usage?.estimatedCostUsd)],
+      ['评估费用（估算 人民币）', formatCurrency(cnyCost(result.usage?.estimatedCostUsd, rate))],
       ['评估耗时', formatDuration(result.durationMs)], ['模型轮次', formatNumber(result.rounds)],
       ['评估状态', badge(result.status).textContent], ['用量覆盖', result.usage?.complete ? '完整' : '不完整'],
     ]),
@@ -143,7 +153,7 @@ function snapshotSignature(snapshot) {
   return JSON.stringify([snapshot.cursor, snapshot.goalDigest, snapshot.constraintsDigest, snapshot.structureDigest, artifacts])
 }
 
-function comparison(jobs, saved) {
+function comparison(jobs, saved, rate) {
   const groups = new Map()
   for (const job of jobs) {
     if (!job.result) continue
@@ -181,7 +191,7 @@ function comparison(jobs, saved) {
       ['模型', one.result.model ?? '确定性', two.result.model ?? '确定性'],
       ['规则版本', one.result.rubricVersion, two.result.rubricVersion],
       ['证据游标', one.snapshot?.cursor, two.snapshot?.cursor],
-      ['评估费用（估算 USD）', formatCurrency(one.result.usage?.estimatedCostUsd), formatCurrency(two.result.usage?.estimatedCostUsd)],
+      ['评估费用（估算 人民币）', formatCurrency(cnyCost(one.result.usage?.estimatedCostUsd, rate)), formatCurrency(cnyCost(two.result.usage?.estimatedCostUsd, rate))],
     ]))
   }
   left.addEventListener('change', show)
@@ -214,7 +224,8 @@ export function updateEvaluation(data, route, actions) {
   const opened = new Set([...container.querySelectorAll('details[open][data-detail]')].map(item => item.dataset.detail))
   const compared = Object.fromEntries([...container.querySelectorAll('select[data-compare]')].map(item => [item.dataset.compare, item.value]))
   if (!jobs.length) { container.replaceChildren(empty('当前范围暂无评估记录。')); return }
-  const records = jobs.map(job => evaluationRecord(job, actions))
+  const rate = data.usdToCnyRate ?? 7.2
+  const records = jobs.map(job => evaluationRecord(job, actions, rate))
   for (const item of records) item.open = opened.has(item.dataset.detail)
-  container.replaceChildren(el('div', { className: 'stack' }, comparison(jobs, compared), el('div', {}, records)))
+  container.replaceChildren(el('div', { className: 'stack' }, comparison(jobs, compared, rate), el('div', {}, records)))
 }
