@@ -38,6 +38,7 @@ export interface DeferredToolOperation {
 export interface ToolInvocationContext {
   taskId: string
   agentRunId: string
+  scopePath?: string
   destination?: string
   defer(operation: DeferredToolOperation): void
   onCleanup(cleanup: () => Promise<void>): void
@@ -52,10 +53,10 @@ export interface Verifier {
   verify(check: VerificationCheck, signal?: AbortSignal, access?: WorkspaceAccess): Promise<VerificationResult>
 }
 
-export function workspaceTarget(input: unknown): string | undefined {
+export function workspaceTarget(input: unknown, mode: 'read' | 'write' = 'write'): string | undefined {
   if (!input || typeof input !== 'object' || !('path' in input)) return undefined
   try {
-    return segments(input.path).join('/')
+    return segments(input.path, false, 'any', mode).join('/')
   } catch {
     return undefined
   }
@@ -68,6 +69,7 @@ const maxEntries = 200
 const maxScannedEntries = 1000
 const forbiddenName = /^(?:node_modules|(?:credentials?|secrets?)(?:\.(?:jsonc?|ya?ml|toml|ini|cfg|conf|txt|xml|env)|$)|auth\.(?:jsonc?|ya?ml|toml|ini|cfg|conf|env)$|id_(?:rsa|dsa|ecdsa|ed25519|ecdsa_sk|ed25519_sk)(?:\.|$))/iu
 const allowedDotDirectory = /^(?:\.github|\.changeset|\.storybook|\.well-known)$/iu
+const readOnlyDotDirectory = /^(?:\.pi|\.agents|\.claude|\.codex)$/iu
 const allowedDotFile = /^(?:\.(?:gitignore|gitkeep|dockerignore|npmignore|eslintignore|prettierignore|stylelintignore|vercelignore|cfignore|editorconfig|nvmrc|node-version|python-version|ruby-version|tool-versions|browserslistrc|swcrc|yamllint)|\.env\.(?:example|sample|template)|\.npmrc\.(?:example|sample|template)|\.(?:prettierrc|eslintrc|stylelintrc|babelrc|lintstagedrc)(?:\.(?:json5?|ya?ml|toml|[cm]?js))?|\.(?:markdownlint|commitlintrc)\.(?:jsonc?|ya?ml)|\.yamllint\.ya?ml)$/iu
 const reservedName = /^(?:con|prn|aux|nul|conin\$|conout\$|(?:com|lpt)[0-9¹²³])(?: *\.|$)/iu
 const sensitiveExtension = /\.(?:key|pem|pfx|p12|ppk|sqlite|db)(?:[-.]|$)/iu
@@ -99,24 +101,34 @@ export function editRecovery(text: string, oldText: string, firstMatch: number) 
   return { code: 'text_not_found' as const, readRange: { startLine: lineAt(normalized, match), lineCount: lines.length } }
 }
 
-function allowedDotSegment(name: string, kind: 'file' | 'directory' | 'any'): boolean {
-  if (kind === 'directory') return allowedDotDirectory.test(name)
+function allowedDotSegment(name: string, kind: 'file' | 'directory' | 'any', mode: 'read' | 'write' = 'write'): boolean {
+  if (kind === 'directory') return allowedDotDirectory.test(name) || (mode === 'read' && readOnlyDotDirectory.test(name))
   if (kind === 'file') return allowedDotFile.test(name)
-  return allowedDotDirectory.test(name) || allowedDotFile.test(name)
+  return allowedDotDirectory.test(name) || allowedDotFile.test(name) || (mode === 'read' && readOnlyDotDirectory.test(name))
 }
 
-function allowedSegment(name: string, kind: 'file' | 'directory' | 'any' = 'any'): boolean {
+function allowedSegment(name: string, kind: 'file' | 'directory' | 'any' = 'any', mode: 'read' | 'write' = 'write'): boolean {
   if (name.length === 0 || name === '.' || name === '..' || /[ .]$/u.test(name)) return false
-  if (name.startsWith('.') && !allowedDotSegment(name, kind)) return false
+  if (name.startsWith('.') && !allowedDotSegment(name, kind, mode)) return false
   return !invalidPathCharacter.test(name) && !forbiddenName.test(name) &&
     !reservedName.test(name) && !sensitiveExtension.test(name)
 }
 
-function segments(value: unknown, allowRoot = false, leafKind: 'file' | 'directory' | 'any' = allowRoot ? 'directory' : 'any'): string[] {
+function withinScopePath(scope: string | undefined, target: string): boolean {
+  if (scope === undefined) return true
+  if (process.platform === 'win32') {
+    scope = scope.toLowerCase()
+    target = target.toLowerCase()
+  }
+  return target === scope || target.startsWith(scope + '/')
+}
+
+function segments(value: unknown, allowRoot = false, leafKind: 'file' | 'directory' | 'any' = allowRoot ? 'directory' : 'any',
+  mode: 'read' | 'write' = 'write'): string[] {
   if (allowRoot && value === '.') return []
   if (typeof value !== 'string' || value.length > maxPathLength) throw new WorkspaceDenied('Invalid relative path')
   const parts = value.split(/[\\/]/u)
-  if (!parts.every((part, index) => allowedSegment(part, index < parts.length - 1 ? 'directory' : leafKind))) {
+  if (!parts.every((part, index) => allowedSegment(part, index < parts.length - 1 ? 'directory' : leafKind, mode))) {
     throw new WorkspaceDenied('Path denied by workspace policy')
   }
   return parts
@@ -174,8 +186,8 @@ export class CodingWorkspace implements Verifier {
     this.#rootStat = stat
   }
 
-  async checkedTarget(value: unknown, kind: 'file' | 'directory' | 'new'): Promise<string> {
-    const parts = segments(value, kind === 'directory', kind === 'directory' ? 'directory' : 'file')
+  async checkedTarget(value: unknown, kind: 'file' | 'directory' | 'new', mode: 'read' | 'write' = 'write'): Promise<string> {
+    const parts = segments(value, kind === 'directory', kind === 'directory' ? 'directory' : 'file', kind === 'new' ? 'write' : mode)
     if (kind !== 'new') return (await this.#checkedPath(parts, kind === 'directory')).path
     const { path: parent } = await this.#checkedPath(parts.slice(0, -1), true)
     const target = join(parent, parts.at(-1)!)
@@ -189,19 +201,19 @@ export class CodingWorkspace implements Verifier {
   }
 
   readTextSnapshot(value: unknown, signal?: AbortSignal) {
-    return this.#read(segments(value, false, 'file'), signal)
+    return this.#read(segments(value, false, 'file', 'read'), signal)
   }
 
   async readPreviewAsset(value: unknown, signal?: AbortSignal): Promise<Buffer> {
-    return (await this.#readBytes(segments(value, false, 'file'), 512 * 1024, signal)).bytes
+    return (await this.#readBytes(segments(value, false, 'file', 'read'), 512 * 1024, signal)).bytes
   }
 
   async readImageAsset(value: unknown, signal?: AbortSignal): Promise<Buffer> {
-    return (await this.#readBytes(segments(value, false, 'file'), 4 * 1024 * 1024, signal)).bytes
+    return (await this.#readBytes(segments(value, false, 'file', 'read'), 4 * 1024 * 1024, signal)).bytes
   }
 
   async gitDiffSnapshot(value: unknown, staged: boolean, signal?: AbortSignal) {
-    const parts = segments(value, false, 'file')
+    const parts = segments(value, false, 'file', 'read')
     await this.#checkedPath(parts, false)
     return this.#gitText([
       'diff', '--no-ext-diff', '--no-textconv', '--no-color', '--ignore-submodules=all',
@@ -252,7 +264,7 @@ export class CodingWorkspace implements Verifier {
             typeof lineCount !== 'number' || !Number.isSafeInteger(lineCount) || lineCount < 1 || lineCount > maxReadLines) {
             return { ok: false, error: 'Invalid line range' }
           }
-          const { text } = await this.#read(segments(args.path, false, 'file'), signal)
+          const { text } = await this.#read(segments(args.path, false, 'file', 'read'), signal)
           if (args.startLine === undefined && args.lineCount === undefined) return { ok: true, text }
           const starts = [0, ...Array.from(text.matchAll(/\r\n|\n|\r/gu), match => match.index + match[0].length)]
           if (starts.at(-1) === text.length && text.length > 0) starts.pop()
@@ -261,6 +273,18 @@ export class CodingWorkspace implements Verifier {
           const endLine = Math.min(first + lineCount, starts.length)
           return { ok: true, text: text.slice(starts[first], starts[endLine] ?? text.length), startLine, endLine, totalLines: starts.length }
         }, ['startLine', 'lineCount']),
+      this.#tool('git_status', 'Inspect local Git status for allowed workspace paths.', 'read', {},
+        async (_args, signal, context) => this.#gitStatus(signal, context?.scopePath), []),
+      this.#tool('git_diff', 'Inspect the unstaged or staged Git diff for a single allowed text file.',
+        'read', { path: pathProperty, staged: { type: 'boolean' } }, async (args, signal) => {
+          if (args.staged !== undefined && typeof args.staged !== 'boolean') throw new WorkspaceDenied('Invalid staged flag')
+          return this.gitDiffSnapshot(args.path, args.staged === true, signal)
+        }, ['staged']),
+      this.#tool('git_log', 'Inspect the last ten local commits as abbreviated IDs and dates.', 'read', {},
+        async (_args, signal, context) => {
+          const scope = context?.scopePath ? workspaceTarget({ path: context.scopePath }, 'read') : undefined
+          return this.#gitText(['log', '-n', '10', '--format=%h%x09%cs', ...(scope ? ['--', scope] : [])], signal)
+        }, []),
     ]
     if (access === 'read') return readTools
     const writeTools = [
@@ -272,10 +296,6 @@ export class CodingWorkspace implements Verifier {
         (args, signal) => this.#edit(args, signal)),
       this.#tool('create_directory', 'Create one new workspace directory under an existing directory.',
         'write', { path: pathProperty }, (args, signal) => this.#mkdir(args.path, signal)),
-    ]
-    if (access !== 'trusted') return writeTools
-    return [
-      ...writeTools,
       this.#tool('run_project_command',
         'Run an authorized local project script. For npm use a relative working directory or ".". For node_script use a relative script file and optional literal arguments.',
         'write', {
@@ -291,18 +311,9 @@ export class CodingWorkspace implements Verifier {
             stderr: redactProcessOutput(result.stderr, result.truncated),
             truncated: result.truncated,
           }
-        }, ['args'], { delegation: 'explicit', wholeWorkspace: true }),
-      this.#tool('git_status', 'Inspect local Git status for allowed workspace paths.', 'read', {},
-        async (_args, signal) => this.#gitStatus(signal), [], { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true }),
-      this.#tool('git_diff', 'Inspect the unstaged or staged Git diff for a single allowed text file.',
-        'read', { path: pathProperty, staged: { type: 'boolean' } }, async (args, signal) => {
-          if (args.staged !== undefined && typeof args.staged !== 'boolean') throw new WorkspaceDenied('Invalid staged flag')
-          return this.gitDiffSnapshot(args.path, args.staged === true, signal)
-        }, ['staged'], { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true }),
-      this.#tool('git_log', 'Inspect the last ten local commits as abbreviated IDs and dates.', 'read', {},
-        async (_args, signal) => this.#gitText(['log', '-n', '10', '--format=%h%x09%cs'], signal), [],
-        { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true }),
+        }, ['args'], { minimumAccess: 'write', approval: 'shell' }),
     ]
+    return writeTools
   }
 
   async verify(check: VerificationCheck, signal?: AbortSignal, access?: WorkspaceAccess): Promise<VerificationResult> {
@@ -351,7 +362,7 @@ export class CodingWorkspace implements Verifier {
     description: string,
     effect: WorkspaceTool['effect'],
     properties: Record<string, unknown>,
-    execute: (args: Record<string, unknown>, signal?: AbortSignal) => Promise<unknown>,
+    execute: (args: Record<string, unknown>, signal?: AbortSignal, context?: ToolInvocationContext) => Promise<unknown>,
     optional: string[] = [],
     policy?: ToolPolicy,
   ): WorkspaceTool {
@@ -365,13 +376,13 @@ export class CodingWorkspace implements Verifier {
         required: Object.keys(properties).filter((key) => !optional.includes(key)),
         additionalProperties: false,
       },
-      execute: async (_callId, input, signal) => {
+      execute: async (_callId, input, signal, context) => {
         if (!input || typeof input !== 'object' || Array.isArray(input) ||
           Object.keys(input).some((key) => !Object.hasOwn(properties, key))) return { ok: false, error: 'Invalid arguments' }
         if (signal?.aborted) return { ok: false, error: 'Tool interrupted before execution' }
         if (effect === 'write' && !this.#startWrite()) return { ok: false, error: 'Another workspace write is active' }
         try {
-          return await execute(input as Record<string, unknown>, signal)
+          return await execute(input as Record<string, unknown>, signal, context)
         } catch (error) {
           if (error instanceof WorkspaceDenied) return { ok: false, error: error.message }
           if (effect === 'read') {
@@ -435,14 +446,16 @@ export class CodingWorkspace implements Verifier {
     return { ok: true, stdout: redactProcessOutput(result.stdout, result.truncated), truncated: result.truncated }
   }
 
-  async #gitStatus(signal?: AbortSignal) {
+  async #gitStatus(signal?: AbortSignal, rawScopePath?: string) {
+    const scope = rawScopePath ? workspaceTarget({ path: rawScopePath }, 'read') : undefined
     const result = await this.#git(['status', '--porcelain=v1', '-z', '--untracked-files=normal', '--no-renames',
-      '--ignore-submodules=all'], signal)
+      '--ignore-submodules=all', ...(scope ? ['--', scope] : [])], signal)
     if (result.state !== 'exited' || result.code !== 0) return { ok: false, error: 'Git inspection failed' }
     const entries = []
     for (const record of result.stdout.split('\0').slice(0, -1)) {
       const path = record.slice(3).replace(/\/$/u, '')
-      if (workspaceTarget({ path }) !== undefined) {
+      const normalized = workspaceTarget({ path }, 'read')
+      if (normalized !== undefined && withinScopePath(scope, normalized)) {
         entries.push({ status: record.slice(0, 2), path: redactProcessOutput(path) })
       }
     }
@@ -471,7 +484,7 @@ export class CodingWorkspace implements Verifier {
   }
 
   async #list(value: unknown, signal?: AbortSignal): Promise<unknown> {
-    const { path } = await this.#checkedPath(segments(value, true), true)
+    const { path } = await this.#checkedPath(segments(value, true, 'directory', 'read'), true)
     const entries: { name: string; kind: 'file' | 'directory' }[] = []
     const directory = await opendir(path)
     let scanned = 0
@@ -480,7 +493,8 @@ export class CodingWorkspace implements Verifier {
       if (++scanned > maxScannedEntries || entries.length >= maxEntries) {
         return { ok: true, entries, truncated: true }
       }
-      if (entry.isDirectory() ? allowedSegment(entry.name, 'directory') : entry.isFile() && allowedSegment(entry.name, 'file')) {
+      if (entry.isDirectory() ? allowedSegment(entry.name, 'directory', 'read')
+        : entry.isFile() && allowedSegment(entry.name, 'file', 'read')) {
         entries.push({ name: entry.name, kind: entry.isDirectory() ? 'directory' : 'file' })
       }
     }

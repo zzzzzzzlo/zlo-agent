@@ -351,7 +351,7 @@ function invalid() { return { ok: false, error: 'Invalid process arguments' } }
 
 const idSchema = { type: 'string', pattern: '^[0-9a-f-]{36}$' }
 const waitSchema = { type: 'integer', minimum: 0, maximum: maxPollWait }
-const control = { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true, whileActive: true } as const
+const control = { minimumAccess: 'trusted', delegation: 'explicit', whileActive: true } as const
 
 export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] {
   const processes = new Map<string, {

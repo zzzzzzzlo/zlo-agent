@@ -63,6 +63,7 @@ export interface WorkerNode {
   access?: WorkspaceAccess
   scopePath?: string
   tools?: string[]
+  disallowedTools?: string[]
   budget?: NodeBudget
   worktreeId?: string
   check?: VerificationCheck
@@ -81,6 +82,7 @@ export interface NodeProposal {
   access?: WorkspaceAccess
   scopePath?: string
   tools?: string[]
+  disallowedTools?: string[]
   budget?: NodeBudget
   worktreeId?: string
   check?: VerificationCheck
@@ -595,7 +597,7 @@ export class TaskEngine {
   }
 
   delegateScoped(taskId: string, requestId: string, parentNodeId: string, input: Pick<NodeProposal,
-    'goal' | 'access' | 'scopePath' | 'tools' | 'budget' | 'check'>): WorkerNode {
+    'goal' | 'access' | 'scopePath' | 'tools' | 'disallowedTools' | 'budget' | 'check'>): WorkerNode {
     const task = this.get(taskId)
     this.#assertPlanning(task, task.planVersion)
     const parent = task.nodes?.find(node => node.id === parentNodeId)
@@ -604,17 +606,19 @@ export class TaskEngine {
     const access = input.access ?? 'read'
     const path = input.scopePath === undefined ? parent?.scopePath : scopePath(input.scopePath)
     const tools = input.tools === undefined ? undefined : planTools(input.tools)
+    const disallowedTools = input.disallowedTools === undefined ? undefined : planTools(input.disallowedTools)
     const budget = input.budget === undefined ? undefined : planBudget(input.budget)
     const check = verificationCheck(input.check)
     const prior = task.nodes?.find(node => node.parentNodeId === parentNodeId && node.role === 'worker' &&
       node.goal === goal && !node.dependencies.length && !node.route && node.worktreeId === parent?.worktreeId &&
       node.access === access && node.scopePath === path &&
       JSON.stringify(node.tools) === JSON.stringify(tools) &&
+      JSON.stringify(node.disallowedTools) === JSON.stringify(disallowedTools) &&
       (node.budget === undefined) === (budget === undefined) &&
       node.budget?.requests === budget?.requests && node.budget?.timeMs === budget?.timeMs &&
       JSON.stringify(node.check) === JSON.stringify(check))
     return prior ?? this.proposePlan(taskId, requestId, task.planVersion,
-      [{ ref: 'child', role: 'worker', parentNodeId, goal, access, scopePath: path, tools, budget, check }])[0]!
+      [{ ref: 'child', role: 'worker', parentNodeId, goal, access, scopePath: path, tools, disallowedTools, budget, check }])[0]!
   }
 
   proposePlan(taskId: string, requestId: string, expectedVersion: number, proposals: NodeProposal[]): WorkerNode[] {
@@ -654,8 +658,8 @@ export class TaskEngine {
         const parent = existing.find(({ id }) => id === parentNodeId)
         if (parent && parent.status !== 'ready' && parent.status !== 'running') throw new Error('Parent is not accepting work')
         const check = verificationCheck(proposal.check)
-        if (check?.command && (access !== 'trusted' || parentNodeId !== task.rootNodeId || proposal.scopePath)) {
-          throw new Error('Command verification requires an explicitly trusted root-level node with the whole workspace')
+        if (check?.command && access !== 'trusted') {
+          throw new Error('Command verification requires trusted node workspace access')
         }
         return {
           id: ids.get(proposal.ref)!, parentNodeId, role, access, status: 'ready',
@@ -663,6 +667,7 @@ export class TaskEngine {
           dependencies: nodeDependencies(proposal.dependencies, resolve),
           ...(proposal.scopePath !== undefined ? { scopePath: scopePath(proposal.scopePath) } : {}),
           ...(proposal.tools !== undefined ? { tools: planTools(proposal.tools) } : {}),
+          ...(proposal.disallowedTools !== undefined ? { disallowedTools: planTools(proposal.disallowedTools) } : {}),
           ...(proposal.budget !== undefined ? { budget: planBudget(proposal.budget) } : {}),
           ...(proposal.worktreeId ? { worktreeId: proposal.worktreeId } : {}),
           ...(proposal.teamKey !== undefined ? { teamKey: proposal.teamKey } : {}),
@@ -675,9 +680,6 @@ export class TaskEngine {
       const proposed = candidates.map((node) => {
         const parent = graph.find(({ id }) => id === node.parentNodeId)
         const scope = node.scopePath ?? parent?.scopePath
-        if ((node.worktreeId || parent?.worktreeId) && node.check?.command) {
-          throw new Error('Worktree nodes require file-based verification')
-        }
         if (parent?.scopePath && scope && !containsScope(parent.scopePath, scope)) throw new Error('Node cannot expand parent scope')
         assertCheckInScope(node.check, scope)
         return { ...node, ...(scope ? { scopePath: scope } : {}),
@@ -708,9 +710,8 @@ export class TaskEngine {
         Object.keys(update).some((key) => !['goal', 'dependencies', 'check'].includes(key))) throw new Error('Invalid node replan')
       if (nodes.some((node) => node.parentNodeId === nodeId && node.status === 'running')) throw new Error('Node has running children')
       const check = update.check !== undefined ? verificationCheck(update.check) : previous.check
-      if (previous.worktreeId && check?.command) throw new Error('Worktree nodes require file-based verification')
-      if (update.check && check?.command && (previous.access !== 'trusted' || previous.parentNodeId !== task.rootNodeId || previous.scopePath)) {
-        throw new Error('Command verification requires an explicitly trusted root-level node with the whole workspace')
+      if (update.check && check?.command && previous.access !== 'trusted') {
+        throw new Error('Command verification requires trusted node workspace access')
       }
       assertCheckInScope(check, previous.scopePath)
       const replan: WorkerNode = {

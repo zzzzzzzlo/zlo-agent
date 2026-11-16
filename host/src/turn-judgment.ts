@@ -16,8 +16,11 @@ interface TurnEvidence {
 }
 
 const verificationTools = new Set(['run_project_command', 'preview_page', 'browser_snapshot', 'read_text_file', 'git_diff'])
-const followUpRead = new Set(['read_text_file', 'list_directory', 'search_files', 'search_content', 'git_status', 'git_diff', 'view_image'])
-const followUpWrite = new Set(['create_text_file', 'edit_text_file'])
+const followUpRead = new Set([
+  'read_text_file', 'list_directory', 'search_files', 'search_content', 'git_status', 'git_diff', 'git_log',
+  'view_image', 'preview_page', 'browser_snapshot', 'run_project_command', 'read_tool_evidence', 'read_skill',
+])
+const followUpWrite = new Set(['create_text_file', 'edit_text_file', 'apply_patch', 'rename_file', 'move_file'])
 
 export function followUpAllows(followUp: TurnFollowUp | undefined, tool: string): boolean {
   return !followUp || followUpRead.has(tool) || (followUp.id === 'turn.continue' && followUpWrite.has(tool))

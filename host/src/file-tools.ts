@@ -24,9 +24,11 @@ function object(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
 }
 
-function pathValue(path: unknown): string | undefined { return workspaceTarget({ path }) }
+function pathValue(path: unknown): string | undefined { return workspaceTarget({ path }, 'write') }
 
-function rootPath(path: unknown): string | undefined { return path === '.' || path === undefined ? '.' : pathValue(path) }
+function readPathValue(path: unknown): string | undefined { return workspaceTarget({ path }, 'read') }
+
+function readRootPath(path: unknown): string | undefined { return path === '.' || path === undefined ? '.' : readPathValue(path) }
 
 function globValue(value: unknown): string | undefined {
   if (typeof value !== 'string' || !value || value.length > 160 || /[{}[\]!+@()\x00-\x1f\x7f<>:"|]/u.test(value) ||
@@ -70,7 +72,7 @@ async function filePaths(workspace: CodingWorkspace, root: string, pattern: stri
     const { path, depth } = pending.pop()!
     signal.throwIfAborted()
     let absolute: string
-    try { absolute = await workspace.checkedTarget(path, 'directory') } catch {
+    try { absolute = await workspace.checkedTarget(path, 'directory', 'read') } catch {
       if (depth === 0) throw new Error('Search directory unavailable')
       continue
     }
@@ -78,7 +80,7 @@ async function filePaths(workspace: CodingWorkspace, root: string, pattern: stri
     for await (const entry of directory) {
       signal.throwIfAborted()
       if (++visited > maxVisited || paths.length >= maxFiles) return { paths, truncated: true }
-      const next = pathValue(path === '.' ? entry.name : `${path}/${entry.name}`)
+      const next = readPathValue(path === '.' ? entry.name : `${path}/${entry.name}`)
       if (!next) continue
       if (entry.isDirectory()) {
         if (depth < maxDepth) pending.push({ path: next, depth: depth + 1 })
@@ -86,7 +88,7 @@ async function filePaths(workspace: CodingWorkspace, root: string, pattern: stri
       } else if (entry.isFile()) {
         const local = root === '.' ? next : next.slice(root.length + 1)
         if (!globMatch(local, pattern)) continue
-        const checked = await workspace.checkedTarget(next, 'file').catch(() => undefined)
+        const checked = await workspace.checkedTarget(next, 'file', 'read').catch(() => undefined)
         if (checked) paths.push(next)
       }
     }
@@ -319,11 +321,11 @@ export function createFileTools(workspace: CodingWorkspace): WorkspaceTool[] {
     }
   }
 
-  const searchTargets = (input: unknown) => [rootPath(object(input)?.path) ?? '']
+  const searchTargets = (input: unknown) => [readRootPath(object(input)?.path) ?? '']
   return [
     tool('search_files', 'Find workspace files by name or glob. Use ** for recursive path matching.', 'read',
       { path: pathSchema, glob: globSchema }, ['glob'], async (input, signal) => {
-        const root = rootPath(input.path)
+        const root = readRootPath(input.path)
         const pattern = globValue(input.glob)
         if (!root || !pattern) return rejected('Invalid search path or glob')
         const bounded = AbortSignal.any([AbortSignal.timeout(maxSearchMs), ...(signal ? [signal] : [])])
@@ -333,7 +335,7 @@ export function createFileTools(workspace: CodingWorkspace): WorkspaceTool[] {
     tool('search_content', 'Find literal or regular expression matches in bounded UTF-8 workspace files.', 'read',
       { path: pathSchema, glob: globSchema, query: { type: 'string', minLength: 1, maxLength: 256 }, regex: { type: 'boolean' },
         caseSensitive: { type: 'boolean' } }, ['query'], async (input, signal) => {
-        const root = rootPath(input.path)
+        const root = readRootPath(input.path)
         const pattern = globValue(input.glob ?? '**/*')
         if (!root || !pattern || typeof input.query !== 'string' || !input.query || input.query.length > 256 ||
           !input.query.isWellFormed() || [input.regex, input.caseSensitive].some(flag => flag !== undefined && typeof flag !== 'boolean')) {

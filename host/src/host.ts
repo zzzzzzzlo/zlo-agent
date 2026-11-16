@@ -332,7 +332,7 @@ export class LocalAgentHost {
       throw new ConversationError('INVALID_INPUT', 'Select an available local workspace separate from Host data')
     }
     return this.#conversations.create(command, workspace.root, this.#defaultRoute,
-      this.#agentPreferences.workspaceAccess === 'trusted' ? 'read' : this.#agentPreferences.workspaceAccess)
+      this.#agentPreferences.workspaceAccess)
   }
 
   listConversations(): ConversationSummary[] {

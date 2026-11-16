@@ -13,6 +13,7 @@ const grant = {
   access: { type: 'string', enum: ['read', 'write', 'trusted'] },
   scopePath: { ...string, maxLength: 512 },
   tools: { type: 'array', maxItems: 128, uniqueItems: true, items: { ...string, maxLength: 64 } },
+  disallowedTools: { type: 'array', maxItems: 128, uniqueItems: true, items: { ...string, maxLength: 64 } },
   budget: { type: 'object', additionalProperties: false, properties: {
     requests: { type: 'integer', minimum: 1, maximum: 512 },
     timeMs: { type: 'integer', minimum: 1, maximum: 3_600_000 },
@@ -34,7 +35,7 @@ export function delegationTool(name: 'delegate_task' | 'delegate_worker', execut
 ) => Promise<unknown>): ExecutionTool {
   return {
     name,
-    description: 'Run a temporary worker and return its delivery evidence. Describe the goal and acceptance check. Omitted access is read-only. To delegate Shell, Browser, Network, Git or other privileged work, name the exact tools and request the necessary workspace access. Shell and Git require a trusted whole workspace. Optional budgets can narrow the parent budget.',
+    description: 'Run a temporary worker and return its delivery evidence. Describe the goal and acceptance check. Omitted access is read-only. Workspace read, search, read-only Git, and tier-appropriate tools inherit automatically unless narrowed with tools or disallowedTools. Shell execution, Git mutations, web access, browser interaction, and export require explicit tool listing and trusted/write access as applicable.',
     parameters: { type: 'object', additionalProperties: false, required: ['goal'], properties: { goal, check: fileCheck, ...grant } },
     execute(id, input, signal) {
       if (!input || typeof input !== 'object' || Array.isArray(input) || !('goal' in input) ||

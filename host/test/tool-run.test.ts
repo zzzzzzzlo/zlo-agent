@@ -262,3 +262,90 @@ test('only relevant workspace changes clear unchanged tool failures, and guards 
     await rm(path, { recursive: true, force: true })
   }
 })
+
+test('execution policy unlocks safe routine project checks and read-only shell commands while gating risky scripts and mutations', async () => {
+  const { isSafeShellCommand } = await import('../src/execution-policy.ts')
+  const { followUpAllows } = await import('../src/turn-judgment.ts')
+  assert.equal(isSafeShellCommand({ shell: 'sh', command: 'git status' }), true)
+  assert.equal(isSafeShellCommand({ shell: 'powershell', command: 'npm run typecheck' }), true)
+  assert.equal(isSafeShellCommand({ shell: 'sh', command: 'node --test test/tool-run.test.ts' }), true)
+  assert.equal(isSafeShellCommand({ shell: 'sh', command: 'git status && rm -rf src' }), false)
+  assert.equal(isSafeShellCommand({ shell: 'sh', command: 'cat .env' }), false)
+  assert.equal(isSafeShellCommand({ shell: 'sh', command: 'git show HEAD:.env' }), false)
+  assert.equal(isSafeShellCommand({ shell: 'sh', command: 'git diff --no-index a.txt b.txt' }), false)
+  assert.equal(isSafeShellCommand({ shell: 'cmd', command: 'npm test %PATH%' }), false)
+  assert.equal(isSafeShellCommand({ shell: 'sh', command: 'rg -f .env secret src' }), false)
+  assert.equal(isSafeShellCommand({ shell: 'sh', command: 'git branch -D main' }), false)
+
+  assert.equal(followUpAllows({ id: 'turn.completion', nudge: 'verify' }, 'run_project_command'), true)
+  assert.equal(followUpAllows({ id: 'turn.completion', nudge: 'verify' }, 'preview_page'), true)
+  assert.equal(followUpAllows({ id: 'turn.completion', nudge: 'verify' }, 'browser_snapshot'), true)
+  assert.equal(followUpAllows({ id: 'turn.completion', nudge: 'verify' }, 'read_tool_evidence'), true)
+  assert.equal(followUpAllows({ id: 'turn.completion', nudge: 'verify' }, 'edit_text_file'), false)
+  assert.equal(followUpAllows({ id: 'turn.continue', nudge: 'finish' }, 'apply_patch'), true)
+  assert.equal(followUpAllows({ id: 'turn.continue', nudge: 'finish' }, 'rename_file'), true)
+  assert.equal(followUpAllows({ id: 'turn.continue', nudge: 'finish' }, 'move_file'), true)
+  assert.equal(followUpAllows({ id: 'turn.continue', nudge: 'finish' }, 'run_project_command'), true)
+  assert.equal(followUpAllows({ id: 'turn.continue', nudge: 'finish' }, 'delete_file'), false)
+  assert.equal(followUpAllows({ id: 'turn.continue', nudge: 'finish' }, 'web_fetch'), false)
+
+  const root = await mkdtemp(join(tmpdir(), 'zlo-exec-policy-'))
+  const db = new LocalStore(':memory:')
+  try {
+    const workspace = new CodingWorkspace(root)
+    const tasks = new TaskEngine(db)
+    const writeTask = tasks.create({ requestId: 'ep-write', cwd: root, goal: 'Run checks under write', workspaceAccess: 'write' }).taskId
+    tasks.start(writeTask)
+    const writeSnap = tasks.get(writeTask)
+    const writeEvent = { taskId: writeTask, taskNodeId: writeSnap.rootNodeId, taskAttemptId: writeSnap.attemptId, agentRunId: 'ep-write-run', type: '', payload: {} }
+
+    const trustedTask = tasks.create({ requestId: 'ep-trusted', cwd: root, goal: 'Run checks under trusted', workspaceAccess: 'trusted' }).taskId
+    tasks.start(trustedTask)
+    const trustedSnap = tasks.get(trustedTask)
+    const trustedEvent = { taskId: trustedTask, taskNodeId: trustedSnap.rootNodeId, taskAttemptId: trustedSnap.attemptId, agentRunId: 'ep-trusted-run', type: '', payload: {} }
+
+    let mode: ToolApprovalMode = 'ask'
+    const asked: string[] = []
+    const executed: string[] = []
+    const run = new ToolRun(tasks, new ToolApprovalBroker(async req => {
+      asked.push(req.tool)
+      return { approved: false }
+    }), undefined, undefined, undefined, () => mode)
+
+    const projectTool = run.wrap({
+      name: 'run_project_command', description: '', parameters: {}, effect: 'write',
+      policy: { minimumAccess: 'write', approval: 'shell' },
+      async execute(_id, input) { executed.push('project:' + (input as { command: string }).command); return { ok: true } },
+    }, workspace, () => activeEvent, new AbortController().signal, () => true)
+    const shellTool = run.wrap({
+      name: 'shell_exec', description: '', parameters: {}, effect: 'write',
+      policy: { minimumAccess: 'trusted', delegation: 'explicit', wholeWorkspace: true, approval: 'shell' },
+      async execute(_id, input) { executed.push('shell:' + (input as { command: string }).command); return { ok: true } },
+    }, workspace, () => activeEvent, new AbortController().signal, () => true)
+
+    let activeEvent = trustedEvent
+    assert.deepEqual(await projectTool.execute('t1', { command: 'npm_test', path: '.' }), { ok: true })
+    assert.deepEqual(asked, [])
+
+    activeEvent = writeEvent
+    assert.equal((await projectTool.execute('w1', { command: 'npm_test', path: '.' }) as { ok: boolean }).ok, false)
+    assert.deepEqual(asked, ['run_project_command'])
+
+    mode = 'routine'
+    assert.deepEqual(await projectTool.execute('w2', { command: 'npm_test', path: '.' }), { ok: true })
+    assert.equal((await projectTool.execute('w3', { command: 'node_script', path: 'check.mjs' }) as { ok: boolean }).ok, false)
+    assert.deepEqual(asked, ['run_project_command', 'run_project_command'])
+
+    activeEvent = trustedEvent
+    assert.deepEqual(await shellTool.execute('s1', { shell: 'sh', command: 'git status' }), { ok: true })
+    assert.equal((await shellTool.execute('s2', { shell: 'sh', command: 'npm install left-pad' }) as { ok: boolean }).ok, false)
+    mode = 'unattended'
+    assert.deepEqual(await shellTool.execute('s3', { shell: 'sh', command: 'git diff src/a.ts' }), { ok: true })
+    assert.equal((await shellTool.execute('s4', { shell: 'sh', command: 'npm install left-pad' }) as { ok: boolean }).ok, false)
+    assert.deepEqual(executed, ['project:npm_test', 'project:npm_test', 'shell:git status', 'shell:git diff src/a.ts'])
+    await run.close()
+  } finally {
+    db.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})

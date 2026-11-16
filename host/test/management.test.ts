@@ -546,3 +546,18 @@ test('P0-2: interrupted Git reads and pre-write errors stay structured, postcond
     await host.close()
   }
 })
+
+test('saving trusted default workspaceAccess preserves trusted when creating new conversations', async (t) => {
+  const { directory, workspace } = await fixture(t)
+  const host = new LocalAgentHost({ directory, execution: new FakeExecution() })
+  try {
+    const conv = host.createConversation({ requestId: 'seed', workspace })
+    const initial = await host.managementSnapshot(conv.id)
+    const saved = await host.saveAgentPreferences({ ...initial.preferences, workspaceAccess: 'trusted' })
+    assert.equal(saved.workspaceAccess, 'trusted')
+    const trustedConv = host.createConversation({ requestId: 'new-after-trusted', workspace })
+    assert.equal(trustedConv.workspaceAccess, 'trusted')
+  } finally {
+    await host.close()
+  }
+})

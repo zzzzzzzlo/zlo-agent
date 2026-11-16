@@ -394,3 +394,108 @@ test('P1-5: rejects out-of-scope nested Team plans, separates deterministic chec
     await host.close()
   }
 })
+
+test('delegated subagents inherit read/git/command tools automatically, honor disallowedTools monotonically, and allow scoped trusted command checks', { timeout: 20_000 }, async t => {
+  const { cwd, directory } = await fixture(t)
+  await mkdir(join(cwd, 'ui'), { recursive: true })
+  await writeFile(join(cwd, 'ui', 'package.json'), JSON.stringify({
+    scripts: { test: 'node verify.cjs' },
+  }))
+  await writeFile(join(cwd, 'ui', 'verify.cjs'), 'process.exit(0)\n')
+
+  let inspectedTools: string[] = []
+  let teamTools: string[] = []
+  const execution = new DelegationFixture(async (config, call) => {
+    if (config.role === 'root') {
+      const readonlyWorker = await call('delegate_task', { goal: 'Inspect repo via inherited read tools', disallowedTools: ['git_log'] })
+      assert.equal(readonlyWorker.ok, true, readonlyWorker.error)
+
+      const scopedPlan = await call('propose_task_plan', {
+        nodes: [
+          {
+            ref: 'ui_team', role: 'team', teamKey: 'ui-spec', goal: 'Coordinate UI edits without delete_file',
+            access: 'write', scopePath: 'ui', disallowedTools: ['delete_file'],
+          },
+          {
+            ref: 'ui_child', parentNodeId: 'ui_team', goal: 'Reactivating delete_file must fail',
+            access: 'write', scopePath: 'ui', tools: ['delete_file'],
+          },
+        ],
+      })
+      assert.equal(scopedPlan.ok, false)
+
+      const teamOnly = await call('propose_task_plan', {
+        nodes: [
+          {
+            ref: 'ui_team', role: 'team', teamKey: 'ui-spec', goal: 'Run scoped command inside ui',
+            access: 'write', scopePath: 'ui', disallowedTools: ['delete_file'],
+          },
+        ],
+      })
+      assert.equal(teamOnly.ok, true, teamOnly.error)
+      return 'Delegation permission inheritance verified'
+    }
+    if (config.role === 'worker') {
+      inspectedTools = config.tools.map(({ name }) => name).sort()
+      assert.ok((await call('list_directory', { path: '.' })).ok)
+      return 'Read-only worker inherited inspection tools without git_log'
+    }
+    teamTools = config.tools.map(({ name }) => name).sort()
+    assert.ok((await call('run_project_command', { command: 'npm_test', path: 'ui' })).ok)
+    return 'Scoped team ran npm_test without explicit tools list'
+  })
+
+  const approvals: string[] = []
+  const host = new LocalAgentHost({
+    directory, execution, approveTool: async (request) => {
+      approvals.push(request.tool)
+      return { approved: false }
+    },
+  })
+  try {
+    const conv = host.createConversation({
+      requestId: 'inherit-conv', workspace: cwd, workspaceAccess: 'trusted', toolApprovalMode: 'routine',
+    })
+    const { taskId } = await host.sendMessage({ requestId: 'inherit-and-disallowed', conversationId: conv.id, text: 'Test subagent permission inheritance' })
+    await host.idle()
+    assert.deepEqual(execution.errors, [])
+    assert.deepEqual(approvals, [])
+    assert.equal(host.getTask(taskId).status, 'succeeded')
+    assert.ok(inspectedTools.includes('git_status'))
+    assert.ok(inspectedTools.includes('git_diff'))
+    assert.ok(!inspectedTools.includes('git_log'))
+    assert.ok(!inspectedTools.includes('shell_exec'))
+    assert.ok(teamTools.includes('run_project_command'))
+    assert.ok(teamTools.includes('git_diff'))
+    assert.ok(!teamTools.includes('delete_file'))
+  } finally {
+    await host.close()
+  }
+
+  // Also confirm TaskEngine permits command checks on scoped/worktree trusted nodes while still enforcing scope bounds.
+  const { LocalStore } = await import('../src/store.ts')
+  const { TaskEngine } = await import('../src/task-engine.ts')
+  const store = new LocalStore(':memory:')
+  try {
+    const tasks = new TaskEngine(store)
+    const { taskId } = tasks.create({ requestId: 'scoped-cmd-check', cwd, goal: 'Run scoped checks', workspaceAccess: 'trusted' })
+    tasks.start(taskId)
+    const scopedNodes = tasks.proposePlan(taskId, 'plan-1', 0, [{
+      ref: 'ui', access: 'trusted', scopePath: 'ui', goal: 'Run UI tests',
+      check: { command: { command: 'npm_test', path: 'ui' } },
+    }])
+    assert.equal(scopedNodes[0]?.check?.command?.path, 'ui')
+    assert.throws(() => tasks.proposePlan(taskId, 'plan-2', 1, [{
+      ref: 'escape', access: 'trusted', scopePath: 'ui', goal: 'Wrong check path',
+      check: { command: { command: 'npm_test', path: 'backend' } },
+    }]), /outside the node scope/)
+    const worktreeId = '11111111-1111-4111-8111-111111111111'
+    const wtNodes = tasks.proposePlan(taskId, 'plan-3', 1, [{
+      ref: 'wt', access: 'trusted', worktreeId, goal: 'Run worktree tests',
+      check: { command: { command: 'npm_test', path: '.' } },
+    }])
+    assert.equal(wtNodes[0]?.worktreeId, worktreeId)
+  } finally {
+    store.close()
+  }
+})

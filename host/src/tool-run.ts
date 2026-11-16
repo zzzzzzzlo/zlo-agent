@@ -12,8 +12,10 @@ import { workspaceTarget } from './workspace.ts'
 import type { CodingWorkspace, DeferredToolOperation, WorkspaceTool } from './workspace.ts'
 import { redactProcessOutput } from './workspace-process.ts'
 import { prepareFilePostcondition } from './reconciliation.ts'
+import { evaluateToolExecutionPolicy } from './execution-policy.ts'
 import { judgeToolResult } from './tool-judgment.ts'
 import type { ToolEvidenceArchive } from './tool-judgment.ts'
+import type { WorkspaceAccess } from './contracts/domain.ts'
 
 const unavailable = { ok: false, error: 'Tool work is unavailable' }
 const failureLimit = 4 // Initial call plus three retries.
@@ -123,8 +125,16 @@ export class ToolRun {
     }
   }
 
+  #effectiveAccess(taskId: string, taskNodeId?: string): WorkspaceAccess {
+    const taskSnapshot = this.#tasks.get(taskId)
+    const node = [...(taskSnapshot.worker ? [taskSnapshot.worker] : []), ...(taskSnapshot.nodes ?? [])]
+      .find(item => item.id === taskNodeId)
+    return taskSnapshot.workspaceAccess === 'trusted' && (!node || node.access === 'trusted')
+      ? 'trusted' : (node?.access ?? taskSnapshot.workspaceAccess ?? (taskSnapshot.check ? 'write' : 'read'))
+  }
+
   wrap(tool: WorkspaceTool, workspace: CodingWorkspace, event: () => EventDraft, signal: AbortSignal,
-    authorize: (input: unknown) => boolean, evidence?: Set<string>, artifacts?: Set<string>, goal = ''): ExecutionTool {
+    authorize: (input: unknown) => boolean, evidence?: Set<string>, artifacts?: Set<string>, goal = '', scopePath?: string): ExecutionTool {
     return {
       name: tool.name, description: tool.description, parameters: tool.parameters,
       execute: async (callId, raw, toolSignal) => {
@@ -144,7 +154,7 @@ export class ToolRun {
         } catch { deny('policy'); return unavailable }
         if (!authorize(input)) { deny('policy'); return unavailable }
         const fingerprint = callFingerprint(tool.name, input)
-        const target = workspaceTarget(input)
+        const target = workspaceTarget(input, effect)
         if (effect === 'write' && this.#tasks.hasUnconfirmedReplay(ref.taskId, tool.name, target, fingerprint)) {
           deny('policy')
           return { ok: false, code: 'REPLAY_BLOCKED', error: 'A previous invocation of this write operation had an unconfirmed effect and cannot be replayed automatically. Inspect current workspace state first or ask the user before making a new change.' }
@@ -157,45 +167,49 @@ export class ToolRun {
             : { ok: false, code: 'ACTIVE_WRITE', error: 'A workspace operation is in progress. For your shell command, read its process status or output before making another change.' }
         }
         const operationId = ref.agentRunId + ':' + callId
+        const effectiveAccess = this.#effectiveAccess(ref.taskId, ref.taskNodeId)
+        const policyResult = evaluateToolExecutionPolicy({
+          tool: tool.name,
+          effect,
+          approvalKind,
+          input,
+          effectiveAccess,
+          approvalMode: this.#approvalMode(),
+          publicRead: tool.policy?.publicRead,
+        })
         let destination: string | undefined
-        if (approvalKind) {
-          const detail = JSON.stringify(input) ?? 'null'
-          if (detail.length > 8_000 || redactProcessOutput(detail) !== detail || /[\u202a-\u202e\u2066-\u2069]/u.test(detail)) {
-            deny('approval_safety')
-            return { ok: false, error: 'The operation cannot be safely displayed for approval' }
+        if (policyResult.decision === 'deny') {
+          deny(policyResult.reason)
+          return policyResult.reason === 'approval_safety'
+            ? { ok: false, error: 'The operation cannot be safely displayed for approval' }
+            : unavailable
+        }
+        if (policyResult.decision === 'allow') {
+          if (policyResult.automatic && approvalKind) {
+            this.#tasks.auditToolApproval(ref, operationId, tool.name, true, approvalKind, true)
           }
-          const mode = this.#approvalMode()
-          let automatic = false
-          try {
-            automatic = mode !== 'ask' && effect === 'read' && approvalKind === 'network' && tool.policy?.publicRead?.(input) === true
-          } catch { /* Classification failure requires a manual decision. */ }
-          if (automatic) this.#tasks.auditToolApproval(ref, operationId, tool.name, true, approvalKind, true)
-          else if (mode === 'unattended') {
+        } else {
+          if (this.#approvalMode() === 'unattended') {
             deny('approval_unattended')
             return { ok: false, error: 'This operation requires separate user approval. Unattended mode declined it; use an already authorized alternative.' }
-          } else {
-            let contextMeta: { conversationId?: string; conversationTitle?: string } | undefined
-            try {
-              contextMeta = this.#approvalContext?.(ref.taskId) ?? { conversationId: this.#tasks.get(ref.taskId).conversationId }
-            } catch { /* Approval metadata is best-effort. */ }
-            const approval = await this.#approval.request({
-              kind: approvalKind, tool: tool.name, detail, workspace: workspace.root,
-              ...(contextMeta?.conversationId ? { conversationId: contextMeta.conversationId } : {}),
-              ...(contextMeta?.conversationTitle ? { conversationTitle: contextMeta.conversationTitle } : {}),
-              ...(approvalKind === 'export' && target ? { suggestedName: basename(target) } : {}),
-            }, combined, ref.taskId)
-            const approved = approval.approved && !this.#closed && !combined.aborted && authorize(input)
-            this.#tasks.auditToolApproval(ref, operationId, tool.name, approved, approvalKind)
-            if (!approved) return { ok: false, code: 'APPROVAL_NOT_GRANTED', error: 'Operation was not authorized. It did not run. Use an already authorized alternative or explain which step needs approval.' }
-            destination = approval.approved ? approval.destination : undefined
           }
+          let contextMeta: { conversationId?: string; conversationTitle?: string } | undefined
+          try {
+            contextMeta = this.#approvalContext?.(ref.taskId) ?? { conversationId: this.#tasks.get(ref.taskId).conversationId }
+          } catch { /* Approval metadata is best-effort. */ }
+          const approval = await this.#approval.request({
+            kind: approvalKind!, tool: tool.name, detail: JSON.stringify(input) ?? 'null', workspace: workspace.root,
+            ...(contextMeta?.conversationId ? { conversationId: contextMeta.conversationId } : {}),
+            ...(contextMeta?.conversationTitle ? { conversationTitle: contextMeta.conversationTitle } : {}),
+            ...(approvalKind === 'export' && target ? { suggestedName: basename(target) } : {}),
+          }, combined, ref.taskId)
+          const approved = approval.approved && !this.#closed && !combined.aborted && authorize(input)
+          this.#tasks.auditToolApproval(ref, operationId, tool.name, approved, approvalKind!)
+          if (!approved) return { ok: false, code: 'APPROVAL_NOT_GRANTED', error: 'Operation was not authorized. It did not run. Use an already authorized alternative or explain which step needs approval.' }
+          destination = approval.approved ? approval.destination : undefined
         }
         try {
-          const taskSnapshot = this.#tasks.get(ref.taskId)
-          const node = [...(taskSnapshot.worker ? [taskSnapshot.worker] : []), ...(taskSnapshot.nodes ?? [])]
-            .find(item => item.id === ref.taskNodeId)
-          const postconditionAccess = taskSnapshot.workspaceAccess === 'trusted' && (!node || node.access === 'trusted')
-            ? 'trusted' : (node?.access ?? taskSnapshot.workspaceAccess ?? 'read')
+          const postconditionAccess = this.#effectiveAccess(ref.taskId, ref.taskNodeId)
           const filePostcondition = effect === 'write'
             ? await prepareFilePostcondition(tool.name, workspace, target, input, postconditionAccess) : undefined
           if (this.#closed || combined.aborted || !authorize(input)) return unavailable
@@ -209,6 +223,7 @@ export class ToolRun {
         try {
           result = await tool.execute(callId, input, combined, {
             taskId: ref.taskId, agentRunId: ref.agentRunId!, destination,
+            ...(scopePath ? { scopePath } : {}),
             defer: (operation) => {
               if (!tool.policy?.deferred || deferred || this.#closed) throw new Error('Deferred operation not permitted')
               if (operation.pid !== undefined) this.#tasks.attachProcess(ref.taskId, operationId, operation.pid)

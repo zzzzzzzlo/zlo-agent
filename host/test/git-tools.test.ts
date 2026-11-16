@@ -99,11 +99,28 @@ test('Git commit neither touches nor includes pre-existing staged changes', asyn
   assert.equal(git(root, ['diff', '--cached', '--name-only']), 'user.txt')
 })
 
-test('Git inspection tools use read accounting and Windows case-variant commit paths stage cleanly', async context => {
+test('Git inspection tools use read accounting, work across access levels, scope git_status/git_log, and commit Windows case variants', async context => {
   const { root, workspace, tools, run } = await fixture(context)
-  const inspectionTools = workspace.tools('root', 'trusted').filter(tool => ['git_status', 'git_diff', 'git_log'].includes(tool.name))
+  const inspectionTools = workspace.tools('root', 'read').filter(tool => ['git_status', 'git_diff', 'git_log'].includes(tool.name))
   assert.equal(inspectionTools.length, 3)
-  assert.ok(inspectionTools.every(tool => tool.effect === 'read' && tool.policy?.minimumAccess === 'trusted'))
+  assert.ok(inspectionTools.every(tool => tool.effect === 'read' && tool.policy === undefined))
+  await mkdir(join(root, 'ui'))
+  await writeFile(join(root, 'ui', 'existing.txt'), 'tracked\n')
+  git(root, ['add', '--', 'ui/existing.txt'])
+  git(root, ['commit', '-m', 'add ui dir'])
+  await writeFile(join(root, 'ui', 'existing.txt'), 'modified tracked\n')
+  await writeFile(join(root, 'ui', 'widget.txt'), 'ui change\n')
+  await writeFile(join(root, 'root-note.txt'), 'root change\n')
+  const scopedStatus = await inspectionTools.find(tool => tool.name === 'git_status')!
+    .execute('scoped-status', {}, undefined, { taskId: 'task-one', agentRunId: 'scoped-run', scopePath: 'ui', defer() {}, onCleanup() {} }) as {
+      ok: boolean; entries: { path: string }[]
+    }
+  assert.equal(scopedStatus.ok, true)
+  assert.deepEqual(scopedStatus.entries.map(item => item.path).sort(), ['ui/existing.txt', 'ui/widget.txt'])
+  git(root, ['rm', '-qf', 'ui/existing.txt'])
+  git(root, ['commit', '-m', 'remove ui fixture'])
+  await rm(join(root, 'ui'), { recursive: true, force: true })
+  await rm(join(root, 'root-note.txt'))
 
   const aborted = new AbortController()
   aborted.abort()

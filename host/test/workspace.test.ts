@@ -39,7 +39,7 @@ test('bounded workspace files can be listed, read, created and edited with liter
   assert.equal(await workspace.verify({ path, contains: '旧' }).then((result) => result.passed), false)
   assert.equal(await workspace.verify({ path }).then((result) => result.passed), true)
   assert.equal(await workspace.verify({ path: 'src/missing.ts' }).then((result) => result.passed), false)
-  assert.deepEqual(workspace.tools('worker').map(({ effect }) => effect), ['read', 'read'])
+  assert.deepEqual(workspace.tools('worker').map(({ effect }) => effect), ['read', 'read', 'read', 'read', 'read'])
 })
 
 test('write denial preserves existing files and concurrent writes are serialized', async (t) => {
@@ -201,4 +201,22 @@ test('P0-1: allows auth source modules and safe engineering dotfiles while still
     assert.deepEqual(await create({ path: blocked, content: 'x' }), { ok: false, error: 'Path denied by workspace policy' }, blocked)
   }
   assert.deepEqual(await mkdirTool({ path: '.husky/hooks' }), { ok: false, error: 'Path denied by workspace policy' })
+
+  // Codex-aligned protected read-only agent directories (.pi, .agents, .claude, .codex):
+  // readable & searchable when present, while all writes & secrets inside them stay blocked.
+  for (const dir of ['.pi', '.agents', '.claude', '.codex']) {
+    await mkdir(join(root, dir))
+    await writeFile(join(root, dir, 'guide.md'), `# ${dir} guide\n`)
+    await writeFile(join(root, dir, '.env'), 'SECRET=1')
+    assert.deepEqual(await read({ path: `${dir}/guide.md` }), { ok: true, text: `# ${dir} guide\n` })
+    const dirList = await list({ path: dir }) as { ok: boolean; entries: { name: string }[] }
+    assert.equal(dirList.ok, true)
+    assert.deepEqual(dirList.entries.map(item => item.name), ['guide.md'])
+    assert.deepEqual(await read({ path: `${dir}/.env` }), { ok: false, error: 'Path denied by workspace policy' })
+    assert.deepEqual(await create({ path: `${dir}/new.md`, content: 'x' }), { ok: false, error: 'Path denied by workspace policy' })
+    assert.deepEqual(await edit({ path: `${dir}/guide.md`, oldText: 'guide', newText: 'mutated' }), {
+      ok: false, error: 'Path denied by workspace policy',
+    })
+    assert.deepEqual(await mkdirTool({ path: `${dir}/sub` }), { ok: false, error: 'Path denied by workspace policy' })
+  }
 })

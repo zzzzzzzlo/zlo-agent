@@ -137,12 +137,13 @@ export class MultiAgentOrchestrator {
   }
 
   #childScope(workspace: CodingWorkspace, parent: CapabilityScope, proposal: Partial<NodeProposal>, role: 'team' | 'worker') {
-    const scope = this.#capabilities.child(parent, proposal.access, proposal.scopePath, role, proposal.tools)
-    if (proposal.tools) {
+    const scope = this.#capabilities.child(parent, proposal.access, proposal.scopePath, role, proposal.tools, proposal.disallowedTools)
+    const checkedTools = new Set([...(proposal.tools ?? []), ...(proposal.disallowedTools ?? [])])
+    if (checkedTools.size) {
       const allowed = new Set(this.#extensions.tools(workspace, role, scope.access)
-        .filter(tool => this.#capabilities.describe(scope, tool)).map(tool => tool.name))
+        .filter(tool => this.#capabilities.describe({ ...scope, disallowedTools: undefined }, tool)).map(tool => tool.name))
       if (this.#runtimePolicy(workspace, scope).skillReadsAllowed()) allowed.add('read_skill')
-      if (proposal.tools.some(name => !allowed.has(name))) throw new Error('Requested tool is outside the effective capability scope')
+      if (proposal.tools?.some(name => !allowed.has(name))) throw new Error('Requested tool is outside the effective capability scope')
     }
     return scope
   }
@@ -349,7 +350,7 @@ export class MultiAgentOrchestrator {
       const scope = this.#childScope(workspace, parentScope, node, role)
       const teamKey = role === 'team'
         ? 'team-' + createHash('sha256').update(JSON.stringify([task.conversationId ?? task.id, node.teamKey, parentRoute.provider,
-          { access: scope.access, path: scope.path, tools: scope.tools, worktreeId: node.worktreeId }])).digest('hex')
+          { access: scope.access, path: scope.path, tools: scope.tools, disallowedTools: scope.disallowedTools, worktreeId: node.worktreeId }])).digest('hex')
         : undefined
       const saved = teamKey ? this.#db.get<AgentRecord>('agents', teamKey) : undefined
       if (teamKey) {
@@ -365,7 +366,7 @@ export class MultiAgentOrchestrator {
         .map(tool => {
           const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input =>
             !childActive &&
-            followUpAllows(followUp, tool.name) && this.#capabilities.authorize(scope, tool, input), evidence, artifacts, node.goal)
+            followUpAllows(followUp, tool.name) && this.#capabilities.authorize(scope, tool, input), evidence, artifacts, node.goal, scope.path)
           return {
             ...wrapped,
             execute: async (id: string, input: unknown, toolSignal?: AbortSignal) => {
@@ -375,8 +376,11 @@ export class MultiAgentOrchestrator {
             },
           } as ExecutionTool
         })
-      const replay = this.#canArchiveToolEvidence(task.id) && toolRun.replayTool(() => event, signal, name => availableTools.some(tool => tool.name === name &&
-        this.#capabilities.describe(scope, tool)) && !followUp)
+      const replay = !scope.disallowedTools?.includes('read_tool_evidence') &&
+        (!scope.tools || scope.tools.includes('read_tool_evidence')) &&
+        this.#canArchiveToolEvidence(task.id) &&
+        toolRun.replayTool(() => event, signal, name => availableTools.some(tool => tool.name === name &&
+          this.#capabilities.describe(scope, tool) && followUpAllows(followUp, tool.name)))
       if (replay) tools.push(replay)
       const runChild = async (child: WorkerNode) => {
         if (followUp || childActive || workspaceActive || signal.aborted || !session) return undefined
@@ -497,12 +501,12 @@ export class MultiAgentOrchestrator {
         followUp = undefined
         executionCompleted = outcome.status === 'completed'
         if (!signal.aborted && outcome.status === 'completed' && outcome.text.trim()) {
-          if (node.check?.command && (!this.#capabilities.enabled('run_project_command') || scope.path ||
-            (scope.tools && !scope.tools.includes('run_project_command')))) {
+          if (node.check?.command && (!this.#capabilities.enabled('run_project_command') ||
+            (scope.tools && !scope.tools.includes('run_project_command')) ||
+            scope.disallowedTools?.includes('run_project_command'))) {
             verification = { passed: false, evidence: 'project_command_disabled' }
           } else if (node.check) verification = await verifyWorkspace(this.#tasks, this.#extensions.workflow,
-            workspace, event, node.check, signal,
-            node.check.command && !node.worktreeId && !scope.path && parentScope.access === 'trusted' && node.access === 'write' ? 'trusted' : scope.access)
+            workspace, event, node.check, signal, scope.access)
           const completedChildren = this.#tasks.get(task.id).nodes?.filter(child =>
             child.parentNodeId === node.id && child.status === 'succeeded').length ?? 0
           const hardEvidence = node.check ? verification?.passed === true : evidence.size > 0 || completedChildren > 0
@@ -695,7 +699,7 @@ export class MultiAgentOrchestrator {
         }
       })
     const replay = this.#canArchiveToolEvidence(task.id) && toolRun.replayTool(() => event, signal, name => availableTools.some(tool => tool.name === name &&
-      this.#capabilities.describe(rootScope, tool)) && !followUp)
+      this.#capabilities.describe(rootScope, tool) && followUpAllows(followUp, tool.name)))
     if (replay) tools.push(replay)
     if (this.#profile.delegation) {
       if (this.#capabilities.enabled('delegate_task')) tools.push(delegationTool('delegate_task', async (id, input, toolSignal) => {

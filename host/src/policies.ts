@@ -105,11 +105,17 @@ export interface CapabilityScope {
   path?: string
   role: AgentRole
   tools?: readonly string[]
+  disallowedTools?: readonly string[]
   explicitDelegation?: boolean
   canSelectTaskWorkspace?: boolean
 }
 
 export const accessRank: Record<WorkspaceAccess, number> = { read: 0, write: 1, trusted: 2 }
+
+function validToolList(list: readonly string[]): boolean {
+  return Array.isArray(list) && list.length <= 128 && new Set(list).size === list.length &&
+    !list.some(name => typeof name !== 'string' || !/^[a-z][a-z_0-9]{0,63}$/u.test(name))
+}
 
 export class CodingCapabilities {
   readonly #profile: Readonly<CodingProfile>
@@ -126,22 +132,29 @@ export class CodingCapabilities {
   }
 
   child(parent: CapabilityScope, requested?: WorkspaceAccess, path?: string, role: 'team' | 'worker' = 'worker',
-    tools?: readonly string[]): CapabilityScope {
+    tools?: readonly string[], disallowedTools?: readonly string[]): CapabilityScope {
     const access = requested ?? 'read'
     if (!Object.hasOwn(accessRank, access) || accessRank[access] > accessRank[parent.access]) throw new Error('Requested access exceeds its parent workspace grant')
     const target = path === undefined ? parent.path : workspaceTarget({ path })
     if (path !== undefined && (!target || !within(parent.path, target))) throw new Error('Child workspace scope exceeds its parent')
-    if (tools !== undefined && (!Array.isArray(tools) || tools.length > 128 || new Set(tools).size !== tools.length ||
-      tools.some(name => typeof name !== 'string' || !/^[a-z][a-z_0-9]{0,63}$/u.test(name) || !this.enabled(name) ||
-        (parent.tools !== undefined && !parent.tools.includes(name))))) {
+    if (disallowedTools !== undefined && !validToolList(disallowedTools)) {
+      throw new Error('Requested tool exclusion set is invalid')
+    }
+    if (tools !== undefined && (!validToolList(tools) ||
+      tools.some(name => !this.enabled(name) ||
+        (parent.tools !== undefined && !parent.tools.includes(name)) ||
+        (parent.disallowedTools !== undefined && parent.disallowedTools.includes(name))))) {
       throw new Error('Requested tool set exceeds its parent capability grant')
     }
+    const mergedDisallowed = [...new Set([...(parent.disallowedTools ?? []), ...(disallowedTools ?? [])])].sort()
     return { role, access, path: target, tools: tools === undefined ? parent.tools : [...tools],
+      ...(mergedDisallowed.length ? { disallowedTools: mergedDisallowed } : {}),
       explicitDelegation: parent.explicitDelegation === true && tools !== undefined }
   }
 
   describe(scope: CapabilityScope, tool: WorkspaceTool): boolean {
     if (!this.enabled(tool.name) || (scope.tools !== undefined && !scope.tools.includes(tool.name))) return false
+    if (scope.disallowedTools?.includes(tool.name)) return false
     if (tool.policy?.delegation === 'explicit' && !scope.explicitDelegation) return false
     if (tool.policy?.wholeWorkspace && scope.path !== undefined) return false
     const minimum = tool.policy?.minimumAccess ?? (tool.effect === 'write' ? 'write' : 'read')
@@ -158,9 +171,9 @@ export class CodingCapabilities {
       const minimum = tool.policy?.minimumAccessFor?.(input) ?? 'read'
       if (accessRank[scope.access] < accessRank[minimum] || (effect === 'write' && scope.access === 'read')) return false
       if (scope.path === undefined) return true
-      const targets = tool.policy?.targets ? tool.policy.targets(input) : [workspaceTarget(input)]
+      const targets = tool.policy?.targets ? tool.policy.targets(input) : [workspaceTarget(input, effect)]
       return targets.every(value => {
-        const target = workspaceTarget({ path: value })
+        const target = workspaceTarget({ path: value }, effect)
         return target !== undefined && within(scope.path, target)
       })
     } catch {

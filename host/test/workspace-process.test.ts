@@ -25,9 +25,10 @@ test('read, write and trusted grants govern each role and reject overlapping wor
   const { root, workspace } = await fixture(t)
   for (const role of ['root', 'team', 'worker'] as const) {
     const names = (access: WorkspaceAccess) => workspace.tools(role, access).map((item) => item.name)
-    assert.deepEqual(names('read'), ['list_directory', 'read_text_file'])
+    assert.deepEqual(names('read'), ['list_directory', 'read_text_file', 'git_status', 'git_diff', 'git_log'])
     assert.ok(names('write').includes('create_directory'))
-    assert.ok(!names('write').includes('run_project_command'))
+    assert.ok(names('write').includes('run_project_command'))
+    assert.ok(names('write').includes('git_status'))
     assert.ok(names('trusted').includes('run_project_command'))
     assert.ok(names('trusted').includes('git_status'))
   }
