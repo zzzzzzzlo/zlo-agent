@@ -6,6 +6,7 @@ import type { AgentExecution, ExecutionConfig, ExecutionSession, ExecutionTool, 
 import type { EndReason, EventDraft, ModelRoute, SessionRef } from './contracts/domain.ts'
 import type { LocalJudgment } from './judgment.ts'
 import { frameInstruction, preflight, skillDisclosure } from './input-judgment.ts'
+import { workspaceMemoryScope } from './memory.ts'
 import type { ScopedContext } from './memory.ts'
 import { ModelBudgetError } from './model-scheduler.ts'
 import type { LocalModelScheduler } from './model-scheduler.ts'
@@ -57,7 +58,11 @@ const deadlines: Record<HarnessMode, { root: number; child: number }> = {
 type ProfileRuntime = ReturnType<ExtensionRegistry['resolve']>
 type WorkerHandoff = WorkerResult & { verification?: WorkerNode['verification'] }
 
-export function memoryScope(task: TaskSnapshot, route: ModelRoute): string {
+export function memoryScope(task: TaskSnapshot, _route?: ModelRoute): string {
+  return workspaceMemoryScope(task.cwd)
+}
+
+export function legacyMemoryScope(task: TaskSnapshot, route: ModelRoute): string {
   return JSON.stringify([task.conversationId ?? task.cwd, route.provider])
 }
 
@@ -464,14 +469,21 @@ export class MultiAgentOrchestrator {
           }))).slice(0, 4000)] : []),
         ]
         const target = workspaceTarget(node.check ?? (scope.path ? undefined : task.check))
-        const scopedFilter = scope.path ? (entry: { kind: string; text: string }) => {
+        const withinScopePath = (scopePath: string, filePath: string) => {
+          const left = process.platform === 'win32' ? scopePath.toLowerCase() : scopePath
+          const right = process.platform === 'win32' ? filePath.toLowerCase() : filePath
+          return right === left || right.startsWith(left + '/')
+        }
+        const scopedFilter = scope.path ? (entry: { kind: string; text: string; paths?: readonly string[] }) => {
+          if (entry.paths?.length) return entry.paths.some(filePath => withinScopePath(scope.path!, filePath))
+          if (entry.kind === 'experience') return true
           const match = /^Confirmed workspace operation \S+ on (.+)$/u.exec(entry.text)
           if (!match) return false
-          const filePath = match[1]!
-          return filePath === scope.path || filePath.startsWith(scope.path + '/')
+          return withinScopePath(scope.path!, match[1]!)
         } : undefined
         const prompt = await this.#context.build(event, {
           scope: memoryScope(task, session.route),
+          fallbackScopes: [legacyMemoryScope(task, session.route)],
           filter: scopedFilter,
           goal: node.goal, constraints,
           artifactRefs: target ? [target] : [], availableTools: tools.map(tool => tool.name), signal,
@@ -1003,7 +1015,10 @@ export class MultiAgentOrchestrator {
           const constraints = await Promise.all(instructions.map(async ({ text }) =>
             'Additional user instruction: ' + await frameInstruction(this.#judgment, event, task.goal, text, signal)))
           const prompt = await this.#context.build(event, {
-            scope: memoryScope(task, session.route), goal: nextPrompt, judgmentGoal: task.goal,
+            scope: memoryScope(task, session.route),
+            fallbackScopes: [legacyMemoryScope(task, session.route)],
+            includePlaybook: true,
+            goal: nextPrompt, judgmentGoal: task.goal,
             constraints,
             signal,
           })

@@ -53,7 +53,7 @@ export function preferences(value: unknown): AgentPreferences {
 }
 
 export function memoryIds(value: unknown): Set<string> {
-  if (!Array.isArray(value) || value.length < 1 || value.length > 96 ||
+  if (!Array.isArray(value) || value.length < 1 || value.length > 2000 ||
     value.some(id => typeof id !== 'string' || !/^[a-f\d]{64}$/u.test(id))) invalid('Invalid memory record identifiers')
   return new Set<string>(value)
 }

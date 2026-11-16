@@ -226,7 +226,7 @@ export function registerManagementIpc(options: {
   register('deleteMemory', (window, value) => mutate(async () => {
     const { conversationId, ids } = object(value, ['conversationId', 'ids'])
     const id = entityId(conversationId)
-    if (!Array.isArray(ids) || ids.length < 1 || ids.length > 96 ||
+    if (!Array.isArray(ids) || ids.length < 1 || ids.length > 2000 ||
       ids.some(item => typeof item !== 'string' || !/^[a-f\d]{64}$/u.test(item))) return invalid()
     await confirm(window, '删除会话记忆', '删除所选记忆记录？', '这些记录将不再参与后续检索。')
     return host.request({ schemaVersion: 1, type: 'deleteConversationMemory', conversationId: id, ids })

@@ -1,12 +1,14 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import type { EventDraft } from '../src/contracts/domain.ts'
 import { LocalJudgment } from '../src/judgment.ts'
-import { ContextBudgetError, LocalMemory, ScopedContext } from '../src/memory.ts'
+import { ContextBudgetError, LocalMemory, ScopedContext, workspaceMemoryScope } from '../src/memory.ts'
+import { createMemoryTools } from '../src/memory-tools.ts'
 import { LocalStore } from '../src/store.ts'
+import { CodingWorkspace } from '../src/workspace.ts'
 
 const event: EventDraft = { taskId: 'task', taskRunId: 'run', agentRunId: 'agent-run', type: '', payload: {} }
 const scope = JSON.stringify(['workspace', 'test', 'provider-a'])
@@ -58,25 +60,54 @@ test('memory persists separate evidence-backed facts and experiences and rejects
   }
 })
 
-test('memory bounds per-scope retention, writes, and retrieval', () => {
+test('memory removes artificial caps, preserves >768B & clipped >8KiB notes, prioritizes durable entries on eviction, and validates recall limits', () => {
   const store = new LocalStore(':memory:')
   try {
     const memory = new LocalMemory(store)
     for (let batch = 0; batch < 10; batch++) {
-      memory.capture(event, scope, Array.from({ length: 13 }, (_, index) => ({
+      memory.capture(event, scope, Array.from({ length: 15 }, (_, index) => ({
         kind: 'fact',
-        text: 'Shared feature-' + batch + '-' + index,
+        text: 'Shared architecture note batch-' + batch + ' item-' + index,
         sourceRefs: ['operation-' + batch + '-' + index],
       })))
     }
-    assert.equal(store.events('task').every(({ payload }) => payload.count === 12), true)
+    assert.equal(store.events('task').every(({ payload }) => payload.count === 15), true)
     const [records] = store.list<unknown[]>('memory-scopes')
-    assert.equal(records.length, 96)
-    const entries = memory.recall(scope, 'shared')
-    assert.equal(entries.length, 8)
-    assert.equal(entries[0].text, 'Shared feature-9-11')
+    assert.equal(records.length, 150)
+    const defaultRecalled = memory.recall(scope, 'shared')
+    assert.equal(defaultRecalled.length, 12)
+    assert.equal(memory.recall(scope, 'shared', 32).length, 32)
     assert.deepEqual(memory.recall(scope, 'shared', 0), [])
     assert.throws(() => memory.recall(scope, 'shared', 1000), /recall limit/)
+
+    // Long notes (>768 B) are preserved intact and oversized notes (>8 KiB) are clipped cleanly instead of dropped.
+    const mediumNote = 'Migration checklist detail ' + 'x'.repeat(2400)
+    const oversizedNote = 'Oversized architecture spec ' + 'z'.repeat(9000)
+    memory.capture(event, otherProvider, [
+      { kind: 'fact', key: 'medium-note', text: mediumNote, sourceRefs: ['op-med'] },
+      { kind: 'fact', key: 'oversized-note', text: oversizedNote, sourceRefs: ['op-big'] },
+    ])
+    const storedLong = memory.list(otherProvider)
+    assert.equal(storedLong.length, 2)
+    assert.equal(storedLong.find(item => item.key === 'medium-note')?.text.length, mediumNote.length)
+    const clippedText = storedLong.find(item => item.key === 'oversized-note')!.text
+    assert.ok(Buffer.byteLength(clippedText) <= 8192)
+    assert.ok(clippedText.endsWith('...'))
+
+    // Eviction drops older non-durable facts before durable/experience entries.
+    const bounded = new LocalMemory(store, { maxEntriesPerScope: 4 })
+    const pruneScope = JSON.stringify(['workspace', 'prune-priority'])
+    bounded.capture(event, pruneScope, [
+      { kind: 'experience', durable: true, key: 'keep-exp', text: 'Run project typecheck before verification', sourceRefs: ['op-0'] },
+    ])
+    for (let i = 1; i <= 5; i++) {
+      bounded.capture(event, pruneScope, [
+        { kind: 'fact', key: 'fact-' + i, text: 'Transient edit observation ' + i, sourceRefs: ['op-' + i] },
+      ])
+    }
+    const kept = bounded.list(pruneScope)
+    assert.equal(kept.length, 4)
+    assert.ok(kept.some(item => item.key === 'keep-exp'))
   } finally {
     store.close()
   }
@@ -248,6 +279,119 @@ test('P1-5: memory recall filters boilerplate stopwords and scoped context filte
     })
     assert.match(scopedPrompt, /src\/FeatureA\.ts/)
     assert.doesNotMatch(scopedPrompt, /secret_notes\/Note\.md/)
+  } finally {
+    store.close()
+  }
+})
+
+test('Codex memory alignment: BM25 subtoken/CJK bigram ranking, MEMORY.md materialization, cross-scope fallback, and memory tools', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'zlo-codex-memory-'))
+  const memoriesDir = join(root, 'memories')
+  const projectDir = join(root, 'repo')
+  const { mkdir } = await import('node:fs/promises')
+  await mkdir(join(projectDir, 'src'), { recursive: true })
+  t.after(() => rm(root, { recursive: true, force: true }))
+
+  const store = new LocalStore(':memory:')
+  try {
+    const memory = new LocalMemory(store, { memoriesDir })
+    const projectScope = workspaceMemoryScope(projectDir)
+    const legacyScope = JSON.stringify(['old-conv-id', 'openai'])
+
+    // Legacy entry in [conversationId, provider] plus modern shared workspace entries.
+    memory.capture(event, legacyScope, [
+      { kind: 'fact', key: 'legacy-op', text: 'Confirmed workspace operation edit_text_file on src/LegacyModule.ts', sourceRefs: ['op-legacy'] },
+    ])
+    memory.capture(event, projectScope, [
+      { kind: 'fact', key: 'noise', text: '数据库初始化与常规构建说明', sourceRefs: ['op-1'] },
+      { kind: 'fact', key: 'target-cjk', durable: true, title: '迁移回滚策略', text: '数据库迁移失败时使用逆向脚本回滚表结构并校验索引', paths: ['src/MigrationRunner.ts'], sourceRefs: ['op-2'] },
+      { kind: 'experience', durable: true, key: 'verify-exp', text: 'Project verification passed using npm_typecheck after fixing FeatureAuthHandler', sourceRefs: ['op-3'] },
+      { kind: 'fact', key: 'secret-note', text: 'Confirmed workspace operation create_text_file on secret_notes/Note.md', paths: ['secret_notes/Note.md'], sourceRefs: ['op-4'] },
+    ])
+
+    // CJK bigram + camelCase subtoken BM25 ranking
+    const cjkHits = memory.recall(projectScope, '迁移回滚策略')
+    assert.equal(cjkHits[0]?.key, 'target-cjk')
+    const subtokenHits = memory.recall(projectScope, 'AuthHandler')
+    assert.equal(subtokenHits[0]?.key, 'verify-exp')
+    assert.equal(memory.recall(projectScope, 'MigrationRunner').length, 1)
+
+    // Materialized MEMORY.md & memory_summary.md exist on disk
+    const { readdir } = await import('node:fs/promises')
+    const scopeDirs = await readdir(memoriesDir)
+    assert.equal(scopeDirs.length, 2)
+    const markdownFiles = await Promise.all(scopeDirs.map(dir => readFile(join(memoriesDir, dir, 'MEMORY.md'), 'utf8')))
+    assert.ok(markdownFiles.some(md => md.includes('迁移回滚策略') && md.includes('Durable Experiences & Key Notes')))
+    const summaryFiles = await Promise.all(scopeDirs.map(dir => readFile(join(memoriesDir, dir, 'memory_summary.md'), 'utf8')))
+    assert.ok(summaryFiles.some(md => md.includes('# Memory Summary')))
+
+    // ScopedContext fallbackScopes + experience passthrough for scoped subagent + playbook summary
+    const judgment = new LocalJudgment(store)
+    const context = new ScopedContext(memory, judgment)
+    const scopedPrompt = await context.build(event, {
+      scope: projectScope,
+      fallbackScopes: [legacyScope],
+      includePlaybook: true,
+      goal: 'Check FeatureAuthHandler, LegacyModule, secret_notes and verification',
+      filter: (entry) => {
+        if (entry.paths?.length) return entry.paths.some(p => p === 'src' || p.startsWith('src/'))
+        if (entry.kind === 'experience') return true
+        const match = /^Confirmed workspace operation \S+ on (.+)$/u.exec(entry.text)
+        return Boolean(match && (match[1] === 'src' || match[1]!.startsWith('src/')))
+      },
+    })
+    assert.match(scopedPrompt, /LegacyModule\.ts/)
+    assert.match(scopedPrompt, /FeatureAuthHandler/)
+    assert.match(scopedPrompt, /Workspace memory summary/)
+    assert.doesNotMatch(scopedPrompt, /secret_notes\/Note\.md/)
+
+    // Memory tools: memory_save, memory_search, memory_list + scope enforcement & secret blocking
+    const workspace = new CodingWorkspace(projectDir)
+    const tools = createMemoryTools(workspace, () => ({
+      memory,
+      judgment,
+      scopesFor: () => ({ primary: projectScope, all: [projectScope, legacyScope], goal: 'inspect memory', event }),
+    }))
+    const search = tools.find(tool => tool.name === 'memory_search')!
+    const list = tools.find(tool => tool.name === 'memory_list')!
+    const save = tools.find(tool => tool.name === 'memory_save')!
+
+    const saved = await save.execute('call-save', {
+      kind: 'experience',
+      title: 'Edge pipe flake avoidance',
+      text: 'Run playwright desktop and observatory E2E tests sequentially to avoid port contention',
+      paths: ['src/runner.ts'],
+    }, undefined, { taskId: 'task', agentRunId: 'agent-run', defer() {}, onCleanup() {} }) as { ok: boolean; saved: boolean }
+    assert.equal(saved.ok, true)
+    assert.equal(saved.saved, true)
+
+    const badPath = await save.execute('call-bad-path', {
+      kind: 'fact',
+      text: 'Outside note',
+      paths: ['other/file.ts'],
+    }, undefined, { taskId: 'task', agentRunId: 'agent-run', scopePath: 'src', defer() {}, onCleanup() {} }) as { ok: boolean }
+    assert.equal(badPath.ok, false)
+
+    const secretTry = await save.execute('call-secret', {
+      kind: 'fact',
+      text: 'api_key=' + secret,
+    }, undefined, { taskId: 'task', agentRunId: 'agent-run', defer() {}, onCleanup() {} }) as { ok: boolean; saved: boolean }
+    assert.equal(secretTry.ok, true)
+    assert.equal(secretTry.saved, false)
+
+    const searched = await search.execute('call-search', { query: 'playwright sequential', kind: 'experience' }, undefined, {
+      taskId: 'task', agentRunId: 'agent-run', scopePath: 'src', defer() {}, onCleanup() {},
+    }) as { ok: boolean; entries: { title?: string }[] }
+    assert.equal(searched.ok, true)
+    assert.equal(searched.entries[0]?.title, 'Edge pipe flake avoidance')
+
+    const listedScoped = await list.execute('call-list', { limit: 20 }, undefined, {
+      taskId: 'task', agentRunId: 'agent-run', scopePath: 'src', defer() {}, onCleanup() {},
+    }) as { ok: boolean; entries: { text: string }[] }
+    assert.equal(listedScoped.ok, true)
+    assert.ok(listedScoped.entries.some(item => item.text.includes('LegacyModule.ts')))
+    assert.ok(listedScoped.entries.some(item => item.text.includes('Project verification passed')))
+    assert.ok(!listedScoped.entries.some(item => item.text.includes('secret_notes/Note.md')))
   } finally {
     store.close()
   }

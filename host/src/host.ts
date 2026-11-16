@@ -32,11 +32,12 @@ import { installTaskDiagnostics } from './diagnostics.ts'
 import { LocalJudgment } from './judgment.ts'
 import { JevConfiguration } from './jev-settings.ts'
 import type { JudgmentOptions } from './judgment.ts'
-import { LocalMemory, ScopedContext } from './memory.ts'
+import { LocalMemory, ScopedContext, workspaceMemoryScope } from './memory.ts'
+import { createMemoryTools } from './memory-tools.ts'
 import * as management from './management.ts'
 import { LocalModelScheduler } from './model-scheduler.ts'
 import type { ModelLimits } from './model-scheduler.ts'
-import { MultiAgentOrchestrator, executionFailure, memoryScope, sameRoute } from './orchestrator.ts'
+import { MultiAgentOrchestrator, executionFailure, legacyMemoryScope, memoryScope, sameRoute } from './orchestrator.ts'
 import type { HarnessMode } from './orchestrator.ts'
 import { accessRank, CodingCapabilities, ExtensionRegistry } from './policies.ts'
 import { probeOperation } from './reconciliation.ts'
@@ -168,6 +169,7 @@ export class LocalAgentHost {
       } },
       { id: 'browser', tools: workspace => createBrowserTools(workspace) },
       { id: 'preview', tools: workspace => createPreviewTools(workspace) },
+      { id: 'memory', tools: workspace => createMemoryTools(workspace, () => this.#memoryToolRuntime()) },
     ])).resolve(options.profileId ?? 'coding')
     this.#profile = { ...(options.profile ?? this.#extensions.profile) }
     this.#capabilities = new CodingCapabilities(this.#profile, name => this.#toolEnabled(name))
@@ -189,7 +191,7 @@ export class LocalAgentHost {
       this.#conversations = new ConversationService(this.#store, () => this.#failStorage())
       installTaskDiagnostics(this.#store)
       const judgment = this.#judgment = new LocalJudgment(this.#store, options.judgment ?? this.#jev.judgmentOptions())
-      this.#memory = new LocalMemory(this.#store)
+      this.#memory = new LocalMemory(this.#store, { memoriesDir: join(this.#directory, 'memories') })
       this.#scheduler = new LocalModelScheduler(options.execution, this.#store, judgment, options.modelLimits,
         () => this.#agentPreferences.modelSelection === 'automatic')
       this.#orchestrator = new MultiAgentOrchestrator({
@@ -608,10 +610,12 @@ export class LocalAgentHost {
     const memory: ManagedMemory | undefined = conversation ? { entries: [], recalls: [] } : undefined
     if (conversation && memory) {
       const providers = this.#conversationMemoryProviders(conversation)
-      for (const provider of providers) {
-        for (const { id, kind, text, version, updatedAt } of this.#memory.list(management.conversationScope(conversation, provider))) {
-          memory.entries.push({ id, kind, text, version, updatedAt })
-        }
+      const scopes = [
+        workspaceMemoryScope(conversation.workspace),
+        ...[...providers].map(provider => management.conversationScope(conversation, provider)),
+      ]
+      for (const { id, kind, text, version, updatedAt } of this.#memory.listScopes(scopes)) {
+        memory.entries.push({ id, kind, text, version, updatedAt })
       }
       memory.entries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     }
@@ -727,12 +731,56 @@ export class LocalAgentHost {
     return providers
   }
 
+  #memoryToolRuntime() {
+    return {
+      memory: this.#memory,
+      judgment: this.#judgment,
+      scopesFor: (taskId: string | undefined, workspaceRoot: string, agentRunId?: string) => {
+        let task: TaskSnapshot | undefined
+        if (taskId) {
+          try { task = this.#engine.get(taskId) } catch { /* Missing task falls back to workspace root. */ }
+        }
+        const primary = workspaceMemoryScope(task?.cwd ?? workspaceRoot)
+        const all = [primary]
+        if (task) {
+          const providers = new Set<string>(management.providers)
+          if (task.route) providers.add(task.route.provider)
+          if (task.conversationId) {
+            try {
+              for (const provider of this.#conversationMemoryProviders(this.#conversations.get(task.conversationId))) {
+                providers.add(provider)
+              }
+            } catch { /* Conversation lookup is best-effort. */ }
+          }
+          for (const provider of providers) {
+            all.push(legacyMemoryScope(task, { provider, model: '' }))
+          }
+        }
+        const event: EventDraft | undefined = task
+          ? {
+            taskId: task.id,
+            taskRunId: task.taskRunId,
+            taskNodeId: task.rootNodeId,
+            taskAttemptId: task.attemptId,
+            agentRunId,
+            type: '',
+            payload: {},
+          }
+          : undefined
+        return { primary, all: [...new Set(all)], goal: task?.goal, event }
+      },
+    }
+  }
+
   #removeMemory(conversationId: string, ids: unknown): number {
     const conversation = this.#conversations.get(management.id(conversationId))
     const selected = management.memoryIds(ids)
     const providers = this.#conversationMemoryProviders(conversation)
-    return [...providers].reduce((count, provider) => count +
-      this.#memory.remove(management.conversationScope(conversation, provider), selected), 0)
+    const scopes = [
+      workspaceMemoryScope(conversation.workspace),
+      ...[...providers].map(provider => management.conversationScope(conversation, provider)),
+    ]
+    return scopes.reduce((count, scope) => count + this.#memory.remove(scope, selected), 0)
   }
 
   async #reconcile(command: Extract<ManagementCommand, { type: 'reconcileOperation' }>): Promise<ManagedOperation> {
@@ -1107,24 +1155,59 @@ export class LocalAgentHost {
       ...(task.worker && task.worker.status !== 'succeeded' ? [task.worker.id] : []),
       ...(task.nodes ?? []).filter(node => node.status !== 'succeeded').map(node => node.id),
     ])
-    const writes = this.#engine.operations(task.id).filter(item =>
+    const allOps = this.#engine.operations(task.id)
+    const writes = allOps.filter(item =>
       item.effect === 'write' && item.status === 'succeeded' && (!item.taskNodeId || !failedNodes.has(item.taskNodeId)))
-    const entries = writes.flatMap(item => {
+    const operationEntries = writes.flatMap(item => {
       const targets = item.target ? [item.target] : (item.changedPaths ?? [])
       return targets.map(target => ({
         kind: 'fact' as const,
         key: 'op:' + item.tool + ':' + createHash('sha256').update(target).digest('hex').slice(0, 24),
         text: 'Confirmed workspace operation ' + item.tool + ' on ' + target,
+        paths: [target],
         sourceRefs: [item.id],
       }))
-    }).slice(-12)
-    const scope = memoryScope(task, route)
-    const experiences = task.check && task.verification?.passed ? [{
-      kind: 'experience' as const,
-      text: task.check.command ? 'Project verification passed using ' + task.check.command.command
-        : 'A workspace check passed for ' + task.check.path,
-      sourceRefs: [task.id],
+    })
+    const uniqueTargets = [...new Set(operationEntries.flatMap(entry => entry.paths ?? []))]
+    const rolloutSummary = writes.length > 8 && uniqueTargets.length > 1 ? [{
+      kind: 'fact' as const,
+      durable: true,
+      key: 'rollout:' + task.id,
+      title: 'Task rollout summary',
+      text: 'Task rollout updated ' + uniqueTargets.length + ' path(s) (' + uniqueTargets.slice(0, 12).join(', ') +
+        (uniqueTargets.length > 12 ? ', ...' : '') + ') across ' + writes.length + ' confirmed write operations.',
+      paths: uniqueTargets.slice(0, 24),
+      sourceRefs: writes.slice(0, 16).map(item => item.id),
     }] : []
+    const entries = [...rolloutSummary, ...operationEntries]
+    const scope = memoryScope(task, route)
+    const experiences: {
+      kind: 'experience'; text: string; sourceRefs: readonly string[]; key?: string; paths?: readonly string[]; durable?: boolean
+    }[] = []
+    if (task.check && task.verification?.passed) {
+      experiences.push({
+        kind: 'experience',
+        durable: true,
+        key: 'verify:' + createHash('sha256').update(JSON.stringify(task.check)).digest('hex').slice(0, 24),
+        text: task.check.command ? 'Project verification passed using ' + task.check.command.command
+          : 'A workspace check passed for ' + task.check.path,
+        ...(task.check.path ? { paths: [task.check.path] } : {}),
+        sourceRefs: [task.id],
+      })
+    }
+    const failedTools = [...new Set(allOps.filter(item => item.status === 'failed').map(item => item.tool))]
+    if (task.verification?.passed && (failedTools.length > 0 || task.attemptCount > 1)) {
+      experiences.push({
+        kind: 'experience',
+        durable: true,
+        key: 'repair:' + task.id,
+        text: failedTools.length
+          ? 'Self-repair succeeded for verified task after resolving failed tool calls (' + failedTools.slice(0, 8).join(', ') + ')'
+          : 'Task converged to verified completion after retry attempt ' + task.attemptCount,
+        ...(uniqueTargets.length ? { paths: uniqueTargets.slice(0, 12) } : {}),
+        sourceRefs: [task.id],
+      })
+    }
     if (this.#judgment.mode('memory.capture', task.id) === 'off') {
       this.#memory.capture(event, scope, entries)
       if (experiences.length) this.#memory.capture(event, scope, experiences)

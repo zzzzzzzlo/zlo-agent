@@ -31,6 +31,7 @@ const verificationTools = new Set(['run_project_command', 'preview_page', 'brows
 const followUpRead = new Set([
   'read_text_file', 'list_directory', 'search_files', 'search_content', 'git_status', 'git_diff', 'git_log',
   'view_image', 'preview_page', 'browser_snapshot', 'run_project_command', 'read_tool_evidence', 'read_skill',
+  'memory_search', 'memory_list',
 ])
 const followUpWrite = new Set(['create_text_file', 'edit_text_file', 'apply_patch', 'rename_file', 'move_file'])
 const completionNudge = 'Before closing, finish any remaining requested work, resolve any defects, and run required local verification with permitted tools while respecting all original constraints (including any instruction to skip tests). Do not seek new approvals or perform external actions. Report verified results or remaining uncertainty.'

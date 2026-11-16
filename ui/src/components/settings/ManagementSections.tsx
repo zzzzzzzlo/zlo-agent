@@ -229,7 +229,7 @@ function Memory({ snapshot, api, busy, perform }: ActionProps) {
     <div className="management-stack">
       <section className="management-group">
         <h4>记忆</h4>
-        <p className="management-note">作用域 · 当前会话</p>
+        <p className="management-note">作用域 · 当前工作区共享（兼容历史会话记录）</p>
         <p className="management-path">{snapshot.conversation?.workspace}</p>
         {!entries.length && <p className="management-note">当前作用域暂无记忆。</p>}
         {entries.length > 0 && (
