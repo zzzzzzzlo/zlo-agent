@@ -90,7 +90,7 @@ export function publicWebUrl(input: string): URL {
       if (next === decoded) break
       decoded = next
     }
-    if (sensitiveWebInput(decoded) || [...url.searchParams.keys()].some(key => sensitiveName.test(key))) {
+    if (sensitiveWebInput(url.hostname) || sensitiveWebInput(decoded) || [...url.searchParams.keys()].some(key => sensitiveName.test(key))) {
       throw new WebFailure('policy')
     }
   } catch { throw new WebFailure('policy') }

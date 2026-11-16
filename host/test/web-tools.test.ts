@@ -8,12 +8,17 @@ const publicV4 = { address: '1.1.1.1', family: 4 }
 const publicV6 = { address: '2606:4700:4700::1111', family: 6 }
 const response: WebResponse = { status: 200, contentType: 'text/html', body: Buffer.from('<main><p>Example</p></main>') }
 
-test('public web policy rejects non-HTTPS, credential-bearing and internal URLs', () => {
+test('public web policy rejects non-HTTPS, credential-bearing and internal URLs', (t) => {
+  const envSecret = 'zlowebsubdomainsecret9911'
+  process.env.ZLO_WEB_URL_TEST_API_KEY = envSecret
+  t.after(() => { delete process.env.ZLO_WEB_URL_TEST_API_KEY })
   for (const url of [
     'http://example.com/', 'https://example.com:444/', 'https://root:secret@example.com/',
     'https://localhost/', 'https://metadata.google.internal/', 'https://169.254.169.254/',
     'https://0177.0.0.1/', 'https://[::ffff:127.0.0.1]/', 'https://example.com/?session_id=hidden',
     'https://example.com/?x=%73%6b%2dthis_is_a_test_fixture_key',
+    'https://sk-fixturesecretkey12345678.example.com/',
+    `https://${envSecret}.example.com/docs`,
   ]) assert.throws(() => publicWebUrl(url), /policy/, url)
   assert.equal(publicWebUrl('https://example.com:443/?q=patch#heading').href, 'https://example.com/?q=patch')
 })

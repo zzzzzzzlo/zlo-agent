@@ -1,7 +1,15 @@
 import { randomUUID } from 'node:crypto'
 import { mkdir, open, rename, unlink } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
-import { safeStorage } from 'electron'
+import electron from 'electron'
+
+const { safeStorage } = electron as unknown as typeof import('electron')
+
+export interface EncryptedStore {
+  available(): boolean
+  read(path: string): Promise<unknown>
+  write(path: string, value: unknown): Promise<void>
+}
 
 export function storageAvailable(): boolean {
   return safeStorage.isEncryptionAvailable() &&
@@ -43,4 +51,10 @@ export async function writeEncryptedJson(path: string, value: unknown): Promise<
   } finally {
     await unlink(temporary).catch(() => {})
   }
+}
+
+export const defaultEncryptedStore: EncryptedStore = {
+  available: storageAvailable,
+  read: readEncryptedJson,
+  write: writeEncryptedJson,
 }

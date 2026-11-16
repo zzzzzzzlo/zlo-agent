@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
-import { shell } from 'electron'
+import electron from 'electron'
 import type { ChatGptSession, ChatGptStatus } from '../../../shared/contracts/chatgpt.ts'
 import type { ManagedModel } from '../../../shared/contracts/management.ts'
 import {
@@ -8,7 +8,10 @@ import {
   validClientId, validModelId, validToken,
 } from './chatgpt-oauth.ts'
 import type { ChatGptIdentity, ChatGptTokens } from './chatgpt-oauth.ts'
-import { readEncryptedJson, storageAvailable, writeEncryptedJson } from './encrypted-storage.ts'
+import { defaultEncryptedStore } from './encrypted-storage.ts'
+import type { EncryptedStore } from './encrypted-storage.ts'
+
+const { shell } = electron as unknown as typeof import('electron')
 
 interface Profile extends ChatGptIdentity {
   id: string
@@ -23,8 +26,10 @@ interface Vault {
   profiles: Profile[]
 }
 
-interface ChatGptAccountOptions {
+export interface ChatGptAccountOptions {
   applySession(session: ChatGptSession | null, quiesce: boolean): Promise<ManagedModel[] | void>
+  store?: EncryptedStore
+  openBrowser?: (url: string) => Promise<void>
 }
 
 const refreshMarginMs = 3 * 60_000
@@ -45,6 +50,8 @@ function validUuid(value: unknown): value is string {
 export class ChatGptAccount {
   readonly #path: string
   readonly #options: ChatGptAccountOptions
+  readonly #store: EncryptedStore
+  readonly #openBrowser: (url: string) => Promise<void>
   #queue = Promise.resolve()
   #signInAttempt?: AbortController
   #refreshTimer?: NodeJS.Timeout
@@ -54,10 +61,38 @@ export class ChatGptAccount {
   constructor(userData: string, options: ChatGptAccountOptions) {
     this.#path = join(userData, 'chatgpt-credentials.bin')
     this.#options = options
+    this.#store = options.store ?? defaultEncryptedStore
+    this.#openBrowser = options.openBrowser ?? (url => shell.openExternal(url))
   }
 
   async loadSession(): Promise<ChatGptSession | null> {
-    const profile = profileOf(await this.#read())
+    let profile = profileOf(await this.#read())
+    if (profile?.tokens && profile.tokens.expiresAt <= Date.now()) {
+      const targetId = profile.id
+      profile = await this.#serialize(async () => {
+        const vault = await this.#read()
+        const current = profileOf(vault)
+        if (!current?.tokens || current.id !== targetId) return current
+        if (current.tokens.expiresAt > Date.now()) return current
+        try {
+          const tokens = await refreshChatGptTokens({ ...current, tokens: current.tokens }, AbortSignal.timeout(8_000))
+          const next: Profile = { ...current, tokens }
+          await this.#write({ ...vault, profiles: vault.profiles.map(entry => entry.id === targetId ? next : entry) })
+          return next
+        } catch (error) {
+          if (error instanceof ChatGptOAuthError && error.reauthorize) {
+            const next: Profile = { ...current, tokens: undefined, models: [] }
+            await this.#write({ ...vault, profiles: vault.profiles.map(entry => entry.id === targetId ? next : entry) })
+            return next
+          }
+          return current
+        }
+      })
+      if (profile?.tokens && profile.tokens.expiresAt <= Date.now()) {
+        this.#schedule(profile, 15_000)
+        return null
+      }
+    }
     this.#schedule(profile)
     return sessionOf(profile)
   }
@@ -78,7 +113,7 @@ export class ChatGptAccount {
 
   async signIn(profileId?: string): Promise<ChatGptStatus> {
     if (this.#signInAttempt) throw new ChatGptOAuthError('已有 ChatGPT 登录请求正在进行。')
-    if (!storageAvailable()) throw localFailure()
+    if (!this.#store.available()) throw localFailure()
     const controller = new AbortController()
     this.#signInAttempt = controller
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(180_000)])
@@ -91,7 +126,7 @@ export class ChatGptAccount {
         await this.#write(vault)
         return { hostId: vault.hostId, previous: previous || undefined }
       })
-      const verified = await signInWithChatGpt({ hostId, previous, signal, openBrowser: url => shell.openExternal(url) })
+      const verified = await signInWithChatGpt({ hostId, previous, signal, openBrowser: this.#openBrowser })
       const models = await listChatGptModels(verified.tokens, signal)
       return await this.#serialize(async () => {
         signal.throwIfAborted()
@@ -219,7 +254,7 @@ export class ChatGptAccount {
 
   async #read(): Promise<Vault> {
     try {
-      const raw = await readEncryptedJson(this.#path) as Vault | undefined
+      const raw = await this.#store.read(this.#path) as Vault | undefined
       if (raw === undefined) return { version: 1, hostId: randomUUID(), profiles: [] }
       if (raw?.version !== 1 || !validUuid(raw.hostId) || !Array.isArray(raw.profiles) || raw.profiles.length > 10 ||
         (raw.active !== undefined && !raw.profiles.some(({ id }) => id === raw.active))) throw localFailure()
@@ -236,6 +271,6 @@ export class ChatGptAccount {
   }
 
   async #write(vault: Vault): Promise<void> {
-    try { await writeEncryptedJson(this.#path, vault) } catch { throw localFailure() }
+    try { await this.#store.write(this.#path, vault) } catch { throw localFailure() }
   }
 }

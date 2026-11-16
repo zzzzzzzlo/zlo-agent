@@ -97,7 +97,10 @@ function fixture(request: typeof fetch, options: Partial<JudgmentOptions> = {}) 
     kernel.decide({ taskId, type: 'unused', payload: {} }, point, input, true, allowed, [], { signal }) }
 }
 
-test('Jev defaults off, validates settings, records Shadow and applies only allowed Active choices', async () => {
+test('Jev defaults off, validates settings, records Shadow and applies only allowed Active choices', async (t) => {
+  const envSecret = 'zlo-env-secret-value-9988'
+  process.env.ZLO_JEV_TEST_SECRET_TOKEN = envSecret
+  t.after(() => { delete process.env.ZLO_JEV_TEST_SECRET_TOKEN })
   let calls = 0
   const { store, settings, last, decide } = fixture(async (url, init) => {
     calls++
@@ -105,7 +108,7 @@ test('Jev defaults off, validates settings, records Shadow and applies only allo
     assert.equal(init?.redirect, 'error')
     assert.equal(new Headers(init?.headers).get('authorization'), 'Bearer ' + key)
     const { state } = JSON.parse(String(init?.body))
-    for (const marker of [key, 'sk-testing-0123456789', 'oc_sk_other_redaction_test', 'secret-cookie', 'private-file']) {
+    for (const marker of [key, envSecret, 'sk-testing-0123456789', 'oc_sk_other_redaction_test', 'secret-cookie', 'private-file']) {
       assert.ok(!JSON.stringify(state).includes(marker))
     }
     return valid()
@@ -124,7 +127,7 @@ test('Jev defaults off, validates settings, records Shadow and applies only allo
     assert.equal(calls, 0)
     current.modes[point] = 'shadow'
     settings.save(current)
-    const sensitive = { goal: 'Check ' + key + ' oc_sk_other_redaction_test\nAuthorization: Bearer sk-testing-0123456789\nCookie: secret-cookie\nfix SVG',
+    const sensitive = { goal: 'Check ' + key + ' ' + envSecret + ' oc_sk_other_redaction_test\nAuthorization: Bearer sk-testing-0123456789\nCookie: secret-cookie\nfix SVG',
       contents: 'private-file' }
     assert.equal(await decide(sensitive), true)
     assert.equal(last().shadow, false)

@@ -24,8 +24,19 @@ if (args.includes('--help')) {
   process.stdout.write('Usage: npm run agent -- (--fake | --faux | --pi) [--data <directory>]\nVersioned JSON commands on stdin, responses and events on stdout. See README.md.\n')
   process.exit(0)
 }
+const protocolWrite = process.stdout.write.bind(process.stdout)
 const desktop = args.at(-1) === '--desktop'
-if (desktop) args.pop()
+if (desktop) {
+  args.pop()
+  const stderrWrite = process.stderr.write.bind(process.stderr)
+  process.stdout.write = ((chunk: unknown, encodingOrCb?: BufferEncoding | ((error?: Error | null) => void), cb?: (error?: Error | null) => void) => {
+    if (typeof encodingOrCb === 'function') return stderrWrite(chunk as string | Uint8Array, encodingOrCb)
+    return stderrWrite(chunk as string | Uint8Array, encodingOrCb, cb)
+  }) as typeof process.stdout.write
+  console.log = console.error
+  console.info = console.error
+  console.warn = console.error
+}
 const lines = createInterface({ input: process.stdin, terminal: false })
 const iterator = lines[Symbol.asyncIterator]()
 const started = await startHost(args, desktop ? iterator : undefined)
@@ -121,7 +132,7 @@ async function serveHost(host: LocalAgentHost, runtimeId: HostMode, desktop: boo
   })).catch(() => { writeHostDiagnostic('host.telemetry_unavailable') }) : undefined
   const subscriptions = new Map<string, () => void>()
   const conversationSubscriptions = new Map<string, () => void>()
-  const send = (message: object): void => { process.stdout.write(JSON.stringify(message) + '\n') }
+  const send = (message: object): void => { protocolWrite(JSON.stringify(message) + '\n') }
   const desktopTypes = new Set([
     'createConversation', 'listConversations', 'getConversation', 'getConversationHistory', 'sendMessage',
     'steerConversation', 'stopConversation', 'resumeConversation', 'renameConversation', 'archiveConversation',

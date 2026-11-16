@@ -1,23 +1,36 @@
 import { join } from 'node:path'
 import { setTimeout as pause } from 'node:timers/promises'
-import { dialog, ipcMain, shell } from 'electron'
+import electron from 'electron'
 import type { BrowserWindow, IpcMainInvokeEvent } from 'electron'
 import type { ManagedModel } from '../../../shared/contracts/management.ts'
 import { customProviderLimit, parseCustomCredential, parseCustomProvider, parseGrokCredential, validCustomId } from '../../../shared/contracts/provider-setup.ts'
 import type { CustomProviderCredential, CustomProviderSummary, CustomProviderTest, GrokCredential, GrokLoginProgress, GrokStatus } from '../../../shared/contracts/provider-setup.ts'
 import { providerSetupChannels } from '../agent-channels.ts'
 import { noInput, object } from './agent-input.ts'
-import { readEncryptedJson, storageAvailable, writeEncryptedJson } from './encrypted-storage.ts'
+import { defaultEncryptedStore } from './encrypted-storage.ts'
+import type { EncryptedStore } from './encrypted-storage.ts'
 import { HostTransportError } from './host-process.ts'
 import type { HostProcessManager } from './host-process.ts'
 import { captureKey, ProviderCredentialError } from './provider-credentials.ts'
 
+const { dialog, ipcMain, shell } = electron as unknown as typeof import('electron')
+
 const requestVersion = { schemaVersion: 1 } as const
 const setupError = (message: string) => new HostTransportError('CONFLICT', message)
+
+export interface ProviderSetupOptions {
+  store?: EncryptedStore
+  openExternal?: (url: string) => Promise<void>
+  retryBaseMs?: number
+}
 
 export class ProviderSetup {
   readonly #customPath: string
   readonly #grokPath: string
+  readonly #getHost: () => HostProcessManager
+  readonly #store: EncryptedStore
+  readonly #openExternal: (url: string) => Promise<void>
+  readonly #retryBaseMs: number
   #writes: Promise<unknown> = Promise.resolve()
   #login?: AbortController
   #code?: string
@@ -25,13 +38,17 @@ export class ProviderSetup {
   #grokModels: ManagedModel[] = []
   #closed = false
 
-  constructor(userData: string, private readonly getHost: () => HostProcessManager) {
+  constructor(userData: string, getHost: () => HostProcessManager, options: ProviderSetupOptions = {}) {
     this.#customPath = join(userData, 'custom-providers.bin')
     this.#grokPath = join(userData, 'grok-credentials.bin')
+    this.#getHost = getHost
+    this.#store = options.store ?? defaultEncryptedStore
+    this.#openExternal = options.openExternal ?? (url => shell.openExternal(url))
+    this.#retryBaseMs = options.retryBaseMs ?? 30_000
   }
 
   async loadCustom(): Promise<CustomProviderCredential[]> {
-    const data = await readEncryptedJson(this.#customPath)
+    const data = await this.#store.read(this.#customPath)
     if (data === undefined) return []
     if (!Array.isArray(data) || data.length > customProviderLimit) throw setupError('无法读取自定义提供商配置。')
     return data.map(value => {
@@ -42,11 +59,11 @@ export class ProviderSetup {
   }
 
   async loadGrok(): Promise<GrokCredential | undefined> {
-    const value = await readEncryptedJson(this.#grokPath)
+    const value = await this.#store.read(this.#grokPath)
     if (value == null) return undefined
     const credential = parseGrokCredential(value)
     if (!credential) throw setupError('无法读取 Grok 授权。')
-    this.#schedule(credential)
+    this.#schedule(credential, credential.expires <= Date.now() ? Math.min(1_000, this.#retryBaseMs) : undefined)
     return credential
   }
 
@@ -59,7 +76,7 @@ export class ProviderSetup {
   async listCustom(): Promise<CustomProviderSummary[]> { return summaries(await this.loadCustom()) }
 
   #applyCustom(id: string, config: CustomProviderCredential | null) {
-    return this.getHost().request({ ...requestVersion, type: 'applyCustomProvider', id, config })
+    return this.#getHost().request({ ...requestVersion, type: 'applyCustomProvider', id, config })
   }
 
   updateCustom(id: string, change: (previous?: CustomProviderCredential) => Promise<CustomProviderCredential | null | undefined>) {
@@ -68,28 +85,33 @@ export class ProviderSetup {
       const current = previous.find(config => config.id === id)
       const next = await change(current)
       if (next === undefined) return summaries(previous)
+      const removingSecret = current !== undefined && (!next || (current.key !== null && next.key === null))
       const updated = next && current ? previous.map(config => config === current ? next : config)
         : next ? [...previous, next] : previous.filter(config => config !== current)
       if (updated.length > customProviderLimit) throw setupError('已达到自定义提供商数量上限。')
-      await writeEncryptedJson(this.#customPath, updated)
+      await this.#store.write(this.#customPath, updated)
       try { await this.#applyCustom(id, next) }
       catch (error) {
-        await writeEncryptedJson(this.#customPath, previous)
+        if (removingSecret) {
+          if ((await this.#getHost().restart()).state === 'ready') return summaries(updated)
+          throw setupError('本地凭证已清除，但 Agent Host 当前不可用。')
+        }
+        await this.#store.write(this.#customPath, previous)
         throw error
       }
       return summaries(updated)
     })
   }
 
-  testCustom(id: string) { return this.getHost().request<CustomProviderTest>({ ...requestVersion, type: 'testCustomProvider', id }) }
+  testCustom(id: string) { return this.#getHost().request<CustomProviderTest>({ ...requestVersion, type: 'testCustomProvider', id }) }
 
   async grokStatus(): Promise<GrokStatus> {
     if (this.#login) return { state: 'signing_in', code: this.#code, models: this.#grokModels }
-    const credential = parseGrokCredential(await readEncryptedJson(this.#grokPath))
+    const credential = parseGrokCredential(await this.#store.read(this.#grokPath))
     if (!credential) return { state: 'signed_out', models: [] }
     if (credential.expires <= Date.now()) return { state: 'reauthorization_required', models: [] }
     if (!this.#grokModels.length) {
-      this.#grokModels = (await this.getHost().request<{ providers: { id: string; models: ManagedModel[] }[] }>({
+      this.#grokModels = (await this.#getHost().request<{ providers: { id: string; models: ManagedModel[] }[] }>({
         ...requestVersion, type: 'managementSnapshot',
       })).providers.find(provider => provider.id === 'xai')?.models ?? []
     }
@@ -98,11 +120,11 @@ export class ProviderSetup {
 
   async grokSignIn(): Promise<GrokStatus> {
     if (this.#login) throw setupError('Grok 授权正在进行。')
-    if (!storageAvailable()) throw setupError('系统加密存储不可用。')
+    if (!this.#store.available()) throw setupError('系统加密存储不可用。')
     const controller = new AbortController()
     this.#login = controller
     const signal = AbortSignal.any([controller.signal, AbortSignal.timeout(300_000)])
-    const host = this.getHost()
+    const host = this.#getHost()
     let opened = false
     try {
       await host.request({ ...requestVersion, type: 'startGrokLogin' })
@@ -121,7 +143,7 @@ export class ProviderSetup {
         }
         if (!opened && progress.verification) {
           const { url, code } = progress.verification
-          await shell.openExternal(grokVerificationUrl(url))
+          await this.#openExternal(grokVerificationUrl(url))
           this.#code = /^[A-Z0-9-]{4,24}$/iu.test(code) ? code : undefined
           opened = true
         }
@@ -144,9 +166,9 @@ export class ProviderSetup {
     this.cancelGrok()
     return this.#serialize(async (): Promise<GrokStatus> => {
       clearTimeout(this.#timer)
-      await writeEncryptedJson(this.#grokPath, null)
+      await this.#store.write(this.#grokPath, null)
       this.#grokModels = []
-      const host = this.getHost()
+      const host = this.#getHost()
       try { await host.request({ ...requestVersion, type: 'applyGrokSession', session: null, quiesce: true }) }
       catch { if ((await host.restart()).state !== 'ready') throw setupError('本地授权已清除，Agent Host 重启失败。') }
       return { state: 'signed_out', models: [] }
@@ -154,13 +176,13 @@ export class ProviderSetup {
   }
 
   async #saveGrok(credential: GrokCredential, quiesce: boolean) {
-    const previous = await readEncryptedJson(this.#grokPath)
-    await writeEncryptedJson(this.#grokPath, credential)
+    const previous = await this.#store.read(this.#grokPath)
+    await this.#store.write(this.#grokPath, credential)
     try {
-      this.#grokModels = await this.getHost().request({ ...requestVersion, type: 'applyGrokSession', session: credential, quiesce })
+      this.#grokModels = await this.#getHost().request({ ...requestVersion, type: 'applyGrokSession', session: credential, quiesce })
     } catch (error) {
-      if (quiesce) await writeEncryptedJson(this.#grokPath, previous ?? null)
-      else if ((await this.getHost().restart()).state === 'ready') return
+      if (quiesce) await this.#store.write(this.#grokPath, previous ?? null)
+      else if ((await this.#getHost().restart()).state === 'ready') return
       throw error
     } finally {
       if (!quiesce) this.#schedule(credential)
@@ -170,15 +192,21 @@ export class ProviderSetup {
 
   #schedule(credential: GrokCredential, retryMs?: number) {
     clearTimeout(this.#timer)
-    if (this.#closed) return
+    if (this.#closed || !credential.refresh) return
+    const delay = retryMs ?? Math.min(2_147_483_647, Math.max(5_000, credential.expires - Date.now() - 60_000))
     this.#timer = setTimeout(() => {
       void this.#serialize(async () => {
-        const current = parseGrokCredential(await readEncryptedJson(this.#grokPath))
+        const current = parseGrokCredential(await this.#store.read(this.#grokPath))
         if (this.#closed || current?.refresh !== credential.refresh || current.expires !== credential.expires) return
-        const updated = await this.getHost().request<GrokCredential>({ ...requestVersion, type: 'refreshGrokLogin', credential: current })
+        const updated = await this.#getHost().request<GrokCredential>({ ...requestVersion, type: 'refreshGrokLogin', credential: current })
         await this.#saveGrok(updated, false)
-      }).catch(() => { if (!this.#closed && credential.expires > Date.now()) this.#schedule(credential, 30_000) })
-    }, retryMs ?? Math.min(2_147_483_647, Math.max(5_000, credential.expires - Date.now() - 60_000)))
+      }).catch(() => {
+        if (!this.#closed && credential.refresh) {
+          const nextBackoff = Math.min(300_000, retryMs !== undefined ? retryMs * 2 : this.#retryBaseMs)
+          this.#schedule(credential, nextBackoff)
+        }
+      })
+    }, delay)
     this.#timer.unref()
   }
 
@@ -239,21 +267,31 @@ export function registerProviderSetupIpc(setup: ProviderSetup | undefined, windo
       return { ...config, key: previous?.key ?? null }
     })
   })
-  register('setCustomKey', (setup, window, input) => setup.updateCustom(idFrom(input), async previous => {
-    if (!previous) throw setupError('请先保存提供商。')
-    const key = await captureKey(window, previous.name + ' · ' + new URL(previous.baseUrl).host)
-    return key ? { ...previous, key } : undefined
-  }))
+  register('setCustomKey', async (setup, window, input) => {
+    const id = idFrom(input)
+    const target = (await setup.listCustom()).find(config => config.id === id)
+    if (!target) throw setupError('请先保存提供商。')
+    const key = await captureKey(window, target.name + ' · ' + new URL(target.baseUrl).host)
+    if (!key) return setup.listCustom()
+    return setup.updateCustom(id, async previous => {
+      if (!previous) throw setupError('请先保存提供商。')
+      if (previous.baseUrl !== target.baseUrl) throw setupError('提供商接口地址已变更，请重新添加 API Key。')
+      return { ...previous, key }
+    })
+  })
   register('removeCustomKey', (setup, _window, input) => setup.updateCustom(idFrom(input), async previous =>
     previous?.key ? { ...previous, key: null } : undefined))
-  register('deleteCustom', (setup, window, input) => setup.updateCustom(idFrom(input), async previous => {
-    if (!previous) return
+  register('deleteCustom', async (setup, window, input) => {
+    const id = idFrom(input)
+    const target = (await setup.listCustom()).find(config => config.id === id)
+    if (!target) return setup.listCustom()
     const { response } = await dialog.showMessageBox(window, {
-      type: 'warning', message: '移除此提供商和本机保存的 API Key？', detail: previous.name,
+      type: 'warning', message: '移除此提供商和本机保存的 API Key？', detail: target.name,
       buttons: ['取消', '移除'], cancelId: 0, defaultId: 0, noLink: true,
     })
-    return response === 1 && !window.isDestroyed() ? null : undefined
-  }))
+    if (response !== 1 || window.isDestroyed()) return setup.listCustom()
+    return setup.updateCustom(id, async previous => (previous ? null : undefined))
+  })
   register('testCustom', (setup, _window, input) => setup.testCustom(idFrom(input)))
   register('grokStatus', (setup, _window, input) => { noInput(input); return setup.grokStatus() })
   register('grokSignIn', async (setup, window, input) => {

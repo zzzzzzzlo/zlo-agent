@@ -13,8 +13,7 @@ import { SecureJevCredentials, SecureProviderCredentials } from './provider-cred
 import { ChatGptAccount } from './chatgpt-account.ts'
 import { registerChatGptIpc } from './chatgpt-ipc.ts'
 import type { ManagedModel } from '../../../shared/contracts/management.ts'
-import { openCodeJudgeEndpoint } from '../../../shared/contracts/jev.ts'
-import { judgeProxyUrl } from './judge-proxy.ts'
+import { resolveOpenCodeJudgeProxy } from './judge-proxy.ts'
 import { ProviderSetup, registerProviderSetupIpc } from './provider-setup.ts'
 
 const developmentData = app.isPackaged ? undefined : process.env.ZLO_AGENT_DESKTOP_DATA
@@ -30,7 +29,6 @@ const defaultWorkspace = join(userData, 'workspace')
 const diagnostics = createDiagnosticLog(join(userData, 'logs'))
 const credentials = new SecureProviderCredentials(userData)
 const jevCredentials = new SecureJevCredentials(userData)
-let openCodeJudgeProxy: string | undefined
 const chatGpt = hostMode === 'pi' ? new ChatGptAccount(userData, {
   async applySession(session, quiesce): Promise<ManagedModel[]> {
     try { return await host.request({ schemaVersion: 1, type: 'applyChatGptSession', session, quiesce }) }
@@ -55,8 +53,11 @@ const host: HostProcessManager = new HostProcessManager({
       onDiagnostic: diagnostics.write,
     })
   },
-  spawnChild() {
+  async spawnChild() {
     mkdirSync(defaultWorkspace, { recursive: true })
+    const openCodeJudgeProxy = process.platform === 'win32' && hostMode === 'pi' && app.isReady()
+      ? await resolveOpenCodeJudgeProxy(url => session.defaultSession.resolveProxy(url))
+      : undefined
     return spawnAgentHost({
       executable: process.execPath, root: hostRoot,
       data: join(userData, 'agent-data', hostMode), defaultWorkspace, mode: hostMode, openCodeJudgeProxy,
@@ -150,17 +151,6 @@ app.whenReady().then(() => {
   const startHost = async () => {
     if (developmentData && process.env.ZLO_AGENT_E2E_HIDDEN === '1' && process.env.ZLO_AGENT_E2E_HOLD_STARTUP === '1') {
       await new Promise<void>(resolve => setTimeout(resolve, 2500))
-    }
-    if (process.platform === 'win32' && hostMode === 'pi') {
-      let deadline: ReturnType<typeof setTimeout> | undefined
-      try {
-        const route = await Promise.race([
-          session.defaultSession.resolveProxy(openCodeJudgeEndpoint),
-          new Promise<string>(resolve => { deadline = setTimeout(() => resolve('DIRECT'), 1000) }),
-        ])
-        openCodeJudgeProxy = judgeProxyUrl(route)
-      } catch { openCodeJudgeProxy = undefined }
-      finally { clearTimeout(deadline) }
     }
     if (!quitting) await host.start()
   }

@@ -39,10 +39,20 @@ function record(value: unknown): Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value) ? value as Record<string, unknown> : {}
 }
 
+function redactEnvSecrets(text: string): string {
+  for (const [envKey, envValue] of Object.entries(process.env)) {
+    if (!envValue || envValue.length < 8 ||
+      !/(?:API|ACCESS|PRIVATE)[_-]?KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTHORIZATION/iu.test(envKey)) continue
+    text = text.replaceAll(envValue, '[redacted]')
+  }
+  return text
+}
+
 function excerpt(value: unknown, limit: number, key: string): string | undefined {
   if (typeof value !== 'string') return
   // Redact before clipping so the beginning of a credential cannot survive a truncation.
-  return value.split(key).join('[redacted]')
+  const withoutKey = key ? value.split(key).join('[redacted]') : value
+  return redactEnvSecrets(withoutKey)
     .replace(/-----BEGIN [^-\r\n]*PRIVATE KEY-----[\s\S]*?(?:-----END [^-\r\n]*PRIVATE KEY-----|$)/gu, '[redacted]')
     .replace(/\b(?:authorization|proxy-authorization|cookie|set-cookie)\s*:[^\r\n]*/giu, '[redacted]')
     .replace(/\b(?:bearer\s+|(?:api[-_ ]?key|password|token|secret)["']?\s*[:=]\s*["']?)[^\s"',;}]+/giu, '[redacted]')
@@ -237,7 +247,7 @@ export class JevJudge implements Judge {
     }
     const result = await readAnswer(response)
     const model = result.model
-    if (!jevModel(model) || model.includes(this.#key)) throw new JevFailure('invalid_response', true)
+    if (!jevModel(model) || (this.#key !== '' && model.includes(this.#key))) throw new JevFailure('invalid_response', true)
     const answers = record(result.answers)
     const probabilities: Record<string, number | undefined> = {}
     for (const id of Object.keys(questions)) {

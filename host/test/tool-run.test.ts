@@ -94,6 +94,42 @@ test('risk and unattended modes authorize only approved public reads and enforce
   }
 })
 
+test('P1-2: automatic routine and unattended public reads still enforce secret redaction and safety checks before execution', async (t) => {
+  const envSecret = 'zlofixtureenvsecretvalue9911'
+  process.env.ZLO_TOOL_APPROVAL_TEST_SECRET = envSecret
+  t.after(() => { delete process.env.ZLO_TOOL_APPROVAL_TEST_SECRET })
+  const root = await mkdtemp(join(tmpdir(), 'zlo-tool-secret-scan-'))
+  const db = new LocalStore(':memory:')
+  try {
+    const workspace = new CodingWorkspace(root)
+    const tasks = new TaskEngine(db)
+    const { taskId } = tasks.create({ requestId: 'secret-scan', cwd: root, goal: 'Scan secrets', workspaceAccess: 'trusted' })
+    const task = tasks.start(taskId)
+    const event = { taskId, taskNodeId: task.rootNodeId, taskAttemptId: task.attemptId, agentRunId: 'secret-scan-run', type: '', payload: {} }
+    let mode: ToolApprovalMode = 'routine'
+    const executed: unknown[] = []
+    const run = new ToolRun(tasks, new ToolApprovalBroker(async () => ({ approved: true })), undefined, undefined, undefined, () => mode)
+    const fetchTool = run.wrap({
+      name: 'web_fetch', description: '', parameters: {}, effect: 'read',
+      policy: { approval: 'network', publicRead: () => true },
+      async execute(_id, input) { executed.push(input); return { ok: true } },
+    }, workspace, () => event, new AbortController().signal, () => true)
+    for (const candidateMode of ['ask', 'routine', 'unattended'] as const) {
+      mode = candidateMode
+      const leakedEnv = await fetchTool.execute('env-' + candidateMode, { url: `https://${envSecret}.example.com/docs` }) as { ok: boolean }
+      assert.equal(leakedEnv.ok, false, candidateMode)
+      const bidi = await fetchTool.execute('bidi-' + candidateMode, { url: 'https://example.com/\u202edocs' }) as { ok: boolean }
+      assert.equal(bidi.ok, false, candidateMode)
+    }
+    assert.deepEqual(executed, [])
+    assert.equal(db.events(taskId).filter(e => e.type === 'tool.denied' && e.payload.reason === 'approval_safety').length, 6)
+    await run.close()
+  } finally {
+    db.close()
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('artifact export ignores model-supplied destinations and only creates the approved new file', async () => {
   const root = await mkdtemp(join(tmpdir(), 'zlo-export-'))
   const project = join(root, 'project')

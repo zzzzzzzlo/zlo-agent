@@ -135,45 +135,87 @@ function shellInvocation(shell: Shell, command: string, workspace: string): Shel
   return executable ? { executable, args: ['/d', '/q', '/v:off', '/s', '/c', '"' + command + '"'], verbatim: true } : undefined
 }
 
+type TreeStopOutcome = 'killed' | 'already_gone' | 'failed'
+
 function alive(child: ChildProcess): child is ChildProcess & { pid: number } {
   return child.pid !== undefined && child.exitCode === null && child.signalCode === null
 }
 
-async function stopTree(child: ChildProcess, workspace: string): Promise<boolean> {
-  if (!alive(child)) return false
+async function killOrphanedChildren(parentPid: number, workspace: string, remainingMs: number): Promise<TreeStopOutcome> {
+  const pwsh = windowsSystemFile('WindowsPowerShell/v1.0/powershell.exe', workspace)
+  const taskkill = windowsSystemFile('taskkill.exe', workspace)
+  if (!pwsh || !taskkill || remainingMs < 200) return 'failed'
+  const script = `$ found = @(Get-CimInstance Win32_Process -Filter 'ParentProcessId = ${parentPid}' -ErrorAction SilentlyContinue); if ($found.Count -eq 0) { exit 2 }; foreach ($p in $found) { & '${taskkill.replaceAll("'", "''")}' /pid $p.ProcessId /t /f | Out-Null }; exit 0`
+    .replace('$ found', '$found')
+  return new Promise(resolve => {
+    const helper = spawn(pwsh, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
+      cwd: workspace, env: processEnvironment(workspace), stdio: 'ignore', shell: false, windowsHide: true,
+    })
+    let done = false
+    const settle = (outcome: TreeStopOutcome) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      resolve(outcome)
+    }
+    const timer = setTimeout(() => {
+      if (alive(helper)) helper.kill()
+      settle('failed')
+    }, remainingMs)
+    helper.once('error', () => settle('failed'))
+    helper.once('close', code => settle(code === 0 ? 'killed' : 'failed'))
+  })
+}
+
+async function stopTree(child: ChildProcess, workspace: string, isPipeClosed: () => boolean): Promise<TreeStopOutcome> {
+  if (child.pid === undefined) return 'already_gone'
+  const pid = child.pid
   if (!windows) {
     try {
-      process.kill(-child.pid, 'SIGKILL')
-      return true
-    } catch {
+      process.kill(-pid, 'SIGKILL')
+      return 'killed'
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return isPipeClosed() ? 'already_gone' : 'failed'
       if (alive(child)) child.kill()
-      return false
+      return 'failed'
     }
   }
   const executable = windowsSystemFile('taskkill.exe', workspace)
   if (!executable) {
     if (alive(child)) child.kill()
-    return false
+    return 'failed'
   }
-  return new Promise(resolve => {
-    const killer = spawn(executable, ['/pid', String(child.pid), '/t', '/f'], {
+  const startedAt = Date.now()
+  const direct = await new Promise<'killed' | 'not_found' | 'failed'>(resolve => {
+    const killer = spawn(executable, ['/pid', String(pid), '/t', '/f'], {
       cwd: workspace, env: processEnvironment(workspace), stdio: 'ignore', shell: false, windowsHide: true,
     })
     let finished = false
-    const finish = (stopped: boolean) => {
+    const finish = (outcome: 'killed' | 'not_found' | 'failed') => {
       if (finished) return
       finished = true
       clearTimeout(timer)
-      if (!stopped && alive(child)) child.kill()
-      resolve(stopped)
+      if (outcome === 'failed' && alive(child)) child.kill()
+      resolve(outcome)
     }
     const timer = setTimeout(() => {
       if (alive(killer)) killer.kill()
-      finish(false)
+      finish('failed')
     }, stopDeadline - 250)
-    killer.once('error', () => finish(false))
-    killer.once('close', code => finish(code === 0))
+    killer.once('error', () => finish('failed'))
+    killer.once('close', code => {
+      if (code === 0) finish('killed')
+      else if (code === 128 && !alive(child)) finish('not_found')
+      else finish('failed')
+    })
   })
+  if (direct === 'killed') return 'killed'
+  if (direct === 'failed') return 'failed'
+  if (!isPipeClosed()) {
+    await new Promise(resolve => setTimeout(resolve, 40))
+  }
+  if (isPipeClosed()) return 'already_gone'
+  return killOrphanedChildren(pid, workspace, stopDeadline - 250 - (Date.now() - startedAt))
 }
 
 function startProcess(invocation: ShellInvocation, cwd: string, workspace: string, timeoutMs: number, signal?: AbortSignal) {
@@ -189,8 +231,9 @@ function startProcess(invocation: ShellInvocation, cwd: string, workspace: strin
   let exitCode: number | null = null
   let terminal = false
   let closed = false
+  let naturalExit: { code: number } | undefined
   let stopReason: StopReason | undefined
-  let stoppedTree: boolean | undefined
+  let stoppedTree: TreeStopOutcome | undefined
   let cleanup: ReturnType<typeof setTimeout> | undefined
 
   const finish = (next: State, code: number | null, completeOutput: boolean) => {
@@ -206,6 +249,14 @@ function startProcess(invocation: ShellInvocation, cwd: string, workspace: strin
       : next === 'exited' || next === 'failed' ? 'failed' : 'unknown_effect')
   }
 
+  const settleStopped = () => {
+    if (!closed || stoppedTree === undefined || !stopReason) return
+    if (stoppedTree === 'killed') finish(stopReason, null, true)
+    else if (stoppedTree === 'already_gone' && naturalExit) finish('exited', naturalExit.code, true)
+    else if (stoppedTree === 'already_gone') finish(stopReason, null, true)
+    else finish('unknown', null, true)
+  }
+
   const stop = async (reason: StopReason = 'stopped'): Promise<void> => {
     if (!terminal && !stopReason) {
       stopReason = reason
@@ -215,9 +266,9 @@ function startProcess(invocation: ShellInvocation, cwd: string, workspace: strin
         child.unref()
         finish('unknown', null, false)
       }, stopDeadline)
-      void stopTree(child, workspace).catch(() => false).then(stopped => {
-        stoppedTree = stopped
-        if (closed) finish(stopped ? reason : 'unknown', null, true)
+      void stopTree(child, workspace, () => closed).catch((): TreeStopOutcome => 'failed').then(outcome => {
+        stoppedTree = outcome
+        settleStopped()
       })
     }
     await completed.promise
@@ -244,10 +295,11 @@ function startProcess(invocation: ShellInvocation, cwd: string, workspace: strin
   })
   child.once('close', (code, exitSignal) => {
     closed = true
+    if (code !== null && !exitSignal) naturalExit = { code }
     if (stopReason) {
-      if (stoppedTree !== undefined) finish(stoppedTree ? stopReason : 'unknown', null, true)
-    } else if (code !== null && !exitSignal) {
-      finish('exited', code, true)
+      settleStopped()
+    } else if (naturalExit) {
+      finish('exited', naturalExit.code, true)
     } else {
       finish('unknown', null, true)
     }

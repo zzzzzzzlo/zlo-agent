@@ -52,8 +52,17 @@ for await (const line of lines) {
       process.stderr.write('fixture provider credential was withheld\n')
       process.exit(17)
       break
+    case 'stopConversation':
+      process.stdout.write('non-json-protocol-corruption\n')
+      setInterval(() => {}, 1000)
+      break
     case 'exit':
+      if (variant === 'hang-exit') {
+        setInterval(() => {}, 1000)
+        break
+      }
       if (marker) writeFileSync(marker, 'clean')
       process.exit(0)
+      break
   }
 }

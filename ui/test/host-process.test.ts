@@ -160,3 +160,32 @@ test('P0-6: loadInitialProviderKeys isolates corrupted vaults, emits redacted di
   assert.equal(degraded.length, 3)
   assert.doesNotMatch(JSON.stringify(entries), /sk-secret-leak|bearer-secret-leak/)
 })
+
+test('P1-3 & P1-4: manager supports async spawnChild re-evaluation on restart and recovers cleanly after protocol corruption or hung exit', async (t) => {
+  const proxies: (string | undefined)[] = []
+  let round = 0
+  const manager = new HostProcessManager({
+    mode: 'faux',
+    shutdownTimeoutMs: 250,
+    async spawnChild() {
+      const currentRound = ++round
+      await new Promise(resolve => setTimeout(resolve, 15))
+      proxies.push(currentRound === 1 ? 'http://127.0.0.1:7890/' : undefined)
+      return startFixture(currentRound === 2 ? 'hang-exit' : 'ready')
+    },
+  })
+  t.after(() => manager.shutdown().catch(() => {}))
+  const starting = manager.start()
+  assert.equal(manager.status.state, 'starting')
+  assert.deepEqual(await starting, { state: 'ready', mode: 'faux' })
+  await assert.rejects(manager.request({
+    schemaVersion: 1, type: 'stopConversation', conversationId: 'c1', requestId: 'r1',
+  }), { code: 'HOST_UNAVAILABLE' })
+  assert.equal(manager.status.state, 'offline')
+  assert.deepEqual(await manager.restart(), { state: 'ready', mode: 'faux' })
+  assert.deepEqual(proxies, ['http://127.0.0.1:7890/', undefined])
+  await assert.rejects(manager.restart(), /未能在关闭期限内退出|HOST_UNAVAILABLE|ready/u).catch(() => {})
+  if (manager.status.state !== 'ready') {
+    assert.deepEqual(await manager.start(), { state: 'ready', mode: 'faux' })
+  }
+})

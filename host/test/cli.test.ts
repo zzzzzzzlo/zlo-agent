@@ -80,3 +80,28 @@ test('JSONL CLI returns command acks, streams output, stops, resumes, and reopen
   await reopened.receive(({ event }) => event?.payload.status === 'succeeded')
   await reopened.close()
 })
+
+test('P1-3: --desktop mode isolates JSONL stdout from console.log and stray stdout writes', { timeout: 15000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'zlo-cli-desktop-'))
+  t.after(() => rm(root, { recursive: true, force: true }))
+  const directory = join(root, 'data')
+  const cli = fileURLToPath(new URL('../src/cli.ts', import.meta.url))
+  const preload = join(root, 'noisy.mjs')
+  const { writeFile } = await import('node:fs/promises')
+  await writeFile(preload, "setInterval(() => { console.log('stray-console-log'); process.stdout.write('stray-stdout\\n') }, 20).unref()\n")
+  const child = spawn(process.execPath, ['--disable-warning=ExperimentalWarning', '--import', new URL('file://' + preload.replaceAll('\\', '/')).href, cli, '--fake', '--data', directory, '--desktop'])
+  t.after(() => { if (child.exitCode === null) child.kill() })
+  const stdoutLines: Message[] = []
+  let stderrText = ''
+  child.stderr.on('data', chunk => { stderrText += chunk.toString() })
+  const rl = createInterface({ input: child.stdout })
+  rl.on('line', line => { stdoutLines.push(JSON.parse(line)) })
+  child.stdin.write(JSON.stringify({ schemaVersion: 1, type: 'initializeProviderKeys', credentials: {}, judgeKeys: {} }) + '\n')
+  for (let tick = 0; tick < 500 && !stdoutLines.some(m => m.kind === 'ready'); tick++) await delay(10)
+  assert.ok(stdoutLines.some(m => m.kind === 'ready'))
+  await delay(60)
+  assert.match(stderrText, /stray-console-log/)
+  assert.match(stderrText, /stray-stdout/)
+  child.stdin.write(JSON.stringify({ schemaVersion: 1, type: 'exit', commandId: 'bye' }) + '\n')
+  assert.deepEqual(await once(child, 'exit'), [0, null])
+})

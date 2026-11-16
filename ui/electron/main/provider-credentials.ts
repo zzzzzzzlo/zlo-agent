@@ -1,10 +1,13 @@
 import { join } from 'node:path'
-import { clipboard, dialog } from 'electron'
+import electron from 'electron'
 import type { BrowserWindow } from 'electron'
 import type { ProviderId } from '../../../shared/contracts/management.ts'
 import { jevEndpoint, judgeKeyMatches, openCodeJudgeEndpoint, parseJudgeCredentials } from '../../../shared/contracts/jev.ts'
 import type { JudgeCredentials } from '../../../shared/contracts/jev.ts'
-import { readEncryptedJson, storageAvailable, writeEncryptedJson } from './encrypted-storage.ts'
+import { defaultEncryptedStore, storageAvailable } from './encrypted-storage.ts'
+import type { EncryptedStore } from './encrypted-storage.ts'
+
+const { clipboard, dialog } = electron as unknown as typeof import('electron')
 
 const providers: Readonly<Record<ProviderId, string>> = {
   deepseek: 'DeepSeek', openai: 'OpenAI', anthropic: 'Anthropic', google: 'Google Gemini',
@@ -20,11 +23,16 @@ export class ProviderCredentialError extends Error {}
 
 export class SecureJevCredentials {
   readonly #path: string
+  readonly #store: EncryptedStore
+  #updates = Promise.resolve()
 
-  constructor(userData: string) { this.#path = join(userData, 'jev-credentials.bin') }
+  constructor(userData: string, store: EncryptedStore = defaultEncryptedStore) {
+    this.#path = join(userData, 'jev-credentials.bin')
+    this.#store = store
+  }
 
   async load(): Promise<JudgeCredentials> {
-    const document = await readEncryptedJson(this.#path) as { version?: number; key?: unknown; values?: unknown } | undefined
+    const document = await this.#store.read(this.#path) as { version?: number; key?: unknown; values?: unknown } | undefined
     if (document === undefined) return {}
     if (document?.version === 1 && (document.key === null || validKey(document.key))) {
       if (document.key === null) return {}
@@ -36,28 +44,35 @@ export class SecureJevCredentials {
     return values
   }
 
-  async set(endpoint: string, key: string | null): Promise<void> {
-    if (!storageAvailable()) throw new ProviderCredentialError('系统安全凭证存储不可用。')
-    if (key !== null && !judgeKeyMatches(endpoint, key)) throw new ProviderCredentialError('这枚 API Key 与当前供应商不匹配。')
-    try {
+  set(endpoint: string, key: string | null): Promise<void> {
+    if (key !== null && !judgeKeyMatches(endpoint, key)) {
+      return Promise.reject(new ProviderCredentialError('这枚 API Key 与当前供应商不匹配。'))
+    }
+    const update = this.#updates.then(async () => {
+      if (!this.#store.available()) throw new ProviderCredentialError('系统安全凭证存储不可用。')
       const values = await this.load()
       if (key === null) delete values[endpoint]
       else values[endpoint] = key
       if (!parseJudgeCredentials(values)) throw new ProviderCredentialError('判定模型凭证数量已达上限。')
-      await writeEncryptedJson(this.#path, { version: 2, values })
-    }
-    catch (error) {
+      await this.#store.write(this.#path, { version: 2, values })
+    }).catch((error) => {
       if (error instanceof ProviderCredentialError) throw error
       throw new ProviderCredentialError('无法更新系统安全凭证。')
-    }
+    })
+    this.#updates = update.catch(() => {})
+    return update
   }
 }
 
 export class SecureProviderCredentials {
   readonly #path: string
+  readonly #store: EncryptedStore
   #updates = Promise.resolve()
 
-  constructor(userData: string) { this.#path = join(userData, 'provider-credentials.bin') }
+  constructor(userData: string, store: EncryptedStore = defaultEncryptedStore) {
+    this.#path = join(userData, 'provider-credentials.bin')
+    this.#store = store
+  }
 
   async load(): Promise<CredentialValues> {
     try { return await this.#read() } catch {
@@ -70,11 +85,11 @@ export class SecureProviderCredentials {
       return Promise.reject(new ProviderCredentialError('模型凭证格式无效。'))
     }
     const update = this.#updates.then(async () => {
-      if (!storageAvailable()) throw new ProviderCredentialError('系统安全凭证存储不可用。')
+      if (!this.#store.available()) throw new ProviderCredentialError('系统安全凭证存储不可用。')
       const values = await this.load()
       if (key === undefined) delete values[provider]
       else values[provider] = key
-      await writeEncryptedJson(this.#path, { version: 1, values })
+      await this.#store.write(this.#path, { version: 1, values })
     }).catch((error) => {
       if (error instanceof ProviderCredentialError) throw error
       throw new ProviderCredentialError('无法更新系统安全凭证。')
@@ -84,7 +99,7 @@ export class SecureProviderCredentials {
   }
 
   async #read(): Promise<CredentialValues> {
-    const document = await readEncryptedJson(this.#path) as { version?: number; values?: Record<string, unknown> } | undefined
+    const document = await this.#store.read(this.#path) as { version?: number; values?: Record<string, unknown> } | undefined
     if (document === undefined) return {}
     if (document?.version !== 1 || !document.values || typeof document.values !== 'object' || Array.isArray(document.values)) {
       throw new Error('Invalid credential store')

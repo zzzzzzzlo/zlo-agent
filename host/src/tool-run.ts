@@ -156,6 +156,11 @@ export class ToolRun {
         const operationId = ref.agentRunId + ':' + callId
         let destination: string | undefined
         if (approvalKind) {
+          const detail = JSON.stringify(input) ?? 'null'
+          if (detail.length > 8_000 || redactProcessOutput(detail) !== detail || /[\u202a-\u202e\u2066-\u2069]/u.test(detail)) {
+            deny('approval_safety')
+            return { ok: false, error: 'The operation cannot be safely displayed for approval' }
+          }
           const mode = this.#approvalMode()
           let automatic = false
           try {
@@ -166,11 +171,6 @@ export class ToolRun {
             deny('approval_unattended')
             return { ok: false, error: 'This operation requires separate user approval. Unattended mode declined it; use an already authorized alternative.' }
           } else {
-            const detail = JSON.stringify(input) ?? 'null'
-            if (detail.length > 8_000 || redactProcessOutput(detail) !== detail || /[\u202a-\u202e\u2066-\u2069]/u.test(detail)) {
-              deny('approval_safety')
-              return { ok: false, error: 'The operation cannot be safely displayed for approval' }
-            }
             const approval = await this.#approval.request({
               kind: approvalKind, tool: tool.name, detail, workspace: workspace.root,
               ...(approvalKind === 'export' && target ? { suggestedName: basename(target) } : {}),

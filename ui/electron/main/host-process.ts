@@ -62,7 +62,7 @@ interface Connection {
 
 interface ManagerOptions {
   mode: HostMode
-  spawnChild: () => ChildProcessWithoutNullStreams
+  spawnChild: () => ChildProcessWithoutNullStreams | Promise<ChildProcessWithoutNullStreams>
   initialize?: () => Promise<Extract<PrivateCredentialCommand, { type: 'initializeProviderKeys' }>>
   diagnostic?: (entry: DiagnosticEntry) => void
   startupTimeoutMs?: number
@@ -101,10 +101,44 @@ function approvalRequest(value: unknown): value is ToolApprovalRequest {
 function waitForClose(connection: Connection, timeoutMs: number): Promise<boolean> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(false), timeoutMs)
+    timer.unref()
     void connection.closed.then(() => {
       clearTimeout(timer)
       resolve(true)
     })
+  })
+}
+
+function killHostTree(child: ChildProcessWithoutNullStreams): Promise<void> {
+  const pid = child.pid
+  const fallbackKill = () => {
+    try {
+      if (child.exitCode === null && child.signalCode === null) child.kill()
+    } catch { /* Best-effort fallback. */ }
+  }
+  if (process.platform !== 'win32' || pid === undefined) {
+    fallbackKill()
+    return Promise.resolve()
+  }
+  const taskkill = join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe')
+  return new Promise<void>((resolve) => {
+    let settled = false
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      fallbackKill()
+      resolve()
+    }
+    const timer = setTimeout(finish, 1_500)
+    timer.unref()
+    try {
+      const killer = spawn(taskkill, ['/pid', String(pid), '/t', '/f'], { stdio: 'ignore', shell: false, windowsHide: true })
+      killer.once('error', finish)
+      killer.once('close', finish)
+    } catch {
+      finish()
+    }
   })
 }
 
@@ -148,6 +182,7 @@ export class HostProcessManager {
   readonly #events = new Set<Listener<ConversationEvent>>()
   #status: DesktopHostStatus
   #connection?: Connection
+  #spawning?: Promise<DesktopHostStatus>
   #stopInFlight?: Promise<void>
   #restartInFlight?: Promise<DesktopHostStatus>
   #shutdown = false
@@ -176,22 +211,49 @@ export class HostProcessManager {
 
   start(): Promise<DesktopHostStatus> {
     if (this.#shutdown) return Promise.resolve(this.#status)
+    if (this.#spawning) return this.#spawning
     if (this.#connection) {
       return this.#connection.state === 'starting' ? this.#connection.ready : Promise.resolve(this.#status)
     }
 
-    const ready = Promise.withResolvers<DesktopHostStatus>()
-    const closed = Promise.withResolvers<void>()
     const correlationId = randomUUID()
     this.#log('desktop.host_starting', correlationId)
-    let child: ChildProcessWithoutNullStreams
+    this.#setStatus('starting')
+    let spawned: ChildProcessWithoutNullStreams | Promise<ChildProcessWithoutNullStreams>
     try {
-      child = this.#options.spawnChild()
+      spawned = this.#options.spawnChild()
     } catch {
       this.#log('desktop.host_spawn_failed', correlationId)
       this.#setStatus('offline', '无法启动 Agent Host。')
       return Promise.resolve(this.#status)
     }
+    if (spawned instanceof Promise) {
+      const pending = spawned.then(
+        child => {
+          this.#spawning = undefined
+          if (this.#shutdown) {
+            void killHostTree(child)
+            this.#setStatus('offline')
+            return this.#status
+          }
+          return this.#attachSpawned(child, correlationId)
+        },
+        () => {
+          this.#spawning = undefined
+          this.#log('desktop.host_spawn_failed', correlationId)
+          this.#setStatus('offline', '无法启动 Agent Host。')
+          return this.#status
+        },
+      )
+      this.#spawning = pending
+      return pending
+    }
+    return this.#attachSpawned(spawned, correlationId)
+  }
+
+  #attachSpawned(child: ChildProcessWithoutNullStreams, correlationId: string): Promise<DesktopHostStatus> {
+    const ready = Promise.withResolvers<DesktopHostStatus>()
+    const closed = Promise.withResolvers<void>()
     const connection: Connection = {
       child, correlationId, state: 'starting', ready: ready.promise, resolveReady: ready.resolve,
       closed: closed.promise, resolveClosed: closed.resolve, pending: new Map(), approvals: new Map(), incompleteLine: '',
@@ -267,6 +329,7 @@ export class HostProcessManager {
   }
 
   async #stopConnection(connection: Connection): Promise<void> {
+    const alreadyFailed = connection.failure !== undefined
     if (connection.state !== 'stopping') {
       connection.state = 'stopping'
       clearTimeout(connection.startupTimer)
@@ -276,19 +339,39 @@ export class HostProcessManager {
       connection.resolveReady(this.#status)
       connection.child.stdin.end(JSON.stringify({ schemaVersion: 1, type: 'exit' }) + '\n')
     }
-    if (await waitForClose(connection, this.#options.shutdownTimeoutMs ?? shutdownTimeoutMs)) return
-    this.#log('desktop.host_shutdown_timeout', connection.correlationId)
-    connection.child.kill()
+    const gracefulWaitMs = alreadyFailed ? Math.min(2_000, this.#options.shutdownTimeoutMs ?? shutdownTimeoutMs)
+      : (this.#options.shutdownTimeoutMs ?? shutdownTimeoutMs)
+    if (await waitForClose(connection, gracefulWaitMs)) return
+    if (!alreadyFailed) this.#log('desktop.host_shutdown_timeout', connection.correlationId)
+    await killHostTree(connection.child)
     if (!await waitForClose(connection, 2_000)) {
-      throw unavailable('Agent Host 未能在关闭期限内退出。')
+      this.#detachStuckConnection(connection)
+      if (!alreadyFailed) throw unavailable('Agent Host 未能在关闭期限内退出。')
     }
+  }
+
+  #detachStuckConnection(connection: Connection): void {
+    for (const approval of connection.approvals.values()) approval.abort()
+    clearTimeout(connection.startupTimer)
+    this.#rejectPending(connection, unavailable(connection.failure ?? 'Agent Host 未能在关闭期限内退出。'))
+    try { connection.child.stdin.destroy() } catch { /* Best-effort stream cleanup. */ }
+    try { connection.child.stdout.destroy() } catch { /* Best-effort stream cleanup. */ }
+    try { connection.child.stderr.destroy() } catch { /* Best-effort stream cleanup. */ }
+    try { connection.child.unref() } catch { /* Best-effort unref. */ }
+    if (this.#connection === connection) this.#connection = undefined
   }
 
   #read(connection: Connection, chunk: string): void {
     if (this.#connection !== connection || connection.state === 'stopping') return
+    if (!chunk.includes('\n') && connection.incompleteLine.length + chunk.length > maxLineLength) {
+      connection.incompleteLine = ''
+      this.#fail(connection, 'desktop.host_protocol_invalid', 'Agent Host 的协议数据超出长度上限。')
+      return
+    }
     const lines = (connection.incompleteLine + chunk).split('\n')
     connection.incompleteLine = lines.pop() ?? ''
     if (connection.incompleteLine.length > maxLineLength || lines.some((line) => line.length > maxLineLength)) {
+      connection.incompleteLine = ''
       this.#fail(connection, 'desktop.host_protocol_invalid', 'Agent Host 的协议数据超出长度上限。')
       return
     }
@@ -386,7 +469,10 @@ export class HostProcessManager {
     this.#log(code, connection.correlationId)
     clearTimeout(connection.startupTimer)
     this.#rejectPending(connection, unavailable(reason))
-    connection.child.kill()
+    for (const approval of connection.approvals.values()) approval.abort()
+    void killHostTree(connection.child).then(() => waitForClose(connection, 2_000)).then((closed) => {
+      if (!closed) this.#detachStuckConnection(connection)
+    })
     this.#setStatus('offline', reason)
     connection.resolveReady(this.#status)
   }

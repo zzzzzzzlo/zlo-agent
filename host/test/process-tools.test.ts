@@ -192,3 +192,27 @@ test('the output cap discards a credential-bearing line cut in the middle', asyn
   assert.equal(visible.length, 16)
   assert.doesNotMatch(visible.join(''), /sk-probe/)
 })
+
+test('P1-3: process_stop terminates inherited-pipe descendants even after the top-level shell has already exited', { timeout: 25_000 }, async t => {
+  const { root, invoke, operations } = await setup(t)
+  const script = join(root, 'bg-descendant.cjs')
+  await writeFile(script, [
+    "const { writeFileSync } = require('node:fs')",
+    "const { join } = require('node:path')",
+    "writeFileSync(join(__dirname, 'bg-ready.flag'), '')",
+    "setTimeout(() => writeFileSync(join(__dirname, 'bg-escaped.txt'), 'ran'), 4000)",
+  ].join('\n'))
+  const launched = windows
+    ? await invoke('shell_exec', { shell: 'cmd', command: `start /b "" "${process.execPath}" "${script}" & exit /b 0` })
+    : await invoke('shell_exec', { shell: 'sh', command: `"${process.execPath}" "${script}" & exit 0` })
+  assert.equal(launched.ok, true)
+  await until(async () => {
+    try { await access(join(root, 'bg-ready.flag')); return true } catch { return undefined }
+  })
+  await delay(150)
+  const stopped = await invoke('process_stop', { processId: launched.processId })
+  assert.equal(stopped.state, 'stopped')
+  assert.equal(await operations[0]!.completion, 'unknown_effect')
+  await delay(4_200)
+  await assert.rejects(access(join(root, 'bg-escaped.txt')), { code: 'ENOENT' })
+})
