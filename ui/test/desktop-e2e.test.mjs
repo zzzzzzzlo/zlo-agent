@@ -9,7 +9,7 @@ import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import { _electron as electron } from 'playwright-core'
-import { judgmentPoints, retiredJudgmentPointIds } from '../../shared/contracts/jev.ts'
+import { defaultJevModes, judgmentPoints, retiredJudgmentPointIds } from '../../shared/contracts/jev.ts'
 
 const appPath = resolve(fileURLToPath(new URL('..', import.meta.url)))
 const require = createRequire(import.meta.url)
@@ -741,7 +741,7 @@ test('Windows Electron configures Jev through Main, shows the registered points 
       const registered = judgmentPoints.map(point => point.id)
       const initialModes = (await actual()).settings.modes
       assert.deepEqual(Object.keys(initialModes).sort(), [...registered].sort())
-      assert.ok(Object.values(initialModes).every(mode => mode === 'off'))
+      assert.deepEqual(initialModes, defaultJevModes())
       for (const point of registered) await models.getByText(point, { exact: true }).waitFor()
       for (const point of retiredJudgmentPointIds) assert.equal(await models.getByText(point, { exact: true }).count(), 0)
       await models.getByRole('button', { name: '添加 API Key' }).click()
@@ -749,11 +749,7 @@ test('Windows Electron configures Jev through Main, shows the registered points 
       assert.ok(!(await readFile(join(data, 'jev-credentials.bin'))).includes(Buffer.from(key)))
       await models.getByRole('checkbox', { name: '全局启用 Jev' }).check()
       await models.getByRole('checkbox', { name: '启用协作模式' }).check()
-      await models.getByRole('checkbox', { name: '启用模型适配' }).check()
-      await models.getByRole('combobox', { name: '模型适配模式' }).selectOption('active')
-      await models.getByRole('checkbox', { name: '启用工具输出筛选' }).check()
-      await models.getByRole('combobox', { name: '工具输出筛选模式' }).selectOption('active')
-      await models.getByRole('checkbox', { name: '启用完成与交付审查' }).check()
+      await models.getByRole('combobox', { name: '完成与交付审查模式' }).selectOption('shadow')
       await models.getByRole('button', { name: '保存 Jev 设置' }).click()
       await eventually(async () => (await actual()).settings.enabled)
       assert.equal((await actual()).settings.modes['collaboration.mode'], 'shadow')

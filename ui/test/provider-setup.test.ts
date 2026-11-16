@@ -120,7 +120,10 @@ test('P1-4: Grok refresh keeps retrying with backoff even when the saved token i
   const setup = new ProviderSetup('/virtual-user-data', () => fakeHost, { store, retryBaseMs: 25 })
   try {
     await setup.loadGrok()
-    for (let tick = 0; tick < 40 && refreshCalls < 2; tick++) await delay(20)
+    for (let tick = 0; tick < 40; tick++) {
+      if (refreshCalls >= 2 && (await setup.grokStatus()).state === 'connected') break
+      await delay(20)
+    }
     assert.ok(refreshCalls >= 2, `Expected retry after expired failure, got ${refreshCalls}`)
     const status = await setup.grokStatus()
     assert.equal(status.state, 'connected')

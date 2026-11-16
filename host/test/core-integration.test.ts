@@ -13,7 +13,7 @@ import { FakeExecution } from '../src/fake.ts'
 import { LocalAgentHost } from '../src/host.ts'
 import { PiExecution } from '../src/pi.ts'
 import { ExtensionRegistry } from '../src/policies.ts'
-import { jevEndpoint, judgmentPoints, phaseTwoJudgmentPoints } from '../../shared/contracts/jev.ts'
+import { jevEndpoint, judgmentPoints } from '../../shared/contracts/jev.ts'
 import { createFileTools } from '../src/file-tools.ts'
 import type { JevStatus } from '../../shared/contracts/jev.ts'
 
@@ -158,6 +158,7 @@ test('Phase 2 judges run at real tool, worker, and turn boundaries with bounded 
         const child = await call('delegate_task', { goal: 'Write and read child.txt', access: 'write', scopePath: 'src' })
         assert.ok(ok(child), JSON.stringify(child))
         assert.ok(JSON.stringify(child).includes('patch_scope_review'))
+        assert.ok(JSON.stringify(child).includes('Patch scope review: verify changes in src/child.txt'))
         assert.ok(ok(await call('search_files', { glob: '**/*.txt' })))
         const web = await call('web_fetch', {}) as { ok: boolean; text: string; evidenceId?: string }
         assert.ok(web.ok)
@@ -187,8 +188,9 @@ test('Phase 2 judges run at real tool, worker, and turn boundaries with bounded 
   const host = new LocalAgentHost({ ...env, execution, extensions, jevFetch, jevKey: 'synthetic-test-key' })
   try {
     const { settings } = await host.managementCommand({ schemaVersion: 1, type: 'getJevStatus' }) as JevStatus
-    for (const { id } of phaseTwoJudgmentPoints) settings.modes[id] = 'active'
-    settings.modes['turn.completion'] = 'active'
+    const testedPoints = ['input.preflight', 'task.frame', 'skills.disclosure', 'tool.admission', 'files.locate', 'tool.injection', 'swarm.patch', 'turn.completion'] as const
+    for (const { id } of judgmentPoints) settings.modes[id] = 'off'
+    for (const id of testedPoints) settings.modes[id] = 'active'
     await host.managementCommand({ schemaVersion: 1, type: 'saveJevSettings', settings: { ...settings, enabled: true } })
     const { taskId } = await host.createTask({ requestId: 'phase-2', cwd: env.workspace, goal: 'Write scoped artifacts', workspaceAccess: 'write' })
     await host.idle()
@@ -197,7 +199,7 @@ test('Phase 2 judges run at real tool, worker, and turn boundaries with bounded 
     assert.equal(host.getTask(taskId).verification?.verdict, 'unverified')
     const evaluated = host.events(taskId).filter(event => event.type === 'judgment.evaluated' && event.payload.requestSent)
     const actual = new Set(evaluated.map(event => event.payload.id))
-    assert.deepEqual(actual, new Set([...phaseTwoJudgmentPoints.map(({ id }) => id), 'turn.completion']))
+    assert.deepEqual(actual, new Set(testedPoints))
     assert.equal(evaluated.filter(event => event.payload.id === 'turn.completion' && event.payload.output === true).length, 1)
     assert.ok(!JSON.stringify(evaluated).includes(publicText.slice(0, 100)))
   } finally {
@@ -523,9 +525,9 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
   try {
     const { settings } = await host.managementCommand({ schemaVersion: 1, type: 'getJevStatus' }) as JevStatus
     assert.equal(settings.enabled, false)
-    assert.ok(Object.values(settings.modes).every(mode => mode === 'off'))
-    const phaseOne = judgmentPoints.slice(0, 6)
-    for (const { id } of phaseOne) settings.modes[id] = 'shadow'
+    const phaseOne = ['collaboration.mode', 'context.relevance', 'delegation.worth', 'model.task_fit', 'task.replan', 'turn.completion'] as const
+    for (const { id } of judgmentPoints) settings.modes[id] = 'off'
+    for (const id of phaseOne) settings.modes[id] = 'shadow'
     await host.managementCommand({ schemaVersion: 1, type: 'saveJevSettings', settings: { ...settings, enabled: true } })
     const conversation = host.createConversation({ requestId: 'new-core', workspace: env.workspace })
     assert.equal(conversation.workspaceAccess, 'write')
@@ -539,7 +541,7 @@ test('Host runs a verified DAG with Team reuse, nested scope, replan and six liv
     assert.ok(task.nodes?.every(node => node.verification?.verdict === (node.check ? 'verified' : 'unverified')))
     assert.equal(await readFile(join(env.workspace, 'src', 'report.txt'), 'utf8'), 'second')
     const events = host.events(taskId)
-    const phaseOneIds = new Set<string>(phaseOne.map(({ id }) => id))
+    const phaseOneIds = new Set<string>(phaseOne)
     const phaseOneDecisions = events.filter(item => item.type === 'judgment.evaluated' && phaseOneIds.has(String(item.payload.id)))
     const decisions = new Set(phaseOneDecisions.map(item => item.payload.id))
     assert.deepEqual([...decisions].sort(), ['collaboration.mode', 'context.relevance', 'delegation.worth',

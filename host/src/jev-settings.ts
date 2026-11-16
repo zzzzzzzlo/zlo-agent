@@ -1,4 +1,4 @@
-import { jevDefaultModel, jevEndpoint, judgmentPoints, parseJevSettings } from '../../shared/contracts/jev.ts'
+import { defaultJevModes, jevDefaultModel, jevEndpoint, judgmentPoints, parseJevSettings } from '../../shared/contracts/jev.ts'
 import type { DecisionPoint, JevDecisionStatus, JevReason, JevSettings, JevStatus, JudgeCredentials } from '../../shared/contracts/jev.ts'
 import { JevFailure, JevJudge } from './jev-judge.ts'
 import type { Judge, JudgmentOptions } from './judgment.ts'
@@ -32,7 +32,7 @@ export class JevConfiguration {
     if (key && !key.startsWith('oc_sk_') && !this.#keys.has(jevEndpoint)) this.#keys.set(jevEndpoint, key)
     this.#settings = parseJevSettings(store.get(namespace, settingsId), true) ?? {
       enabled: false, provider: 'typesafe', endpoint: jevEndpoint, model: jevDefaultModel,
-      modes: Object.fromEntries(judgmentPoints.map(({ id }) => [id, 'off'])) as JevSettings['modes'],
+      modes: defaultJevModes(),
     }
   }
 

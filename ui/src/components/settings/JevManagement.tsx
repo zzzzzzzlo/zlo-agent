@@ -1,5 +1,5 @@
 import { useEffect, useState } from 'react'
-import { judgeProviders, judgmentPoints, parseJevSettings } from '../../../../shared/contracts/jev.ts'
+import { coreJudgmentPoints, defaultJevModes, judgeProviders, parseJevSettings, secondaryJudgmentPoints } from '../../../../shared/contracts/jev.ts'
 import type { JevReason, JevSettings, JevStatus, JudgeProviderId } from '../../../../shared/contracts/jev.ts'
 import type { DesktopManagementApi } from '../../../../shared/contracts/management.ts'
 import type { PerformManagement } from './ModelManagement'
@@ -8,7 +8,7 @@ const reasons: Record<JevReason, string> = {
   missing_key: '尚未配置 API Key',
   timeout: '请求超时',
   busy: '判定并发已满',
-  budget_exhausted: '本地判定预算已用尽',
+  budget_exhausted: '单次请求超出体积上限或配额受限',
   billing: '供应商账户余额不足',
   unauthorized: '服务拒绝了此凭证',
   rate_limited: '服务限流，稍后重试',
@@ -107,29 +107,36 @@ export function JevManagement({ api, busy, perform }: {
     </section>
     <section className="management-group">
       <h4>判定点管理</h4>
-      {judgmentPoints.map(point => {
-        const mode = settings.modes[point.id]
-        const effective = status.settings.modes[point.id]
-        const latest = status.decisions[point.id]
-        const label = !status.settings.enabled || effective === 'off' ? '已关闭'
-          : !stored ? '等待 API Key' : latest?.mode !== effective ? '等待判定'
-          : latest.reason ? '最近回退 · ' + reasons[latest.reason] : '最近判定 · ' + (latest.model ?? effective)
-        return <div className="management-stack" key={point.id}>
-          <div><strong>{point.label}</strong> <code>{point.id}</code></div>
-          <p className="management-note">{point.description} {label}</p>
-          <div className="management-actions">
-            <label><input type="checkbox" checked={mode !== 'off'} disabled={disabled}
-              onChange={event => setDraft({ ...settings, modes: { ...settings.modes,
-                [point.id]: event.target.checked ? 'shadow' : 'off' } })} /> 启用{point.label}</label>
-            <select aria-label={point.label + '模式'} value={mode === 'active' ? 'active' : 'shadow'} disabled={disabled || mode === 'off'}
-              onChange={event => setDraft({ ...settings, modes: { ...settings.modes,
-                [point.id]: event.target.value === 'active' ? 'active' : 'shadow' } })}>
-              <option value="shadow">Shadow</option>
-              <option value="active">Active</option>
-            </select>
+      <div className="management-actions">
+        <button type="button" className="button-neutral" disabled={disabled}
+          onClick={() => setDraft({ ...settings, modes: defaultJevModes() })}>恢复核心 6 项推荐预设</button>
+      </div>
+      {[coreJudgmentPoints, secondaryJudgmentPoints].map((group, groupIndex) => <div className="management-stack" key={groupIndex}>
+        <h5>{groupIndex === 0 ? '核心判定点（推荐启用 Active · 6 项）' : '扩展/备选判定点（默认关闭 · 8 项）'}</h5>
+        {group.map(point => {
+          const mode = settings.modes[point.id]
+          const effective = status.settings.modes[point.id]
+          const latest = status.decisions[point.id]
+          const label = !status.settings.enabled || effective === 'off' ? '已关闭'
+            : !stored ? '等待 API Key' : latest?.mode !== effective ? '等待判定'
+            : latest.reason ? '最近回退 · ' + reasons[latest.reason] : '最近判定 · ' + (latest.model ?? effective)
+          return <div className="management-stack" key={point.id}>
+            <div><strong>{point.label}</strong> <code>{point.id}</code></div>
+            <p className="management-note">{point.description} {label}</p>
+            <div className="management-actions">
+              <label><input type="checkbox" checked={mode !== 'off'} disabled={disabled}
+                onChange={event => setDraft({ ...settings, modes: { ...settings.modes,
+                  [point.id]: event.target.checked ? 'shadow' : 'off' } })} /> 启用{point.label}</label>
+              <select aria-label={point.label + '模式'} value={mode === 'active' ? 'active' : 'shadow'} disabled={disabled || mode === 'off'}
+                onChange={event => setDraft({ ...settings, modes: { ...settings.modes,
+                  [point.id]: event.target.value === 'active' ? 'active' : 'shadow' } })}>
+                <option value="shadow">Shadow</option>
+                <option value="active">Active</option>
+              </select>
+            </div>
           </div>
-        </div>
-      })}
+        })}
+      </div>)}
       <div className="management-actions">
         <button type="button" className="button-primary" disabled={disabled || !draft || !parseJevSettings(settings)}
           onClick={() => run(() => api.saveJevSettings(settings), true)}>保存 Jev 设置</button>

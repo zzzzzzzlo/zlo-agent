@@ -528,13 +528,16 @@ export class MultiAgentOrchestrator {
         executionCompleted = outcome.status === 'completed'
         if (!signal.aborted && outcome.status === 'completed' && outcome.text.trim() && settledEvidence) {
           const review = await this.#reviewWorkerPatch(task, node, event, scope, signal)
+          const patchNotice = review.flagged && review.paths.length
+            ? `\n[Patch scope review: verify changes in ${review.paths.slice(0, 6).join(', ')} against assigned sub-goal.]`
+            : ''
           result = {
             resultStatus: hardEvidence && completionAccepted ? 'succeeded' : 'failed',
             executionStatus: 'completed',
-            summary: outcome.text.slice(0, 1600), artifactRefs: [...artifacts], evidenceRefs: [...evidence],
+            summary: (outcome.text.trim() + patchNotice).slice(0, 1600), artifactRefs: [...artifacts], evidenceRefs: [...evidence],
             remainingRisks: [
               ...(!hardEvidence ? ['verification_failed'] : !completionAccepted ? ['handoff_insufficient'] : []),
-              ...(review ? ['patch_scope_review'] : []),
+              ...(review.flagged ? ['patch_scope_review'] : []),
             ],
           }
         }
@@ -578,16 +581,22 @@ export class MultiAgentOrchestrator {
   }
 
 
-  async #reviewWorkerPatch(task: TaskSnapshot, node: WorkerNode, event: EventDraft, scope: CapabilityScope, signal: AbortSignal) {
-    if (this.#judgment.mode('swarm.patch', task.id) === 'off' || signal.aborted) return false
+  async #reviewWorkerPatch(task: TaskSnapshot, node: WorkerNode, event: EventDraft, scope: CapabilityScope, signal: AbortSignal):
+  Promise<{ flagged: boolean; paths: string[]; writeCount: number; targetCount: number }> {
+    if (this.#judgment.mode('swarm.patch', task.id) === 'off' || signal.aborted) {
+      return { flagged: false, paths: [], writeCount: 0, targetCount: 0 }
+    }
     const writes = this.#tasks.operations(task.id).filter(operation => operation.taskNodeId === node.id &&
       operation.attemptId === event.taskAttemptId && operation.effect === 'write' && operation.status === 'succeeded')
-    if (!writes.length) return false
+    if (!writes.length) return { flagged: false, paths: [], writeCount: 0, targetCount: 0 }
+    const touched = [...new Set(writes.flatMap(({ target, changedPaths }) =>
+      changedPaths?.length ? changedPaths : target ? [target] : []))]
     const summary = writes.slice(0, 12).map(({ tool, target, changedPaths }) =>
       tool + ': ' + (changedPaths?.join(', ') || target || '(no individual path)')).join('\n')
-    return this.#judgment.decide(event, 'swarm.patch', {
-      goal: node.goal, parentGoal: task.goal, proposedGoal: scope.path, summary, writeCount: writes.length,
+    const flagged = await this.#judgment.decide(event, 'swarm.patch', {
+      goal: node.goal, parentGoal: task.goal, proposedGoal: scope.path, summary, writeCount: writes.length, targetCount: touched.length,
     }, false, [false, true], writes.map(operation => operation.id), { signal })
+    return { flagged, paths: touched, writeCount: writes.length, targetCount: touched.length }
   }
 
   #completedReceipts(event: EventDraft): string[] {

@@ -33,30 +33,47 @@ export function parseJudgeCredentials(value: unknown): JudgeCredentials | undefi
 }
 
 export const judgmentPoints = [
-  { id: 'collaboration.mode', label: '协作模式', description: '在允许的选项中选择临时 Worker 或持久 Team。' },
-  { id: 'delegation.worth', label: '委派价值', description: '判断交给子 Agent 是否有助于完成父任务。' },
-  { id: 'model.task_fit', label: '模型适配', description: '在已经获准的模型中选择适合当前子任务的模型。' },
-  { id: 'context.relevance', label: '上下文相关性', description: '在已获准召回的记忆中选择优先使用的内容。' },
-  { id: 'turn.completion', label: '完成与交付审查', description: '在主 Agent 或子 Agent 声称完成时审查任务完成度与验证证据，不充分时强制补充执行。' },
-  { id: 'task.replan', label: '任务重规划', description: '评估符合任务状态约束的重规划提议。' },
-  { id: 'input.preflight', label: '任务预判', description: '判断当前请求的类型和复杂度，提供执行与推理提示。' },
-  { id: 'task.frame', label: '任务意图', description: '标注新消息中的目标、约束或纠正，让执行模型正确理解追加说明。' },
-  { id: 'skills.disclosure', label: '技能选择', description: '按任务相关性选择预先展示的技能，其他技能仍可按需读取。' },
-  { id: 'tool.admission', label: '工具输出筛选', description: '在送入上下文前分段审查长搜索或外部网页结果，保留原始存档供按需回查。' },
-  { id: 'memory.capture', label: '记忆写入', description: '从有证据的候选记录中选择值得保留的事实和经验。' },
-  { id: 'files.locate', label: '文件定位', description: '按任务语义重新排序已有的授权文件搜索结果。' },
   { id: 'tool.injection', label: '注入识别', description: '识别外部文本与进程流里针对 Agent 的可疑指令，隔离模型输入中的对应片段。' },
+  { id: 'turn.completion', label: '完成与交付审查', description: '在主 Agent 或子 Agent 声称完成时审查任务完成度与验证证据，不充分时强制补充执行。' },
   { id: 'swarm.patch', label: '子 Agent 修改审查', description: '根据实际改动记录评估变更是否偏离委派范围，提醒父 Agent。' },
+  { id: 'tool.admission', label: '工具输出筛选', description: '在送入上下文前分段审查长搜索或外部网页结果，保留原始存档供按需回查。' },
+  { id: 'model.task_fit', label: '模型适配', description: '在已经获准的模型中选择适合当前子任务的模型。' },
+  { id: 'memory.capture', label: '记忆写入', description: '从有证据的候选记录中选择值得保留的事实和经验。' },
+  { id: 'delegation.worth', label: '委派价值', description: '判断交给子 Agent 是否有助于完成父任务。' },
+  { id: 'skills.disclosure', label: '技能选择', description: '按任务相关性选择预先展示的技能，其他技能仍可按需读取。' },
+  { id: 'input.preflight', label: '任务预判', description: '判断当前请求的类型和复杂度，提供执行与推理提示。' },
+  { id: 'files.locate', label: '文件定位', description: '按任务语义重新排序已有的授权文件搜索结果。' },
+  { id: 'context.relevance', label: '上下文相关性', description: '在已获准召回的记忆中选择优先使用的内容。' },
+  { id: 'collaboration.mode', label: '协作模式', description: '在允许的选项中选择临时 Worker 或持久 Team。' },
+  { id: 'task.replan', label: '任务重规划', description: '评估符合任务状态约束的重规划提议。' },
+  { id: 'task.frame', label: '任务意图', description: '标注新消息中的目标、约束或纠正，让执行模型正确理解追加说明。' },
 ] as const
+
+export const coreJudgmentPoints = judgmentPoints.slice(0, 6)
+export const secondaryJudgmentPoints = judgmentPoints.slice(6)
 
 export const retiredJudgmentPointIds = ['handoff.sufficiency', 'turn.continue'] as const
 export type RetiredDecisionPoint = typeof retiredJudgmentPointIds[number]
 export type AnyDecisionPoint = DecisionPoint | RetiredDecisionPoint
 
-const phaseOneIds = judgmentPoints.slice(0, 6).map(({ id }) => id)
+const coreIds = coreJudgmentPoints.map(({ id }) => id)
 const legacyPhaseOneIds = ['collaboration.mode', 'delegation.worth', 'model.task_fit', 'context.relevance', 'handoff.sufficiency', 'task.replan'] as const
-const legacySixteenIds = [...legacyPhaseOneIds, ...judgmentPoints.slice(6).slice(0, 7).map(({ id }) => id), 'turn.completion', 'turn.continue', 'swarm.patch'] as const
-export const phaseTwoJudgmentPoints = judgmentPoints.slice(6)
+const legacyPhaseOneUnifiedIds = ['collaboration.mode', 'delegation.worth', 'model.task_fit', 'context.relevance', 'turn.completion', 'task.replan'] as const
+const legacySixteenIds = [
+  'collaboration.mode', 'delegation.worth', 'model.task_fit', 'context.relevance', 'handoff.sufficiency', 'task.replan',
+  'input.preflight', 'task.frame', 'skills.disclosure', 'tool.admission', 'memory.capture', 'files.locate',
+  'tool.injection', 'turn.completion', 'turn.continue', 'swarm.patch',
+] as const
+const excerptSharingIds = new Set<string>([
+  'tool.injection', 'turn.completion', 'swarm.patch', 'tool.admission', 'memory.capture',
+  'input.preflight', 'task.frame', 'skills.disclosure', 'files.locate',
+])
+export const phaseTwoJudgmentPoints = judgmentPoints.filter(({ id }) => excerptSharingIds.has(id))
+
+export function defaultJevModes(): JevSettings['modes'] {
+  const coreSet = new Set<string>(coreIds)
+  return Object.fromEntries(judgmentPoints.map(({ id }) => [id, coreSet.has(id) ? 'active' : 'off'])) as JevSettings['modes']
+}
 
 export type DecisionPoint = typeof judgmentPoints[number]['id']
 export type JudgmentMode = 'off' | 'shadow' | 'active'
@@ -121,8 +138,9 @@ export function parseJevSettings(value: unknown, legacy = false): JevSettings | 
   const rawModes = modes as Record<string, unknown>
   const currentIds = judgmentPoints.map(({ id }) => id)
   const accepted = exactKeys(rawModes, currentIds) || (legacy && (
-    exactKeys(rawModes, phaseOneIds) ||
+    exactKeys(rawModes, coreIds) ||
     exactKeys(rawModes, legacyPhaseOneIds) ||
+    exactKeys(rawModes, legacyPhaseOneUnifiedIds) ||
     exactKeys(rawModes, legacySixteenIds)
   ))
   if (!accepted) return

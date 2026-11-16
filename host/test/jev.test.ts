@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
-import { jevEndpoint, judgmentPoints, openCodeFreeJudgeModel, openCodeJudgeEndpoint, parseJevSettings, parseJudgeCredentials } from '../../shared/contracts/jev.ts'
+import { coreJudgmentPoints, defaultJevModes, jevEndpoint, judgmentPoints, openCodeFreeJudgeModel, openCodeJudgeEndpoint, parseJevSettings, parseJudgeCredentials, secondaryJudgmentPoints } from '../../shared/contracts/jev.ts'
 import type { JevStatus } from '../../shared/contracts/jev.ts'
 import { JevConfiguration } from '../src/jev-settings.ts'
 import { LocalJudgment } from '../src/judgment.ts'
@@ -48,14 +48,18 @@ test('System One routes keep credentials bound to the exact endpoint and preserv
     const { settings: original } = settings.status()
     const { provider, endpoint, ...legacy } = original
     assert.deepEqual(parseJevSettings(legacy, true), original)
-    const oldModes = Object.fromEntries(judgmentPoints.slice(0, 6).map(({ id }) => [id, 'shadow']))
+    const oldModes = Object.fromEntries(['collaboration.mode', 'delegation.worth', 'model.task_fit', 'context.relevance', 'handoff.sufficiency', 'task.replan'].map(id => [id, 'shadow']))
     const oldSettings = { ...original, enabled: true, modes: oldModes }
     assert.equal(parseJevSettings(oldSettings), undefined)
     const migrated = parseJevSettings(oldSettings, true)
     assert.equal(migrated?.enabled, true)
     assert.equal(migrated?.modes['collaboration.mode'], 'shadow')
+    assert.equal(migrated?.modes['turn.completion'], 'shadow')
     assert.equal(migrated?.modes['tool.admission'], 'off')
     assert.equal(Object.keys(migrated?.modes ?? {}).length, judgmentPoints.length)
+    assert.deepEqual(original.modes, defaultJevModes())
+    assert.equal(coreJudgmentPoints.every(({ id }) => original.modes[id] === 'active'), true)
+    assert.equal(secondaryJudgmentPoints.every(({ id }) => original.modes[id] === 'off'), true)
     const oldSixteenModes = {
       'collaboration.mode': 'shadow', 'delegation.worth': 'off', 'model.task_fit': 'off', 'context.relevance': 'off',
       'handoff.sufficiency': 'off', 'task.replan': 'off', 'input.preflight': 'off', 'task.frame': 'off',
