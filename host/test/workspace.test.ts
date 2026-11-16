@@ -220,3 +220,60 @@ test('P0-1: allows auth source modules and safe engineering dotfiles while still
     assert.deepEqual(await mkdirTool({ path: `${dir}/sub` }), { ok: false, error: 'Path denied by workspace policy' })
   }
 })
+
+test('read_text_file streams slices on files over 128 KiB and create_directory builds nested relative paths safely', async (t) => {
+  const { root, workspace } = await fixture(t)
+  const read = tool(workspace, 'read_text_file', 'worker')
+  const mkdirTool = tool(workspace, 'create_directory')
+
+  // Large file (> 128 KiB) with CRLF split across the 64 KiB read boundary and multi-byte UTF-8.
+  const linePrefix = 'x'.repeat(65535) + '\r\n'
+  const secondLine = '中文边界line2\r\n'
+  const extraLines = Array.from({ length: 1500 }, (_, i) => `row-${i + 3}-${'a'.repeat(80)}\n`).join('')
+  await writeFile(join(root, 'big.txt'), linePrefix + secondLine + extraLines, 'utf8')
+
+  const whole = await read({ path: 'big.txt' }) as { ok: boolean; code?: string; error?: string; sizeBytes?: number }
+  assert.equal(whole.ok, false)
+  assert.equal(whole.code, 'file_too_large')
+  assert.match(whole.error ?? '', /startLine.*lineCount/u)
+  assert.ok((whole.sizeBytes ?? 0) > 128 * 1024)
+
+  const slice1 = await read({ path: 'big.txt', startLine: 1, lineCount: 2 }) as {
+    ok: boolean; text: string; startLine: number; endLine: number; totalLines: number
+  }
+  assert.equal(slice1.ok, true)
+  assert.equal(slice1.text, linePrefix + secondLine)
+  assert.equal(slice1.startLine, 1)
+  assert.equal(slice1.endLine, 2)
+  assert.equal(slice1.totalLines, 1502)
+
+  const tailSlice = await read({ path: 'big.txt', startLine: 1501, lineCount: 10 }) as {
+    ok: boolean; text: string; startLine: number; endLine: number; totalLines: number
+  }
+  assert.equal(tailSlice.ok, true)
+  assert.equal(tailSlice.startLine, 1501)
+  assert.equal(tailSlice.endLine, 1502)
+  assert.match(tailSlice.text, /^row-1501-.*\nrow-1502-/u)
+
+  // Single oversized line slice caps safely at 128 KiB with truncated flag.
+  await writeFile(join(root, 'one-giant-line.txt'), '中'.repeat(60_000))
+  const cappedSlice = await read({ path: 'one-giant-line.txt', startLine: 1, lineCount: 1 }) as {
+    ok: boolean; text: string; truncated?: boolean
+  }
+  assert.equal(cappedSlice.ok, true)
+  assert.equal(cappedSlice.truncated, true)
+  assert.ok(Buffer.byteLength(cappedSlice.text) <= 128 * 1024)
+
+  // Invalid UTF-8 in a large file is still rejected when slicing.
+  await writeFile(join(root, 'bad-utf8.txt'), Buffer.concat([Buffer.alloc(130_000, 0x61), Buffer.from([0xc0, 0xaf])]))
+  assert.equal((await read({ path: 'bad-utf8.txt', startLine: 1, lineCount: 2 }) as { ok: boolean }).ok, false)
+
+  // Recursive safe directory creation.
+  assert.deepEqual(await mkdirTool({ path: 'packages/core/src/utils' }), { ok: true })
+  assert.deepEqual(await mkdirTool({ path: 'packages/core/src/utils' }), { ok: true })
+  await writeFile(join(root, 'existing.txt'), 'file')
+  assert.equal((await mkdirTool({ path: 'existing.txt/child' }) as { ok: boolean }).ok, false)
+  assert.deepEqual(await mkdirTool({ path: '.env/nested' }), { ok: false, error: 'Path denied by workspace policy' })
+  assert.deepEqual(await mkdirTool({ path: '.gitignore' }), { ok: false, error: 'Path denied by workspace policy' })
+  assert.deepEqual(await mkdirTool({ path: 'packages/../escape' }), { ok: false, error: 'Path denied by workspace policy' })
+})

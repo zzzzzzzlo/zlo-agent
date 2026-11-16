@@ -11,6 +11,8 @@ const maxFiles = 100
 const maxVisited = 5_000
 const maxDepth = 24
 const maxSearchBytes = 2 * 1024 * 1024
+const maxSearchResultBytes = 48 * 1024
+const maxContextLines = 5
 const maxSearchMs = 3_000
 const maxTextBytes = 128 * 1024
 const maxPatchEdits = 16
@@ -97,12 +99,20 @@ async function filePaths(workspace: CodingWorkspace, root: string, pattern: stri
 }
 
 interface SearchFile { path: string; text: string }
-interface SearchMatch { path: string; line: number; column: number; text: string }
+interface SearchContextLine { line: number; text: string }
+interface SearchMatch {
+  path: string
+  line: number
+  column: number
+  text: string
+  before?: SearchContextLine[]
+  after?: SearchContextLine[]
+}
 
 // A caller-supplied regular expression cannot block the Host or its stop processing.
 const searchWorker = String.raw`
   const { parentPort, workerData } = require('node:worker_threads');
-  const { files, query, regex, caseSensitive, limit } = workerData;
+  const { files, query, regex, caseSensitive, limit, contextLines } = workerData;
   let expression;
   try { if (regex) expression = new RegExp(query, caseSensitive ? 'u' : 'iu'); }
   catch { parentPort.postMessage({ invalid: true }); return; }
@@ -115,18 +125,31 @@ const searchWorker = String.raw`
       const column = expression ? text.search(expression) : (caseSensitive ? text : text.toLowerCase()).indexOf(needle);
       if (column < 0) continue;
       if (matches.length >= limit) { parentPort.postMessage({ matches, truncated: true }); return; }
-      matches.push({ path: file.path, line: index + 1, column: column + 1, text });
+      const entry = { path: file.path, line: index + 1, column: column + 1, text };
+      if (contextLines > 0) {
+        const before = [];
+        for (let i = Math.max(0, index - contextLines); i < index; i++) {
+          before.push({ line: i + 1, text: lines[i] });
+        }
+        const after = [];
+        for (let i = index + 1; i <= Math.min(lines.length - 1, index + contextLines); i++) {
+          after.push({ line: i + 1, text: lines[i] });
+        }
+        entry.before = before;
+        entry.after = after;
+      }
+      matches.push(entry);
     }
   }
   parentPort.postMessage({ matches, truncated: false });
 `
 
-function searchLines(files: SearchFile[], query: string, regex: boolean, caseSensitive: boolean, signal: AbortSignal) {
+function searchLines(files: SearchFile[], query: string, regex: boolean, caseSensitive: boolean, contextLines: number, signal: AbortSignal) {
   type Result = { matches: SearchMatch[]; truncated: boolean } | { invalid: true } | undefined
   if (signal.aborted) return Promise.resolve(undefined)
   return new Promise<Result>(resolve => {
     const worker = new Worker(`(() => { ${searchWorker} })()`, {
-      eval: true, execArgv: [], workerData: { files, query, regex, caseSensitive, limit: maxFiles },
+      eval: true, execArgv: [], workerData: { files, query, regex, caseSensitive, limit: maxFiles, contextLines },
     })
     let finished = false
     const finish = (result?: Result) => {
@@ -332,13 +355,15 @@ export function createFileTools(workspace: CodingWorkspace): WorkspaceTool[] {
         const result = await filePaths(workspace, root, pattern, bounded)
         return { ok: true, paths: result.paths.sort().map(path => redactProcessOutput(path)), truncated: result.truncated }
       }, searchTargets),
-    tool('search_content', 'Find literal or regular expression matches in bounded UTF-8 workspace files.', 'read',
+    tool('search_content', 'Find literal or regular expression matches in bounded UTF-8 workspace files. Pass contextLines (0-5) to include surrounding lines.', 'read',
       { path: pathSchema, glob: globSchema, query: { type: 'string', minLength: 1, maxLength: 256 }, regex: { type: 'boolean' },
-        caseSensitive: { type: 'boolean' } }, ['query'], async (input, signal) => {
+        caseSensitive: { type: 'boolean' }, contextLines: { type: 'integer', minimum: 0, maximum: maxContextLines } }, ['query'], async (input, signal) => {
         const root = readRootPath(input.path)
         const pattern = globValue(input.glob ?? '**/*')
+        const contextLines = input.contextLines === undefined ? 0 : input.contextLines
         if (!root || !pattern || typeof input.query !== 'string' || !input.query || input.query.length > 256 ||
-          !input.query.isWellFormed() || [input.regex, input.caseSensitive].some(flag => flag !== undefined && typeof flag !== 'boolean')) {
+          !input.query.isWellFormed() || [input.regex, input.caseSensitive].some(flag => flag !== undefined && typeof flag !== 'boolean') ||
+          typeof contextLines !== 'number' || !Number.isSafeInteger(contextLines) || contextLines < 0 || contextLines > maxContextLines) {
           return rejected('Invalid content search')
         }
         const bounded = AbortSignal.any([AbortSignal.timeout(maxSearchMs), ...(signal ? [signal] : [])])
@@ -354,12 +379,34 @@ export function createFileTools(workspace: CodingWorkspace): WorkspaceTool[] {
           if (bytes > maxSearchBytes) { capped = true; break }
           files.push({ path, text: file.text })
         }
-        const result = await searchLines(files, input.query, input.regex === true, input.caseSensitive === true, bounded)
+        const result = await searchLines(files, input.query, input.regex === true, input.caseSensitive === true, contextLines, bounded)
         if (!result) return rejected('Content search timed out or was interrupted')
         if ('invalid' in result) return rejected('Invalid regular expression')
-        return { ok: true, truncated: capped || result.truncated, matches: result.matches.map(match => ({
-          ...match, path: redactProcessOutput(match.path), text: redactProcessOutput(match.text).slice(0, 512),
-        })) }
+        const matches: SearchMatch[] = []
+        let outputBytes = 0
+        let resultCapped = capped || result.truncated
+        const cleanLine = (line: SearchContextLine): SearchContextLine => ({
+          line: line.line,
+          text: redactProcessOutput(line.text).slice(0, 512),
+        })
+        for (const match of result.matches) {
+          const formatted: SearchMatch = {
+            path: redactProcessOutput(match.path),
+            line: match.line,
+            column: match.column,
+            text: redactProcessOutput(match.text).slice(0, 512),
+            ...(match.before ? { before: match.before.map(cleanLine) } : {}),
+            ...(match.after ? { after: match.after.map(cleanLine) } : {}),
+          }
+          const entryBytes = Buffer.byteLength(JSON.stringify(formatted))
+          if (matches.length > 0 && outputBytes + entryBytes > maxSearchResultBytes) {
+            resultCapped = true
+            break
+          }
+          matches.push(formatted)
+          outputBytes += entryBytes
+        }
+        return { ok: true, truncated: resultCapped, matches }
       }, searchTargets),
     tool('apply_patch', 'Replace exact text in one or more files. Repeat a path to edit several locations in the same file. Each oldText must match once in the original file, including whitespace, and edits must not overlap. All edits are checked before any target is changed. On a mismatch, use the edit number and any readRange to reread the current file before retrying.', 'write',
       { edits: { type: 'array', minItems: 1, maxItems: maxPatchEdits, items: { type: 'object', additionalProperties: false,

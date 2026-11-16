@@ -7,7 +7,7 @@ import { test } from 'node:test'
 import type { TestContext } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { CodingWorkspace } from '../src/workspace.ts'
-import type { WorkspaceAccess } from '../src/workspace.ts'
+import type { ToolInvocationContext, WorkspaceAccess } from '../src/workspace.ts'
 
 async function fixture(t: TestContext) {
   const root = await mkdtemp(join(tmpdir(), 'zlo-workspace-process-'))
@@ -18,7 +18,7 @@ async function fixture(t: TestContext) {
 function tool(workspace: CodingWorkspace, name: string, access: WorkspaceAccess = 'trusted') {
   const spec = workspace.tools('root', access).find((item) => item.name === name)
   assert.ok(spec)
-  return (input: unknown, signal?: AbortSignal) => spec.execute(name, input, signal)
+  return (input: unknown, signal?: AbortSignal, context?: ToolInvocationContext) => spec.execute(name, input, signal, context)
 }
 
 test('read, write and trusted grants govern each role and reject overlapping workspace writes', async (t) => {
@@ -63,7 +63,8 @@ test('real Node scripts receive literal arguments and a bounded environment with
   assert.equal(result.ok, true)
   assert.equal(result.exitCode, 0)
   assert.deepEqual(JSON.parse(result.stdout), { args, inherited: false })
-  assert.equal(result.stderr.length, 16 * 1024)
+  assert.ok(result.stderr.length <= 16 * 1024)
+  assert.match(result.stderr, /\[truncated /u)
   assert.equal(result.truncated, true)
   assert.deepEqual(await run({ command: 'powershell', path: '.' }), { ok: false, error: 'Invalid project command' })
   assert.deepEqual(await run({ command: 'node_script', path: '../outside.cjs' }), {
@@ -95,8 +96,42 @@ test('process results redact known secrets, standard auth headers and a secret c
   }
   assert.equal(result.ok, true)
   assert.equal(result.stdout, '[redacted]\n{"Authorization":"Bearer [redacted]"}\n')
-  assert.equal(result.stderr, 'x'.repeat(16 * 1024 - 12) + '[redacted]')
+  assert.ok(result.stderr.length <= 16 * 1024)
+  assert.ok(result.stderr.endsWith('[redacted]'))
+  assert.ok(!result.stderr.includes(value))
   assert.equal(result.truncated, true)
+})
+
+test('runWorkspaceProcess preserves head, key diagnostics and tail within 16 KiB and redacts cut boundary secrets', async (t) => {
+  const { root, workspace } = await fixture(t)
+  const boundarySecret = 'zlo-boundary-secret-value-9988'
+  process.env.ZLO_BOUNDARY_TEST_SECRET = boundarySecret
+  t.after(() => { delete process.env.ZLO_BOUNDARY_TEST_SECRET })
+  await writeFile(join(root, 'big-log.cjs'), `
+    console.log('HEAD_START_MARKER');
+    for (let i = 0; i < 40; i++) console.log('head-pad-' + i + '-' + 'h'.repeat(80));
+    console.log('src/main.ts(9,1): error TS2322: Type number is not assignable');
+    for (let i = 0; i < 200; i++) console.log('mid-noise-' + i + '-' + 'm'.repeat(160));
+    console.log('TAIL_FAILURE_SUMMARY: 1 failed');
+    process.stderr.write('x'.repeat(4096 - 10) + ${JSON.stringify(boundarySecret)} + 'y'.repeat(20000));
+    process.exitCode = 1;
+  `)
+  const run = tool(workspace, 'run_project_command')
+  const result = await run({ command: 'node_script', path: 'big-log.cjs' }) as {
+    ok: boolean; exitCode: number; stdout: string; stderr: string; truncated: boolean
+  }
+  assert.equal(result.ok, false)
+  assert.equal(result.exitCode, 1)
+  assert.equal(result.truncated, true)
+  assert.ok(Buffer.byteLength(result.stdout) <= 16 * 1024)
+  assert.ok(Buffer.byteLength(result.stderr) <= 16 * 1024)
+  assert.match(result.stdout, /HEAD_START_MARKER/u)
+  assert.match(result.stdout, /truncated \d+ bytes/u)
+  assert.match(result.stdout, /error TS2322/u)
+  assert.match(result.stdout, /TAIL_FAILURE_SUMMARY: 1 failed/u)
+  assert.ok(!result.stderr.includes(boundarySecret))
+  assert.ok(!result.stderr.includes(boundarySecret.slice(0, 10)))
+  assert.match(result.stderr, /\[redacted\]/u)
 })
 
 test('npm test and build use real package scripts and trusted exit-code acceptance', async (t) => {
@@ -173,7 +208,66 @@ test('Git status, staged diff and commit metadata inspect a real local repositor
   assert.match(staged.stdout, /^\+updated$/mu)
   assert.deepEqual(await diff({ path: '.env' }), { ok: false, error: 'Path denied by workspace policy' })
   const history = await tool(workspace, 'git_log')({}) as { stdout: string }
-  assert.match(history.stdout, /^[a-f\d]+\t\d{4}-\d{2}-\d{2}\s*$/u)
+  assert.match(history.stdout, /^[a-f\d]+\t\d{4}-\d{2}-\d{2}\tfixture\s*$/u)
+})
+
+test('git_log supports titles, limit, path, redaction and git_diff supports repo/directory/scope and truncation', async (t) => {
+  const { root, workspace } = await fixture(t)
+  const git = (...args: string[]) => execFileSync('git', args, { cwd: root, stdio: 'ignore', windowsHide: true })
+  git('init', '-q')
+  await mkdir(join(root, 'src'))
+  await mkdir(join(root, 'docs'))
+  await writeFile(join(root, 'src', 'a.ts'), 'export const a = 1\n')
+  await writeFile(join(root, 'docs', 'readme.md'), 'hello\n')
+  await writeFile(join(root, '.env'), 'SECRET=1\n')
+  git('add', '--', 'src/a.ts', 'docs/readme.md')
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'init files')
+  // Even if a forbidden file was previously tracked in the repo, git_diff must omit it.
+  git('add', '-f', '--', '.env')
+  git('-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'Bearer sk-probe-12345678901234567890')
+
+  await writeFile(join(root, 'src', 'a.ts'), 'export const a = 2\n')
+  await writeFile(join(root, 'docs', 'readme.md'), 'updated docs\n')
+  await writeFile(join(root, '.env'), 'SECRET=changed\n')
+
+  const diff = tool(workspace, 'git_diff')
+  const log = tool(workspace, 'git_log')
+
+  const repoDiff = await diff({}) as { ok: boolean; stdout: string; truncated: boolean }
+  assert.equal(repoDiff.ok, true)
+  assert.match(repoDiff.stdout, /src\/a\.ts/u)
+  assert.match(repoDiff.stdout, /docs\/readme\.md/u)
+  assert.doesNotMatch(repoDiff.stdout, /\.env|SECRET=changed/u)
+
+  const dirDiff = await diff({ path: 'src' }) as { ok: boolean; stdout: string }
+  assert.equal(dirDiff.ok, true)
+  assert.match(dirDiff.stdout, /\+export const a = 2/u)
+  assert.doesNotMatch(dirDiff.stdout, /readme\.md/u)
+
+  const scopedContext: ToolInvocationContext = { taskId: 't', agentRunId: 'r', scopePath: 'src', defer() {}, onCleanup() {} }
+  const scopedDiff = await diff({}, undefined, scopedContext) as { ok: boolean; stdout: string }
+  assert.equal(scopedDiff.ok, true)
+  assert.match(scopedDiff.stdout, /src\/a\.ts/u)
+  assert.doesNotMatch(scopedDiff.stdout, /readme\.md/u)
+  assert.equal((await diff({ path: 'docs/readme.md' }, undefined, scopedContext) as { ok: boolean }).ok, false)
+
+  const limitedLog = await log({ limit: 1 }) as { ok: boolean; stdout: string }
+  assert.equal(limitedLog.ok, true)
+  assert.equal(limitedLog.stdout.trim().split('\n').length, 1)
+  assert.match(limitedLog.stdout, /\[redacted\]/u)
+  assert.doesNotMatch(limitedLog.stdout, /sk-probe-/u)
+  const scopedLog = await log({ path: 'src' }) as { ok: boolean; stdout: string }
+  assert.equal(scopedLog.ok, true)
+  assert.match(scopedLog.stdout, /init files/u)
+
+  // Large diff emits truncation marker and retains tail.
+  await writeFile(join(root, 'src', 'a.ts'), Array.from({ length: 400 }, (_, i) => `line_${i}_${'x'.repeat(60)}`).join('\n') + '\n')
+  const bigDiff = await diff({ path: 'src' }) as { ok: boolean; stdout: string; truncated: boolean; note?: string }
+  assert.equal(bigDiff.ok, true)
+  assert.equal(bigDiff.truncated, true)
+  assert.match(bigDiff.stdout, /\[truncated /u)
+  assert.match(bigDiff.stdout, /line_399_/u)
+  assert.ok(bigDiff.note)
 })
 
 test('Git inspection ignores workspace executables and disables the repository fsmonitor hook', async (t) => {

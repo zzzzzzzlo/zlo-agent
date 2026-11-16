@@ -126,3 +126,91 @@ test('Brave provider uses its fixed HTTPS web endpoint and bounded source fields
     { title: 'Result', url: 'https://example.com/', snippet: 'Example', source: 'Brave Search' },
   ])
 })
+
+test('web_fetch handles Markdown, JSON and XML safely and web_search clarifies keyless fallback', async () => {
+  const client: WebClient = {
+    async get(input) {
+      const url = new URL(input)
+      if (url.hostname === 'hn.algolia.com') {
+        return { url, status: 200, contentType: 'application/json', body: Buffer.from(JSON.stringify({ hits: [] })) }
+      }
+      if (url.pathname === '/doc.md') {
+        return {
+          url, status: 200, contentType: 'text/markdown; charset=utf-8',
+          body: Buffer.from('# Guide Title\n\nParagraph 1\n\nAuthorization: Bearer secret-markdown-token\n\n```ts\nconst x = 1\n```\n'),
+        }
+      }
+      if (url.pathname === '/api.json') {
+        return {
+          url, status: 200, contentType: 'application/problem+json',
+          body: Buffer.from(JSON.stringify({ ok: true, api_key: 'should-be-redacted', items: [{ name: 'alpha' }] })),
+        }
+      }
+      if (url.pathname === '/bad.json') {
+        return { url, status: 200, contentType: 'application/json', body: Buffer.from('{not-json') }
+      }
+      if (url.pathname === '/feed.xml') {
+        return {
+          url, status: 200, contentType: 'application/xml',
+          body: Buffer.from('<?xml version="1.0"?><feed><entry>hello</entry><secret>token=abcd1234</secret></feed>'),
+        }
+      }
+      return { url, status: 200, contentType: 'application/octet-stream', body: Buffer.from([1, 2, 3]) }
+    },
+  }
+  const previousKey = process.env.ZLO_AGENT_BRAVE_SEARCH_API_KEY
+  delete process.env.ZLO_AGENT_BRAVE_SEARCH_API_KEY
+  try {
+    const tools = createWebTools({} as CodingWorkspace, { client })
+    const search = tools.find(tool => tool.name === 'web_search')!
+    const fetch = tools.find(tool => tool.name === 'web_fetch')!
+    assert.match(search.description, /Hacker News.*ZLO_AGENT_BRAVE_SEARCH_API_KEY/u)
+
+    const emptySearch = await search.execute('s1', { query: 'obscure query with zero hits' }) as {
+      ok: boolean; untrusted: boolean; results: unknown[]; provider?: string; notice?: string
+    }
+    assert.equal(emptySearch.ok, true)
+    assert.equal(emptySearch.untrusted, true)
+    assert.deepEqual(emptySearch.results, [])
+    assert.equal(emptySearch.provider, 'hacker_news')
+    assert.match(emptySearch.notice ?? '', /ZLO_AGENT_BRAVE_SEARCH_API_KEY/u)
+
+    const md = await fetch.execute('f-md', { url: 'https://example.com/doc.md' }) as {
+      ok: boolean; untrusted: boolean; title: string; text: string
+    }
+    assert.equal(md.ok, true)
+    assert.equal(md.untrusted, true)
+    assert.equal(md.title, 'Guide Title')
+    assert.match(md.text, /# Guide Title\n\nParagraph 1/u)
+    assert.match(md.text, /\[redacted\]/u)
+    assert.doesNotMatch(md.text, /secret-markdown-token/u)
+
+    const json = await fetch.execute('f-json', { url: 'https://example.com/api.json' }) as {
+      ok: boolean; untrusted: boolean; text: string
+    }
+    assert.equal(json.ok, true)
+    assert.equal(json.untrusted, true)
+    assert.deepEqual(JSON.parse(json.text), { ok: true, api_key: '[redacted]', items: [{ name: 'alpha' }] })
+
+    const badJson = await fetch.execute('f-bad-json', { url: 'https://example.com/bad.json' }) as { ok: boolean }
+    assert.equal(badJson.ok, false)
+
+    const xml = await fetch.execute('f-xml', { url: 'https://example.com/feed.xml' }) as {
+      ok: boolean; untrusted: boolean; text: string
+    }
+    assert.equal(xml.ok, true)
+    assert.match(xml.text, /<feed><entry>hello<\/entry>/u)
+    assert.doesNotMatch(xml.text, /abcd1234/u)
+
+    const bin = await fetch.execute('f-bin', { url: 'https://example.com/data.bin' }) as { ok: boolean }
+    assert.equal(bin.ok, false)
+
+    // Invalid inputs must not consume rate-limit quota.
+    for (let i = 0; i < 15; i++) {
+      assert.equal((await fetch.execute('invalid-' + i, { url: 'http://127.0.0.1/' }) as { ok: boolean }).ok, false)
+    }
+    assert.equal((await fetch.execute('still-allowed', { url: 'https://example.com/doc.md' }) as { ok: boolean }).ok, true)
+  } finally {
+    if (previousKey !== undefined) process.env.ZLO_AGENT_BRAVE_SEARCH_API_KEY = previousKey
+  }
+})

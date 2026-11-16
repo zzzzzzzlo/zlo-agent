@@ -30,7 +30,7 @@ export function createImageTool(workspace: CodingWorkspace): WorkspaceTool {
       path: { type: 'string', maxLength: 512 },
     } },
     async execute(_id, input, cancellation) {
-      const path = workspaceTarget(input)
+      const path = workspaceTarget(input, 'read')
       const mime = path && mimeTypes.get(extname(path).toLowerCase())
       if (!path || !mime) return { ok: false, error: 'Expected a workspace PNG, JPEG, WebP, GIF or SVG path.' }
       const deadline = AbortSignal.timeout(localBrowserTimeout)

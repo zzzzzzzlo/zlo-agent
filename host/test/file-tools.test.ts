@@ -207,3 +207,55 @@ test('P0-1: search and multi-file apply_patch support auth paths and allowlisted
     changed: ['src/auth/login.ts', 'auth.test.ts', '.gitignore', '.github/workflows/desktop-ci.yml', '.env.example'],
   })
 })
+
+test('search_content supports bounded contextLines, redacts context secrets, and caps oversized context responses', async context => {
+  const { root, run } = await fixture(context)
+  await mkdir(join(root, 'src'), { recursive: true })
+  await writeFile(join(root, 'src', 'sample.ts'), [
+    'const header = "ok"',
+    'Authorization: Bearer secret-in-before-context',
+    'const target = "needle"',
+    'const token = "sk-probe-secret-in-after-context-12345"',
+    'const footer = "done"',
+  ].join('\n'))
+
+  const withContext = await run('search_content', { query: 'needle', contextLines: 2 }) as {
+    ok: boolean
+    truncated: boolean
+    matches: { path: string; line: number; text: string; before?: { line: number; text: string }[]; after?: { line: number; text: string }[] }[]
+  }
+  assert.equal(withContext.ok, true)
+  assert.equal(withContext.truncated, false)
+  assert.deepEqual(withContext.matches, [{
+    path: 'src/sample.ts',
+    line: 3,
+    column: 17,
+    text: 'const target = "needle"',
+    before: [
+      { line: 1, text: 'const header = "ok"' },
+      { line: 2, text: 'Authorization: Bearer [redacted]' },
+    ],
+    after: [
+      { line: 4, text: 'const token = "[redacted]"' },
+      { line: 5, text: 'const footer = "done"' },
+    ],
+  }])
+
+  assert.deepEqual(await run('search_content', { query: 'needle', contextLines: 6 }), {
+    ok: false, error: 'Invalid content search',
+  })
+  assert.deepEqual(await run('search_content', { query: 'needle', contextLines: -1 }), {
+    ok: false, error: 'Invalid content search',
+  })
+
+  // Large match set with contextLines should cap cleanly instead of overflowing context.
+  const manyLines = Array.from({ length: 100 }, (_, i) => `const hit_${i} = "${'x'.repeat(240)}"`).join('\n')
+  await writeFile(join(root, 'src', 'bulk.ts'), manyLines)
+  const bounded = await run('search_content', { path: 'src', glob: 'bulk.ts', query: 'hit_', contextLines: 5 }) as {
+    ok: boolean; truncated: boolean; matches: unknown[]
+  }
+  assert.equal(bounded.ok, true)
+  assert.equal(bounded.truncated, true)
+  assert.ok(bounded.matches.length >= 1 && bounded.matches.length < 100)
+  assert.ok(Buffer.byteLength(JSON.stringify(bounded.matches)) <= 50 * 1024)
+})

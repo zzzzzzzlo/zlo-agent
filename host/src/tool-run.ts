@@ -273,18 +273,66 @@ export class ToolRun {
     const archive = this.#archive
     if (!archive) return
     this.#evidenceReplayAvailable = true
+    const defaultReplayPageChars = 16_000
+    const maxReplayPageChars = 32_000
+    const maxEvidenceChars = 512_000
     return {
       name: 'read_tool_evidence',
-      description: 'Read retained, redacted output for an evidenceId from one of your current run’s authorized tools. Quarantined content stays withheld.',
+      description: 'Read retained, redacted output for an evidenceId from one of your current run’s authorized tools. Pass optional offset and maxChars to paginate large evidence. Quarantined content stays withheld.',
       parameters: { type: 'object', additionalProperties: false, required: ['evidenceId'],
-        properties: { evidenceId: { type: 'string', minLength: 36, maxLength: 36 } } },
+        properties: {
+          evidenceId: { type: 'string', minLength: 36, maxLength: 36 },
+          offset: { type: 'integer', minimum: 0, maximum: maxEvidenceChars },
+          maxChars: { type: 'integer', minimum: 256, maximum: maxReplayPageChars },
+        } },
       execute: async (_id, input, toolSignal) => {
-        if (this.#closed || signal.aborted || toolSignal?.aborted || !input || typeof input !== 'object' ||
+        if (this.#closed || signal.aborted || toolSignal?.aborted || !input || typeof input !== 'object' || Array.isArray(input) ||
           !('evidenceId' in input) || typeof input.evidenceId !== 'string') return unavailable
+        if (Object.keys(input).some(key => key !== 'evidenceId' && key !== 'offset' && key !== 'maxChars')) {
+          return { ok: false, error: 'Invalid evidence replay arguments' }
+        }
+        const rawOffset = 'offset' in input ? input.offset : undefined
+        const rawMaxChars = 'maxChars' in input ? input.maxChars : undefined
+        if (rawOffset !== undefined && (typeof rawOffset !== 'number' || !Number.isSafeInteger(rawOffset) || rawOffset < 0 || rawOffset > maxEvidenceChars)) {
+          return { ok: false, error: 'Invalid evidence replay arguments' }
+        }
+        if (rawMaxChars !== undefined && (typeof rawMaxChars !== 'number' || !Number.isSafeInteger(rawMaxChars) || rawMaxChars < 256 || rawMaxChars > maxReplayPageChars)) {
+          return { ok: false, error: 'Invalid evidence replay arguments' }
+        }
         const authorized = this.#evidenceAccess.get(input.evidenceId)
         if (!authorized) return unavailable
         try {
-          return archive.replay(event(), input.evidenceId, tool => sourceAllowed(tool) && authorized()) ?? unavailable
+          const replayed = archive.replay(event(), input.evidenceId, tool => sourceAllowed(tool) && authorized())
+          if (!replayed) return unavailable
+          const serialized = JSON.stringify(replayed) ?? 'null'
+          if (rawOffset === undefined && rawMaxChars === undefined && serialized.length <= defaultReplayPageChars) {
+            return replayed
+          }
+          const start = rawOffset ?? 0
+          const limit = rawMaxChars ?? defaultReplayPageChars
+          if (start > serialized.length) {
+            return { ok: false, error: 'Offset is past the end of the archived evidence', totalLength: serialized.length }
+          }
+          let end = Math.min(serialized.length, start + limit)
+          if (end < serialized.length && end > start) {
+            const code = serialized.charCodeAt(end - 1)
+            if (code >= 0xd800 && code <= 0xdbff) end--
+          }
+          const content = serialized.slice(start, end)
+          const hasMore = end < serialized.length
+          const truncated = start > 0 || hasMore
+          return {
+            ok: true,
+            ...(replayed.untrusted === true ? { untrusted: true } : {}),
+            evidenceId: input.evidenceId,
+            offset: start,
+            length: content.length,
+            totalLength: serialized.length,
+            truncated,
+            hasMore,
+            ...(hasMore ? { nextOffset: end, note: 'Evidence output paginated; pass offset: nextOffset to read the remaining content.' } : {}),
+            content,
+          }
         } catch { return unavailable }
       },
     }

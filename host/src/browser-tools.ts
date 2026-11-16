@@ -33,6 +33,7 @@ interface PublicPage {
   kind: 'public'
   origin: string
   navigation?: string
+  strippedScripts: number
 }
 
 interface WorkspacePage {
@@ -53,8 +54,9 @@ interface BrowserRun {
   busy: boolean
 }
 
-function staticMarkup(html: string): string {
+function staticMarkup(html: string): { html: string; strippedScripts: number } {
   const document = parse(html)
+  let strippedScripts = 0
   type Container = typeof document | (typeof document.childNodes)[number]
   const parents: Container[] = [document]
   while (parents.length) {
@@ -64,11 +66,12 @@ function staticMarkup(html: string): string {
       const node = parent.childNodes[i]
       if ('tagName' in node && (['script', 'base', 'iframe', 'frame', 'object', 'embed'].includes(node.tagName) ||
         node.tagName === 'meta' && node.attrs.some(attr => attr.name === 'http-equiv'))) {
+        if (node.tagName === 'script') strippedScripts++
         parent.childNodes.splice(i, 1)
       } else if ('childNodes' in node) parents.push(node)
     }
   }
-  return serialize(document)
+  return { html: serialize(document), strippedScripts }
 }
 
 function owner(context?: ToolInvocationContext): string | undefined {
@@ -131,7 +134,7 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
       let requests = 0
       let bytes = 0
       let activeRequests = 0
-      const source: PublicPage = { kind: 'public', origin: url.origin, navigation: url.href }
+      const source: PublicPage = { kind: 'public', origin: url.origin, navigation: url.href, strippedScripts: 0 }
       let page: Page | undefined
       await browserContext.routeWebSocket(/./u, socket => socket.close())
       await browserContext.route(/./u, async route => {
@@ -164,12 +167,16 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
           bytes += reply.body.byteLength
           if (bytes > maxTotalBytes) { await route.abort(); return }
           const mime = reply.contentType.toLowerCase().split(';')[0].trim()
-          if ((navigation && !['text/html', 'text/plain'].includes(mime)) || (!navigation && !allowedAssets.has(mime))) {
+          if ((navigation && !['text/html', 'application/xhtml+xml', 'text/plain'].includes(mime)) || (!navigation && !allowedAssets.has(mime))) {
             await route.abort()
             return
           }
-          const body = navigation && mime === 'text/html'
-            ? Buffer.from(staticMarkup(reply.body.toString('utf8')), 'utf8') : reply.body
+          let body = reply.body
+          if (navigation && (mime === 'text/html' || mime === 'application/xhtml+xml')) {
+            const sanitized = staticMarkup(reply.body.toString('utf8'))
+            source.strippedScripts += sanitized.strippedScripts
+            body = Buffer.from(sanitized.html, 'utf8')
+          }
           await route.fulfill({ status: 200, body, headers: {
             'content-type': navigation ? mime + '; charset=utf-8' : mime,
             'content-security-policy': csp,
@@ -198,8 +205,15 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
     const args = object(input)
     const key = owner(context)
     const active = key && runs.get(key)
-    if (!key || !active || !args || args.browserId !== active.id || active.closing || active.busy || signal?.aborted) {
+    if (!key || !active || !args || active.closing || active.busy || signal?.aborted) {
       return error('Browser session is unavailable for this Agent run')
+    }
+    if (args.browserId !== active.id) {
+      return {
+        ok: false,
+        error: 'Browser session is unavailable for this Agent run; active session ID differs. Close or reuse activeBrowserId.',
+        activeBrowserId: active.id,
+      }
     }
     const cancel = () => { void close(key, active).catch(() => {}) }
     active.busy = true
@@ -236,7 +250,18 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
         const args = object(input)
         const key = owner(context)
         if (!key || !context || !args || cancellation?.aborted) return error('Browser input or Agent run is unavailable')
-        if (opening.has(key) || runs.has(key)) return error('Close the current browser session before opening another page')
+        if (opening.has(key)) {
+          return error('A browser session is currently opening for this Agent run; wait before opening another page')
+        }
+        const existing = runs.get(key)
+        if (existing) {
+          if (existing.closing) return error('The previous browser session is still closing; retry momentarily')
+          return {
+            ok: false,
+            error: 'Close the current browser session with browser_close using activeBrowserId before opening another page',
+            activeBrowserId: existing.id,
+          }
+        }
         const deadline = AbortSignal.timeout(localBrowserTimeout)
         const signal = cancellation ? AbortSignal.any([cancellation, deadline]) : deadline
         const local = args.url === undefined ? localPageInput(input) : undefined
@@ -265,7 +290,13 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
             await close(key, active)
             throw cause
           }
-          return { ok: true, browserId: active.id, ...pageLocation(active), mode: active.source.kind }
+          return {
+            ok: true,
+            browserId: active.id,
+            ...pageLocation(active),
+            mode: active.source.kind,
+            ...(active.source.kind === 'public' ? { javascriptEnabled: false } : {}),
+          }
         } catch {
           return error(signal.aborted ? 'Browser launch interrupted or timed out' : 'Could not open the page with the selected resources')
         } finally { opening.delete(key) }
@@ -311,9 +342,14 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
           return { title: document.title.slice(0, 512), text: (document.body?.innerText ?? '').slice(0, 14_000), elements }
         })
         pageLocation(active)
+        const text = cleanWebText(result.text, 12_000)
+        const publicNotice = source.kind === 'public' && (source.strippedScripts > 0 || text.length < 80)
+          ? 'Public pages load statically with JavaScript disabled for isolation; dynamic SPA or script-rendered content will not execute. Use web_fetch for JSON/Markdown/API endpoints if needed.'
+          : undefined
         return { ok: true, untrusted: true, ...location,
-          ...(source.kind === 'workspace' ? source.diagnostics() : {}),
-          title: cleanWebText(result.title, 256), text: cleanWebText(result.text, 12_000),
+          ...(source.kind === 'workspace' ? source.diagnostics() : { javascriptEnabled: false }),
+          ...(publicNotice ? { notice: publicNotice } : {}),
+          title: cleanWebText(result.title, 256), text,
           elements: result.elements.filter(item => !sensitiveWebInput(item.selector))
             .map(item => ({ ...item, label: cleanWebText(item.label, 256) })) }
       }),
