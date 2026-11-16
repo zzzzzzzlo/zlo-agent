@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { execFileSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
@@ -409,6 +410,15 @@ test('delegated subagents inherit read/git/command tools automatically, honor di
     scripts: { test: 'node verify.cjs' },
   }))
   await writeFile(join(cwd, 'ui', 'verify.cjs'), 'process.exit(0)\n')
+  await writeFile(join(cwd, 'src', 'outside.txt'), 'initial outside\n')
+  const gitOpts = { cwd, encoding: 'utf8' as const, stdio: ['ignore', 'pipe', 'pipe'] as ['ignore', 'pipe', 'pipe'], windowsHide: true }
+  execFileSync('git', ['init', '-b', 'main'], gitOpts)
+  execFileSync('git', ['config', 'user.email', 'test@example.invalid'], gitOpts)
+  execFileSync('git', ['config', 'user.name', 'Zlo test'], gitOpts)
+  execFileSync('git', ['add', '--', 'ui/package.json', 'ui/verify.cjs', 'src/outside.txt'], gitOpts)
+  execFileSync('git', ['commit', '-m', 'initial scoped repo'], gitOpts)
+  await writeFile(join(cwd, 'ui', 'verify.cjs'), 'process.exit(0) // ui dirty\n')
+  await writeFile(join(cwd, 'src', 'outside.txt'), 'dirty outside\n')
 
   let inspectedTools: string[] = []
   let teamTools: string[] = []
@@ -449,7 +459,16 @@ test('delegated subagents inherit read/git/command tools automatically, honor di
     }
     teamTools = config.tools.map(({ name }) => name).sort()
     assert.ok((await call('run_project_command', { command: 'npm_test', path: 'ui' })).ok)
-    return 'Scoped team ran npm_test without explicit tools list'
+    const scopedStatus = await call('git_status', {}) as { ok: boolean; entries?: { path: string }[] }
+    assert.equal(scopedStatus.ok, true)
+    assert.deepEqual(scopedStatus.entries?.map(item => item.path), ['ui/verify.cjs'])
+    const scopedDiff = await call('git_diff', {}) as { ok: boolean; stdout?: string }
+    assert.equal(scopedDiff.ok, true)
+    assert.match(scopedDiff.stdout ?? '', /ui\/verify\.cjs/)
+    assert.doesNotMatch(scopedDiff.stdout ?? '', /outside\.txt/)
+    assert.equal((await call('git_diff', { path: 'src' })).ok, false)
+    assert.ok((await call('git_log', {})).ok)
+    return 'Scoped team ran npm_test and pathless scoped git inspection without explicit tools list'
   })
 
   const approvals: string[] = []

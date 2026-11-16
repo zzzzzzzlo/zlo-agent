@@ -171,6 +171,7 @@ export class CodingCapabilities {
       const minimum = tool.policy?.minimumAccessFor?.(input) ?? 'read'
       if (accessRank[scope.access] < accessRank[minimum] || (effect === 'write' && scope.access === 'read')) return false
       if (scope.path === undefined) return true
+      if (scopedGitInspectionWithoutPath(tool, input)) return true
       const targets = tool.policy?.targets ? tool.policy.targets(input) : [workspaceTarget(input, effect)]
       return targets.every(value => {
         const target = workspaceTarget({ path: value }, effect)
@@ -180,6 +181,13 @@ export class CodingCapabilities {
       return false
     }
   }
+}
+
+function scopedGitInspectionWithoutPath(tool: WorkspaceTool, input: unknown): boolean {
+  if (tool.policy?.targets) return false
+  if (tool.name === 'git_status') return true
+  if (tool.name !== 'git_log' && tool.name !== 'git_diff') return false
+  return !input || typeof input !== 'object' || !('path' in input) || (input as { path?: unknown }).path === undefined
 }
 
 function within(scope: string | undefined, target: string): boolean {

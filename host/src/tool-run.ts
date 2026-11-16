@@ -256,7 +256,7 @@ export class ToolRun {
           if (target && (tool.name === 'read_text_file' || tool.name === 'view_image' || effect === 'write')) artifacts?.add(target)
         }
         const safeResult = redactResult(result)
-        if (!this.#archive || !this.#judgment || !successful || deferred || effect !== 'read') return safeResult
+        if (!this.#archive || !this.#judgment || deferred || (effect !== 'read' && tool.name !== 'run_project_command')) return safeResult
         const judged = await judgeToolResult(this.#judgment, this.#archive, ref, operationId, tool.name, goal, safeResult, combined,
           this.#evidenceReplayAvailable)
         if (this.#closed || combined.aborted || !authorize(input)) return unavailable

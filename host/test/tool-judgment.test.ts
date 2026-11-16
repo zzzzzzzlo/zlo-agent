@@ -83,7 +83,7 @@ test('Active admission checks external/search outputs in full non-sampled batche
     assert.equal((await replay.execute('disabled', input) as { ok: boolean }).ok, false)
     const frames = Array.from({ length: 4 }, (_, index) =>
       ({ cursor: index + 1, stream: 'stdout', text: 'local-output:' + String(index).repeat(600) }))
-    const processOriginal = { ok: true, frames, cursor: frames.length, hasMore: false }
+    const processOriginal = { ok: true, untrusted: true, frames, cursor: frames.length, hasMore: false }
     const processOutput = await wrap('process_output', processOriginal).execute('local-process', {})
     assert.deepEqual(processOutput, processOriginal)
     const visual = await wrap('browser_screenshot', { ok: true, [toolImages]: images }).execute('visual', {}) as { [toolImages]: ToolImage[] }
@@ -123,8 +123,8 @@ test('Exhaustive chunked tool.injection and files.locate inspect beyond 8 items 
     const run = new ToolRun(tasks, new ToolApprovalBroker(), judgment, archive)
     const stop = new AbortController()
     const workspace = new CodingWorkspace(process.cwd())
-    const wrap = (name: string, result: unknown) =>
-      run.wrap({ name, effect: 'read', description: '', parameters: {}, execute: async () => result },
+    const wrap = (name: string, result: unknown, effect: 'read' | 'write' = 'read') =>
+      run.wrap({ name, effect, description: '', parameters: {}, execute: async () => result },
         workspace, () => event, stop.signal, () => true, undefined, undefined, task.goal)
 
     const manyPaths = Array.from({ length: 12 }, (_, index) => `src/dir-${index}/target-${index}.ts`)
@@ -141,6 +141,7 @@ test('Exhaustive chunked tool.injection and files.locate inspect beyond 8 items 
 
     const proc = await wrap('process_output', {
       ok: true,
+      untrusted: true,
       frames: [
         { cursor: 1, stream: 'stdout', text: 'normal stdout line' },
         { cursor: 2, stream: 'stderr', text: 'late-canary in process stream' },
@@ -148,6 +149,14 @@ test('Exhaustive chunked tool.injection and files.locate inspect beyond 8 items 
     }).execute('proc-inject', {}) as { frames: { text: string }[] }
     assert.equal(proc.frames[0]!.text, 'normal stdout line')
     assert.match(proc.frames[1]!.text, /Potential instructions from external content withheld/u)
+
+    const cmd = await wrap('run_project_command', {
+      ok: false,
+      stdout: 'test run started\n',
+      stderr: 'late-canary in command stderr',
+    }, 'write').execute('cmd-inject', {}) as { stdout: string; stderr: string }
+    assert.equal(cmd.stdout, 'test run started\n')
+    assert.match(cmd.stderr, /Potential instructions from external content withheld/u)
     await run.close()
   } finally { store.close() }
 })
