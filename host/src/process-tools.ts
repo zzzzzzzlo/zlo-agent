@@ -11,7 +11,7 @@ import { containsPath, processEnvironment, redactProcessOutput } from './workspa
 const windows = process.platform === 'win32'
 const defaultTimeout = 90_000
 const maxTimeout = 10 * 60_000
-const stopDeadline = 3_000
+const stopDeadline = 8_000
 const maxCaptureBytes = 64 * 1024
 const maxLineBytes = 4_096
 const maxFrames = 256
@@ -201,7 +201,7 @@ async function stopTree(child: ChildProcess, workspace: string, isPipeClosed: ()
     const timer = setTimeout(() => {
       if (alive(killer)) killer.kill()
       finish('failed')
-    }, stopDeadline - 250)
+    }, Math.min(2_500, stopDeadline - 250))
     killer.once('error', () => finish('failed'))
     killer.once('close', code => {
       if (code === 0) finish('killed')

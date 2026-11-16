@@ -200,7 +200,7 @@ test('P1-3: process_stop terminates inherited-pipe descendants even after the to
     "const { writeFileSync } = require('node:fs')",
     "const { join } = require('node:path')",
     "writeFileSync(join(__dirname, 'bg-ready.flag'), '')",
-    "setTimeout(() => writeFileSync(join(__dirname, 'bg-escaped.txt'), 'ran'), 4000)",
+    "setTimeout(() => writeFileSync(join(__dirname, 'bg-escaped.txt'), 'ran'), 8500)",
   ].join('\n'))
   const launched = windows
     ? await invoke('shell_exec', { shell: 'cmd', command: `start /b "" "${process.execPath}" "${script}" & exit /b 0` })
@@ -213,6 +213,6 @@ test('P1-3: process_stop terminates inherited-pipe descendants even after the to
   const stopped = await invoke('process_stop', { processId: launched.processId })
   assert.equal(stopped.state, 'stopped')
   assert.equal(await operations[0]!.completion, 'unknown_effect')
-  await delay(4_200)
+  await delay(8_700)
   await assert.rejects(access(join(root, 'bg-escaped.txt')), { code: 'ENOENT' })
 })
