@@ -4,6 +4,7 @@ import { basename, dirname, join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import type { AgentEvent, EventDraft, TaskStatus, VerificationResult, VerificationVerdict } from './contracts/domain.ts';
 import { verificationVerdict } from './contracts/domain.ts';
+import { isCompletionFollowUp } from '../../shared/contracts/observatory.ts';
 
 export type { AgentEvent, EventDraft } from './contracts/domain.ts';
 
@@ -224,7 +225,7 @@ export class LocalStore {
       FROM records r
       JOIN events e ON e.task_id = json_extract(r.value, '$.taskId')
       WHERE r.namespace = ?
-        AND json_extract(e.event, '$.type') IN ('judgment.evaluated', 'tool.evidence_replayed')
+        AND json_extract(e.event, '$.type') IN ('judgment.evaluated', 'tool.evidence_replayed', 'turn.followup_triggered')
       ORDER BY r.id, e.seq
     `).all(namespace) as { taskId: string; eventJson: string }[];
     const judgments = summarizeConversationJudgments(judgmentRows);
@@ -598,20 +599,23 @@ const coreJudgmentOrder = ['tool.injection', 'turn.completion', 'swarm.patch', '
 
 function summarizeConversationJudgments(rows: readonly { taskId: string; eventJson: string }[]) {
   const replayedTasks = new Set<string>();
-  const parsedRows: { taskId: string; payload: Record<string, unknown> }[] = [];
+  const followUpTriggers = new Map<string, AgentEvent>();
+  const parsedRows: AgentEvent[] = [];
   for (const row of rows) {
-    const parsed = JSON.parse(row.eventJson) as { type?: string; payload?: Record<string, unknown> };
+    const parsed = JSON.parse(row.eventJson) as AgentEvent;
     if (parsed.type === 'tool.evidence_replayed') {
       replayedTasks.add(row.taskId);
+    } else if (parsed.type === 'turn.followup_triggered' && parsed.correlationId) {
+      followUpTriggers.set(parsed.correlationId, parsed);
     } else if (parsed.type === 'judgment.evaluated' && parsed.payload) {
-      parsedRows.push({ taskId: row.taskId, payload: parsed.payload });
+      parsedRows.push(parsed);
     }
   }
   const byTask = new Map<string, { calls: number; interventions: number }>();
   const pointMap = new Map<string, { point: string; total: number; activeInterventions: number; shadowDisagreements: number; fallbacks: number }>();
   const recent: {
     taskId: string; point: string; mode: 'off' | 'shadow' | 'active';
-    impactKind: 'intervened' | 'shadow_diff' | 'fallback' | 'aligned' | 'baseline_only';
+    impactKind: 'intervened' | 'shadow_diff' | 'fallback' | 'aligned' | 'baseline_only' | 'unconfirmed';
     whatSummary: string; verdictSummary: string; impactSummary: string;
     judgeModel?: string; elapsedMs?: number; fallbackReason?: string;
   }[] = [];
@@ -619,7 +623,8 @@ function summarizeConversationJudgments(rows: readonly { taskId: string; eventJs
   let injectionBlocks = 0, completionFollowUps = 0, admissionOmissions = 0, patchFlags = 0, memoryFiltered = 0;
   let estimatedCostUsd: number | null = null;
 
-  for (const { taskId, payload } of parsedRows) {
+  for (const decision of parsedRows) {
+    const { taskId, correlationId, payload } = decision;
     const mode = payload.mode === 'active' || payload.mode === 'shadow' ? payload.mode : 'off';
     if (mode === 'off') continue;
     const point = typeof payload.id === 'string' ? payload.id : 'unknown';
@@ -647,8 +652,10 @@ function summarizeConversationJudgments(rows: readonly { taskId: string; eventJs
     }
 
     const isFallback = judgeStatus !== undefined && judgeStatus !== 'baseline' && judgeStatus !== 'valid' && fallbackReason !== 'no_choice';
+    const completionTriggered = isCompletionFollowUp(decision, correlationId ? followUpTriggers.get(correlationId) : undefined);
     const impactKind = isFallback ? 'fallback'
-      : mode === 'active' && disagree ? 'intervened'
+      : point === 'turn.completion' && mode === 'active' && payload.output === true ? (completionTriggered ? 'intervened' : 'unconfirmed')
+        : mode === 'active' && disagree ? 'intervened'
         : mode === 'shadow' && disagree ? 'shadow_diff' : 'aligned';
     if (impactKind === 'intervened') activeInterventions++;
     if (impactKind === 'shadow_diff' || (mode === 'shadow' && disagree)) shadowDisagreements++;
@@ -697,8 +704,9 @@ function summarizeConversationJudgments(rows: readonly { taskId: string; eventJs
       whatSummary = `审查 ${role} 交付完整度 (写入 ${writes} 次)`;
       const out = payload.output === true;
       verdictSummary = `基线=${payload.baseline === true ? '不足' : '放行'} → 实际=${out ? '补充验证' : '放行'}`;
-      if (mode === 'active' && out) completionFollowUps++;
-      impactSummary = mode === 'active' && out ? '拦截过早收尾，触发补充自检轮次'
+      if (completionTriggered) completionFollowUps++;
+      impactSummary = completionTriggered ? '拦截过早收尾，触发补充自检轮次'
+        : impactKind === 'unconfirmed' ? '建议补充自检，未记录到由此判定触发的续跑'
         : impactKind === 'shadow_diff' ? 'Shadow 建议补充检查（未拦截）'
           : isFallback ? `回退基线放行 (${fallbackReason ?? judgeStatus})` : '允许回合正常收尾';
     } else if (point === 'swarm.patch') {

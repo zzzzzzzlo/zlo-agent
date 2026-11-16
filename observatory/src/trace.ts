@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import type { ModelRoute } from '../../shared/contracts/domain.ts'
 import { coreJudgmentPoints } from '../../shared/contracts/jev.ts'
+import { isCompletionFollowUp } from '../../shared/contracts/observatory.ts'
 import type { TelemetryEvent, TelemetryNode, TelemetryTask } from '../../shared/contracts/observatory.ts'
 
 export interface TraceSpan {
@@ -324,7 +325,7 @@ export interface JudgmentCausalDetail {
   linkedEventIds: string[]
   whatSummary: string
   verdictSummary: string
-  impactKind: 'intervened' | 'shadow_diff' | 'fallback' | 'aligned' | 'baseline_only'
+  impactKind: 'intervened' | 'shadow_diff' | 'fallback' | 'aligned' | 'baseline_only' | 'unconfirmed'
   impactSummary: string
 }
 
@@ -345,10 +346,12 @@ function judgmentLinks(task: TelemetryTask, events: TelemetryEvent[]) {
   const replays = new Map<string, TelemetryEvent[]>()
   const settlements = new Map<string, TelemetryEvent>()
   const related = new Map<string, TelemetryEvent[]>()
+  const followUps = new Map<string, TelemetryEvent>()
   const verifications: TelemetryEvent[] = []
   const stateChanges: TelemetryEvent[] = []
   for (const event of events) {
     if (event.type === 'task.plan_changed' && event.correlationId) plans.set(event.correlationId, event)
+    if (event.type === 'turn.followup_triggered' && event.correlationId) followUps.set(event.correlationId, event)
     if (event.type === 'tool.finished' && typeof event.payload.id === 'string') {
       receipts.set(receiptDigest(event.payload.id), event)
     }
@@ -384,11 +387,12 @@ function judgmentLinks(task: TelemetryTask, events: TelemetryEvent[]) {
       candidates.push(settlements.get(`${node}:${attempt}`))
     }
     if (point === 'turn.completion' && node === task.rootNodeId) {
-      if (agent && event.payload.mode === 'active' && event.payload.output === true) {
-        candidates.push((related.get(`${agent}:model.reserved`) ?? []).find(candidate => candidate.seq > event.seq))
-      }
       candidates.push(verifications.find(candidate => candidate.seq > event.seq && (!attempt || candidate.taskAttemptId === attempt)))
       candidates.push(stateChanges.find(candidate => candidate.seq > event.seq && (!attempt || candidate.taskAttemptId === attempt)))
+    }
+    if (point === 'turn.completion' && event.correlationId) {
+      const followUp = followUps.get(event.correlationId)
+      if (isCompletionFollowUp(event, followUp)) candidates.push(followUp)
     }
     if (agent && point === 'memory.capture') {
       candidates.push((related.get(`${agent}:memory.captured`) ?? []).find(candidate => candidate.seq > event.seq))
@@ -492,8 +496,14 @@ function judgmentCausalDetails(events: TelemetryEvent[], links: ReturnType<typeo
       const base = payload.baseline === true
       const judge = payload.judgeOutput === true || payload.shadow === true
       verdictSummary = `基线=${base ? '不足' : '放行'} → 实际=${out ? '要求补做' : '放行'}${payload.judgeOutput !== undefined || payload.shadow !== undefined ? ` (Jev=${judge ? '不足' : '放行'})` : ''}`
-      const followUpTriggered = linked.some(item => item.type === 'model.reserved')
-      if (mode === 'active' && out) impactSummary = followUpTriggered ? '判定未收尾，已拦截结束并触发补充自检轮次' : '判定未收尾，已拒绝不足交付'
+      const followUpTriggered = linked.some(item => item.type === 'turn.followup_triggered')
+      if (followUpTriggered) {
+        impactKind = 'intervened'
+        impactSummary = '判定未收尾，已拦截结束并触发补充自检轮次'
+      } else if (mode === 'active' && out && impactKind !== 'fallback') {
+        impactKind = 'unconfirmed'
+        impactSummary = '建议补充自检，未记录到由此判定触发的续跑'
+      }
       else if (impactKind === 'shadow_diff') impactSummary = 'Shadow 认为证据尚不充分（仅记录未拦截）'
       else if (impactKind === 'fallback') impactSummary = `回退规则基线放行（原因: ${fallbackReason ?? judgeStatus}）`
       else impactSummary = '允许当前回合正常收尾'

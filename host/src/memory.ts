@@ -4,6 +4,7 @@ import { join, resolve } from 'node:path'
 import type { EventDraft } from './contracts/domain.ts'
 import type { LocalJudgment } from './judgment.ts'
 import type { LocalStore } from './store.ts'
+import { withinScopePath, workspaceTarget } from './workspace-path.ts'
 
 type MemoryKind = 'fact' | 'experience'
 
@@ -47,7 +48,6 @@ const maxEntryPaths = 24
 const batchLimit = 8
 const batchConcurrency = 4
 const referencePattern = /^[a-zA-Z0-9_.:-]{1,128}$/
-const relativePathPattern = /^[a-zA-Z0-9_.:/-]{1,256}$/u
 const sensitiveText = /(?:\b(?:api[-_ ]?key|password|authorization|credential|access[-_ ]?token)\s*[:=]|\bbearer\s+\S+|\b(?:oc_sk_|sk[-_]|github_pat_|gh[pousr]_|xox[baprs]-)[a-z\d_-]{10,}|\b(?:AIza[\w-]{28,}|AKIA[A-Z\d]{16})\b|\beyJ[\w-]{8,}\.[\w-]{8,}\.[\w-]{8,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)/iu
 
 function hash(...fields: string[]): string {
@@ -82,24 +82,20 @@ function clipUtf8(text: string, maxBytes: number): string {
   return out + suffix
 }
 
-function sanitizePaths(paths: readonly string[] | undefined): string[] | undefined {
-  if (paths === undefined) return undefined
-  if (!Array.isArray(paths)) return []
-  const out: string[] = []
-  const seen = new Set<string>()
-  for (const item of paths) {
-    if (typeof item !== 'string') continue
-    const normalized = item.replaceAll('\\', '/').trim()
-    if (!normalized || !relativePathPattern.test(normalized) || normalized.startsWith('/') ||
-      normalized.split('/').some(segment => !segment || segment === '.' || segment === '..') ||
-      sensitiveText.test(normalized)) continue
-    if (!seen.has(normalized)) {
-      seen.add(normalized)
-      out.push(normalized)
-      if (out.length >= maxEntryPaths) break
-    }
+export function memoryEntryInScope(entry: MemoryCandidate, scopePath?: string): boolean {
+  if (scopePath === undefined) return true
+  const contains = (path: string) => {
+    const target = workspaceTarget({ path }, 'read')
+    return target !== undefined && withinScopePath(scopePath, target)
   }
-  return out
+  if (entry.paths?.length) return entry.paths.every(contains)
+  // Only the old Host-generated operation format has a recoverable path.
+  if (entry.kind !== 'fact') return false
+  const match = /^Confirmed workspace operation (\S+) on (.+)$/u.exec(entry.text)
+  if (!match) return false
+  const [, tool, target] = match
+  const expectedKey = 'op:' + tool + ':' + createHash('sha256').update(target).digest('hex').slice(0, 24)
+  return entry.key === expectedKey && contains(target)
 }
 
 function normalizedCandidate(candidate: MemoryCandidate): MemoryCandidate | undefined {
@@ -123,15 +119,19 @@ function normalizedCandidate(candidate: MemoryCandidate): MemoryCandidate | unde
       title = clipUtf8(cleanTitle, maxTitleBytes)
     }
   }
-  if (candidate.paths !== undefined && !Array.isArray(candidate.paths)) return undefined
-  const paths = sanitizePaths(candidate.paths)
-  if (candidate.paths?.some(item => typeof item === 'string' && sensitiveText.test(item))) return undefined
+  if (candidate.paths !== undefined && (!Array.isArray(candidate.paths) || candidate.paths.length > maxEntryPaths)) return undefined
+  const paths = new Set<string>()
+  for (const path of candidate.paths ?? []) {
+    const target = workspaceTarget({ path }, 'read')
+    if (!target || sensitiveText.test(target)) return undefined
+    paths.add(target)
+  }
   return {
     kind: candidate.kind,
     text,
     sourceRefs,
     ...(candidate.key ? { key: candidate.key } : {}),
-    ...(paths?.length ? { paths } : {}),
+    ...(paths.size ? { paths: [...paths] } : {}),
     ...(candidate.durable === true ? { durable: true } : {}),
     ...(title ? { title } : {}),
   }
@@ -320,9 +320,9 @@ export class LocalMemory {
   }
 
   async captureReviewed(event: EventDraft, scope: string, entries: readonly MemoryCandidate[], goal: string,
-    judgment: LocalJudgment, signal: AbortSignal): Promise<void> {
+    judgment: LocalJudgment, signal: AbortSignal, scopePath?: string): Promise<void> {
     const eligible = entries.map(normalizedCandidate)
-      .filter((candidate): candidate is MemoryCandidate => candidate !== undefined)
+      .filter((candidate): candidate is MemoryCandidate => candidate !== undefined && memoryEntryInScope(candidate, scopePath))
     if (!eligible.length || signal.aborted) return
     const factCount = eligible.filter(entry => entry.kind === 'fact').length
     const experienceCount = eligible.filter(entry => entry.kind === 'experience').length
@@ -337,16 +337,16 @@ export class LocalMemory {
       batch.flatMap(entry => entry.sourceRefs), { signal }))
     if (signal.aborted) return
     const retained = batches.flatMap((batch, batchIndex) => batch.filter((_, itemIndex) => verdicts[batchIndex]?.[itemIndex]))
-    this.capture(event, scope, retained.filter(entry => entry.kind === 'fact'))
+    this.capture(event, scope, retained.filter(entry => entry.kind === 'fact'), scopePath)
     const experiences = retained.filter(entry => entry.kind === 'experience')
-    if (experiences.length) this.capture(event, scope, experiences)
+    if (experiences.length) this.capture(event, scope, experiences, scopePath)
   }
 
-  capture(event: EventDraft, scope: string, entries: readonly MemoryCandidate[]): void {
+  capture(event: EventDraft, scope: string, entries: readonly MemoryCandidate[], scopePath?: string): void {
     const start = performance.now()
     const scopeKey = scopeId(scope)
     const candidates = entries.map(normalizedCandidate)
-      .filter((candidate): candidate is MemoryCandidate => candidate !== undefined)
+      .filter((candidate): candidate is MemoryCandidate => candidate !== undefined && memoryEntryInScope(candidate, scopePath))
     if (!candidates.length) return
     let writtenRecords: StoredMemoryEntry[] | undefined
     this.#store.transaction(() => {
@@ -356,6 +356,7 @@ export class LocalMemory {
         const id = hash(scopeKey, candidate.kind, candidate.key ? 'key:' + candidate.key : 'text:' + candidate.text)
         const index = records.findIndex((entry) => entry.id === id)
         const previous = records[index]
+        if (previous && !memoryEntryInScope(previous, scopePath)) continue
         const newSources = candidate.sourceRefs.filter((ref) => !previous?.seenSources.includes(ref))
         if (!newSources.length) continue
         const superseded = previous && (previous.text !== candidate.text ||
@@ -396,11 +397,12 @@ export class LocalMemory {
       .map(({ seenSources: _seenSources, ...entry }) => entry)
   }
 
-  #mergedRecords(scopes: readonly string[]): StoredMemoryEntry[] {
+  #mergedRecords(scopes: readonly string[], filter?: (entry: MemoryEntry) => boolean): StoredMemoryEntry[] {
     const deduped = new Map<string, StoredMemoryEntry>()
     for (const scope of [...new Set(scopes)]) {
       const records = this.#store.get<StoredMemoryEntry[]>(memoryNamespace, scopeId(scope)) ?? []
       for (const record of records) {
+        if (filter && !filter(record)) continue
         const identity = `${record.kind}:${record.key ? 'key:' + record.key : 'text:' + record.text}`
         const existing = deduped.get(identity)
         if (!existing || record.updatedAt > existing.updatedAt) {
@@ -411,8 +413,8 @@ export class LocalMemory {
     return [...deduped.values()].sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
   }
 
-  listScopes(scopes: readonly string[]): MemoryEntry[] {
-    return this.#mergedRecords(scopes).map(({ seenSources: _seenSources, ...entry }) => entry)
+  listScopes(scopes: readonly string[], filter?: (entry: MemoryEntry) => boolean): MemoryEntry[] {
+    return this.#mergedRecords(scopes, filter).map(({ seenSources: _seenSources, ...entry }) => entry)
   }
 
   remove(scope: string, ids: ReadonlySet<string>): number {
@@ -438,13 +440,13 @@ export class LocalMemory {
     return rankBm25(entries, query, limit)
   }
 
-  recallScopes(scopes: readonly string[], query: string, limit = defaultRecallLimit): MemoryEntry[] {
+  recallScopes(scopes: readonly string[], query: string, limit = defaultRecallLimit, filter?: (entry: MemoryEntry) => boolean): MemoryEntry[] {
     if (!Number.isSafeInteger(limit) || limit < 0 || limit > maxRecallEntries) throw new RangeError('Invalid memory recall limit')
-    return rankBm25(this.#mergedRecords(scopes), query, limit)
+    return rankBm25(this.#mergedRecords(scopes, filter), query, limit)
   }
 
   playbookSummary(scopes: readonly string[], maxBytes = 1200, filter?: (entry: MemoryEntry) => boolean): string {
-    const entries = this.listScopes(scopes).filter(entry => !filter || filter(entry))
+    const entries = this.listScopes(scopes, filter)
     const prioritized = [
       ...entries.filter(entry => entry.kind === 'experience' || entry.durable === true),
       ...entries.filter(entry => entry.kind === 'fact' && entry.durable !== true),
@@ -525,10 +527,7 @@ export class ScopedContext {
     }
     const recallStart = performance.now()
     const allScopes = [options.scope, ...(options.fallbackScopes ?? [])]
-    const recalledRaw = allScopes.length > 1
-      ? this.#memory.recallScopes(allScopes, options.goal)
-      : this.#memory.recall(options.scope, options.goal)
-    const recalled = options.filter ? recalledRaw.filter(options.filter) : recalledRaw
+    const recalled = this.#memory.recallScopes(allScopes, options.goal, defaultRecallLimit, options.filter)
     if (options.includePlaybook && remaining > 4096) {
       const summary = this.#memory.playbookSummary(allScopes, Math.min(1024, Math.floor(remaining / 6)), options.filter)
       if (summary) append(playbookHeading + summary)

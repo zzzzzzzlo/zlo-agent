@@ -12,6 +12,9 @@ import {
   runWorkspaceProcess, UnknownProcessEffect,
 } from './workspace-process.ts'
 
+import { allowedSegment, maxPathLength, segments, withinScopePath, WorkspaceDenied, workspaceTarget } from './workspace-path.ts'
+
+export { workspaceTarget } from './workspace-path.ts'
 export { parseProjectCommand } from './workspace-process.ts'
 export type { VerificationCheck, VerificationResult, WorkspaceAccess } from './contracts/domain.ts'
 export interface ToolPolicy {
@@ -53,38 +56,19 @@ export interface Verifier {
   verify(check: VerificationCheck, signal?: AbortSignal, access?: WorkspaceAccess): Promise<VerificationResult>
 }
 
-export function workspaceTarget(input: unknown, mode: 'read' | 'write' = 'write'): string | undefined {
-  if (!input || typeof input !== 'object' || !('path' in input)) return undefined
-  try {
-    return segments(input.path, false, 'any', mode).join('/')
-  } catch {
-    return undefined
-  }
-}
-
 const maxBytes = 128 * 1024
 const maxStreamBytes = 32 * 1024 * 1024
 const readChunkBytes = 64 * 1024
 const maxReadLines = 200
 const maxStartLine = 10_000_000
 const maxGitLogLimit = 50
-const maxPathLength = 512
 const maxEntries = 200
 const maxScannedEntries = 1000
-const forbiddenName = /^(?:node_modules|(?:credentials?|secrets?)(?:\.(?:jsonc?|ya?ml|toml|ini|cfg|conf|txt|xml|env)|$)|auth\.(?:jsonc?|ya?ml|toml|ini|cfg|conf|env)$|id_(?:rsa|dsa|ecdsa|ed25519|ecdsa_sk|ed25519_sk)(?:\.|$))/iu
-const allowedDotDirectory = /^(?:\.github|\.changeset|\.storybook|\.well-known)$/iu
-const readOnlyDotDirectory = /^(?:\.pi|\.agents|\.claude|\.codex)$/iu
-const allowedDotFile = /^(?:\.(?:gitignore|gitkeep|dockerignore|npmignore|eslintignore|prettierignore|stylelintignore|vercelignore|cfignore|editorconfig|nvmrc|node-version|python-version|ruby-version|tool-versions|browserslistrc|swcrc|yamllint)|\.env\.(?:example|sample|template)|\.npmrc\.(?:example|sample|template)|\.(?:prettierrc|eslintrc|stylelintrc|babelrc|lintstagedrc)(?:\.(?:json5?|ya?ml|toml|[cm]?js))?|\.(?:markdownlint|commitlintrc)\.(?:jsonc?|ya?ml)|\.yamllint\.ya?ml)$/iu
-const reservedName = /^(?:con|prn|aux|nul|conin\$|conout\$|(?:com|lpt)[0-9¹²³])(?: *\.|$)/iu
-const sensitiveExtension = /\.(?:key|pem|pfx|p12|ppk|sqlite|db)(?:[-.]|$)/iu
-const invalidPathCharacter = /[\u0000-\u001f\u007f<>:"|?*]/u
 const invalidTextCharacter = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u
 const pathProperty = { type: 'string', maxLength: maxPathLength }
 const textProperty = { type: 'string', maxLength: maxBytes }
 const scriptExtensions = /\.(?:[cm]?[jt]s)$/iu
 const activeWrites = new Set<string>()
-
-class WorkspaceDenied extends Error {}
 
 function lineAt(text: string, offset: number): number {
   return (text.slice(0, offset).match(/\r\n|\n|\r/gu)?.length ?? 0) + 1
@@ -103,39 +87,6 @@ export function editRecovery(text: string, oldText: string, firstMatch: number) 
   const match = normalized.indexOf(target)
   if (match < 0 || normalized.indexOf(target, match + 1) >= 0) return { code: 'text_not_found' as const }
   return { code: 'text_not_found' as const, readRange: { startLine: lineAt(normalized, match), lineCount: lines.length } }
-}
-
-function allowedDotSegment(name: string, kind: 'file' | 'directory' | 'any', mode: 'read' | 'write' = 'write'): boolean {
-  if (kind === 'directory') return allowedDotDirectory.test(name) || (mode === 'read' && readOnlyDotDirectory.test(name))
-  if (kind === 'file') return allowedDotFile.test(name)
-  return allowedDotDirectory.test(name) || allowedDotFile.test(name) || (mode === 'read' && readOnlyDotDirectory.test(name))
-}
-
-function allowedSegment(name: string, kind: 'file' | 'directory' | 'any' = 'any', mode: 'read' | 'write' = 'write'): boolean {
-  if (name.length === 0 || name === '.' || name === '..' || /[ .]$/u.test(name)) return false
-  if (name.startsWith('.') && !allowedDotSegment(name, kind, mode)) return false
-  return !invalidPathCharacter.test(name) && !forbiddenName.test(name) &&
-    !reservedName.test(name) && !sensitiveExtension.test(name)
-}
-
-function withinScopePath(scope: string | undefined, target: string): boolean {
-  if (scope === undefined) return true
-  if (process.platform === 'win32') {
-    scope = scope.toLowerCase()
-    target = target.toLowerCase()
-  }
-  return target === scope || target.startsWith(scope + '/')
-}
-
-function segments(value: unknown, allowRoot = false, leafKind: 'file' | 'directory' | 'any' = allowRoot ? 'directory' : 'any',
-  mode: 'read' | 'write' = 'write'): string[] {
-  if (allowRoot && value === '.') return []
-  if (typeof value !== 'string' || value.length > maxPathLength) throw new WorkspaceDenied('Invalid relative path')
-  const parts = value.split(/[\\/]/u)
-  if (!parts.every((part, index) => allowedSegment(part, index < parts.length - 1 ? 'directory' : leafKind, mode))) {
-    throw new WorkspaceDenied('Path denied by workspace policy')
-  }
-  return parts
 }
 
 function textValue(value: unknown): string {

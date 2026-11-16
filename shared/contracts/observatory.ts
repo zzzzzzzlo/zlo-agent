@@ -18,6 +18,16 @@ export interface TelemetryEvent {
   causationId?: string
 }
 
+export function isCompletionFollowUp(decision: TelemetryEvent, trigger?: TelemetryEvent): boolean {
+  return !!trigger && decision.type === 'judgment.evaluated' && decision.payload.id === 'turn.completion' &&
+    decision.payload.mode === 'active' && decision.payload.output === true &&
+    trigger.type === 'turn.followup_triggered' && trigger.payload.source === 'turn.completion' &&
+    !!decision.correlationId && decision.correlationId === trigger.correlationId && trigger.seq > decision.seq &&
+    decision.taskId === trigger.taskId && decision.taskRunId === trigger.taskRunId &&
+    decision.taskAttemptId === trigger.taskAttemptId && decision.taskNodeId === trigger.taskNodeId &&
+    decision.agentRunId === trigger.agentRunId
+}
+
 export interface TelemetryVerification {
   verdict: string
   passed: boolean

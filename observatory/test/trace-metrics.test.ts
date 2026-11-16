@@ -391,8 +391,10 @@ test('causal judgment details link tool evidence replays, Root completion follow
     baseline: false, output: true, judgeOutput: true, disagreement: true,
     features: { role: 'root', writeCount: 1, evidenceCount: 0 },
     resultLink: { taskNodeId: 'root', taskAttemptId: 'r1' },
-  }, run('root'))
-  const followUp = emit(246, 'model.reserved', { route, kind: 'prompt', estimatedTokens: 60 }, { ...run('root'), correlationId: 'res-followup' })
+  }, { ...run('root'), correlationId: 'completion-review-1' })
+  const followUpTrigger = emit(246, 'turn.followup_triggered', { source: 'turn.completion' },
+    { ...run('root'), correlationId: 'completion-review-1' })
+  emit(246, 'model.reserved', { route, kind: 'prompt', estimatedTokens: 60 }, { ...run('root'), correlationId: 'res-followup' })
   emit(247, 'judgment.evaluated', {
     id: 'swarm.patch', mode: 'active', judgeStatus: 'valid', judgeModel: 'jev-latest', elapsedMs: 9,
     baseline: false, output: true, judgeOutput: true, disagreement: true,
@@ -418,7 +420,7 @@ test('causal judgment details link tool evidence replays, Root completion follow
   assert.match(admissionDetail.impactSummary, /read_tool_evidence/)
 
   const completionDetail = trace.judgmentDetails.find(d => d.point === 'turn.completion')!
-  assert.ok(completionDetail.linkedEventIds.includes(followUp.id))
+  assert.ok(completionDetail.linkedEventIds.includes(followUpTrigger.id))
   assert.match(completionDetail.impactSummary, /触发补充自检轮次/)
 
   const patchDetail = trace.judgmentDetails.find(d => d.point === 'swarm.patch')!
@@ -436,4 +438,32 @@ test('causal judgment details link tool evidence replays, Root completion follow
   assert.equal(byId.get('judgment.completion_followups'), 1)
   assert.equal(byId.get('judgment.memory_filtered'), 1)
   assert.equal(metrics.judgments.length, 7)
+})
+
+test('user instruction arriving during turn.completion review is not misattributed as a Jev follow-up', () => {
+  const { task, events, emit, run } = scenario()
+  emit(245, 'judgment.evaluated', {
+    id: 'turn.completion', mode: 'active', judgeStatus: 'valid', judgeModel: 'jev-latest', elapsedMs: 14,
+    baseline: false, output: true, judgeOutput: true, disagreement: true,
+    features: { role: 'root', writeCount: 1, evidenceCount: 0 },
+    resultLink: { taskNodeId: 'root', taskAttemptId: 'r1' },
+  }, { ...run('root'), correlationId: 'completion-superseded' })
+  emit(246, 'task.instruction_added', {}, run('root'))
+  const userFollowUp = emit(247, 'model.reserved', { route, kind: 'prompt', estimatedTokens: 40 }, { ...run('root'), correlationId: 'res-steer' })
+  const otherDecision = emit(248, 'judgment.evaluated', {
+    id: 'turn.completion', mode: 'active', judgeStatus: 'valid', baseline: false, output: true, disagreement: true,
+  }, { ...run('root'), correlationId: 'completion-applied' })
+  const otherFollowUp = emit(249, 'turn.followup_triggered', { source: 'turn.completion' },
+    { ...run('root'), correlationId: 'completion-applied' })
+
+  const trace = buildTrace(task, events)
+  const detail = trace.judgmentDetails.find(d => d.point === 'turn.completion')!
+  assert.equal(detail.linkedEventIds.includes(userFollowUp.id), false)
+  assert.equal(detail.linkedEventIds.includes(otherFollowUp.id), false)
+  assert.equal(detail.impactKind, 'unconfirmed')
+  assert.match(detail.impactSummary, /未记录到/)
+  assert.ok(trace.judgmentDetails.find(d => d.eventId === otherDecision.id)?.linkedEventIds.includes(otherFollowUp.id))
+
+  const metrics = buildMetrics([task], events)
+  assert.equal(metrics.domains.judgment.find(m => m.id === 'judgment.completion_followups')?.value, 1)
 })

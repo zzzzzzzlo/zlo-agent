@@ -144,7 +144,7 @@ export interface ConversationJudgmentItem {
   taskId: string
   point: string
   mode: 'off' | 'shadow' | 'active'
-  impactKind: 'intervened' | 'shadow_diff' | 'fallback' | 'aligned' | 'baseline_only'
+  impactKind: 'intervened' | 'shadow_diff' | 'fallback' | 'aligned' | 'baseline_only' | 'unconfirmed'
   whatSummary: string
   verdictSummary: string
   impactSummary: string

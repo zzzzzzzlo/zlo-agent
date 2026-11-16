@@ -6,7 +6,7 @@ import type { AgentExecution, ExecutionConfig, ExecutionSession, ExecutionTool, 
 import type { EndReason, EventDraft, ModelRoute, SessionRef } from './contracts/domain.ts'
 import type { LocalJudgment } from './judgment.ts'
 import { frameInstruction, preflight, skillDisclosure } from './input-judgment.ts'
-import { workspaceMemoryScope } from './memory.ts'
+import { memoryEntryInScope, workspaceMemoryScope } from './memory.ts'
 import type { ScopedContext } from './memory.ts'
 import { ModelBudgetError } from './model-scheduler.ts'
 import type { LocalModelScheduler } from './model-scheduler.ts'
@@ -19,7 +19,7 @@ import type { ToolApprovalMode } from '../../shared/contracts/tool-approval.ts'
 import { ToolRun } from './tool-run.ts'
 import { ToolEvidenceArchive } from './tool-judgment.ts'
 import { followUpAllows, reviewCompletion } from './turn-judgment.ts'
-import type { TurnFollowUp } from './turn-judgment.ts'
+import type { CompletionFollowUp } from './turn-judgment.ts'
 import { verifyWorkspace } from './verification.ts'
 import { VisualTelemetry } from './visual-workflow.ts'
 import { workspaceTarget } from './workspace.ts'
@@ -255,6 +255,13 @@ export class MultiAgentOrchestrator {
     this.#db.transaction(() => { this.#db.append({ ...event, type, payload }) })
   }
 
+  #recordCompletionFollowUp(event: EventDraft, followUp: CompletionFollowUp): void {
+    this.#db.transaction(() => {
+      this.#db.append({ ...event, correlationId: followUp.correlationId, type: 'turn.followup_triggered',
+        payload: { source: followUp.id } })
+    })
+  }
+
   #register(task: TaskSnapshot, session: ExecutionSession, event: EventDraft, agentKey: string, role: AgentRole,
     maxDurationMs: number, parentAgentId?: string): EventDraft {
     const recorded = { ...event, sessionId: session.ref.id }
@@ -324,7 +331,7 @@ export class MultiAgentOrchestrator {
     const artifacts = new Set<string>()
     const toolRun = new ToolRun(this.#tasks, this.#approval, this.#judgment, this.#toolEvidence, () => stalled.abort(),
       () => this.#approvalMode(task), this.#approvalContext)
-    let followUp: TurnFollowUp | undefined
+    let followUp: CompletionFollowUp | undefined
     let session: ExecutionSession | undefined
     let unwatch: (() => Promise<void>) | undefined
     let lease: ReturnType<LocalModelScheduler['reserve']> | undefined
@@ -469,22 +476,10 @@ export class MultiAgentOrchestrator {
           }))).slice(0, 4000)] : []),
         ]
         const target = workspaceTarget(node.check ?? (scope.path ? undefined : task.check))
-        const withinScopePath = (scopePath: string, filePath: string) => {
-          const left = process.platform === 'win32' ? scopePath.toLowerCase() : scopePath
-          const right = process.platform === 'win32' ? filePath.toLowerCase() : filePath
-          return right === left || right.startsWith(left + '/')
-        }
-        const scopedFilter = scope.path ? (entry: { kind: string; text: string; paths?: readonly string[] }) => {
-          if (entry.paths?.length) return entry.paths.some(filePath => withinScopePath(scope.path!, filePath))
-          if (entry.kind === 'experience') return true
-          const match = /^Confirmed workspace operation \S+ on (.+)$/u.exec(entry.text)
-          if (!match) return false
-          return withinScopePath(scope.path!, match[1]!)
-        } : undefined
         const prompt = await this.#context.build(event, {
           scope: memoryScope(task, session.route),
           fallbackScopes: [legacyMemoryScope(task, session.route)],
-          filter: scopedFilter,
+          filter: scope.path ? entry => memoryEntryInScope(entry, scope.path) : undefined,
           goal: node.goal, constraints,
           artifactRefs: target ? [target] : [], availableTools: tools.map(tool => tool.name), signal,
         })
@@ -532,6 +527,8 @@ export class MultiAgentOrchestrator {
           followUp = judgment.followUp
           settledEvidence = false
           await session.checkpoint()
+          if (signal.aborted) break
+          this.#recordCompletionFollowUp(event, followUp)
           outcome = await session.run(followUp.nudge)
           followUp = undefined
           await drainDeferred()
@@ -645,7 +642,7 @@ export class MultiAgentOrchestrator {
     let textProduced = false
     let streamed = false
     let deferredResultRounds = 0
-    let followUp: TurnFollowUp | undefined
+    let followUp: CompletionFollowUp | undefined
     let advice: Awaited<ReturnType<typeof preflight>> = {}
     let completionAttempts = 0
     if (this.#judgment.mode('turn.completion', task.id) !== 'off') {
@@ -1011,6 +1008,10 @@ export class MultiAgentOrchestrator {
           const latest = this.#tasks.get(task.id)
           if (conversationId && latest.route && !sameRoute(latest.route, session.route)) continue
           const instructions = latest.instructions.filter((item) => !item.delivered)
+          if (followUp && instructions.length) {
+            followUp = undefined
+            nextPrompt = 'Continue the current task using the updates in this turn.'
+          }
           prompted = new Set(instructions.map(({ id }) => id))
           const constraints = await Promise.all(instructions.map(async ({ text }) =>
             'Additional user instruction: ' + await frameInstruction(this.#judgment, event, task.goal, text, signal)))
@@ -1025,6 +1026,7 @@ export class MultiAgentOrchestrator {
           if (signal.aborted) break
           streamed = false
           promptAccepted = !this.#execution.verifySession
+          if (followUp) this.#recordCompletionFollowUp(event, followUp)
           const result = await session.run(prompt)
           followUp = undefined
           if (result.status !== 'completed') {

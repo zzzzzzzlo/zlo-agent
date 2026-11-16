@@ -1,9 +1,11 @@
+import { randomUUID } from 'node:crypto'
 import type { EventDraft } from './contracts/domain.ts'
 import type { LocalJudgment } from './judgment.ts'
 import { isUnresolvedEffect } from './task-engine.ts'
 import type { Operation } from './task-engine.ts'
 
 export type TurnFollowUp = { id: 'turn.completion' | 'turn.continue'; nudge: string; allowEdits?: boolean }
+export type CompletionFollowUp = TurnFollowUp & { correlationId: string }
 
 export interface TurnEvidence {
   goal: string
@@ -44,7 +46,7 @@ export function followUpAllows(followUp: TurnFollowUp | undefined, tool: string)
 }
 
 export async function reviewCompletion(judgment: LocalJudgment, event: EventDraft, evidence: TurnEvidence):
-Promise<{ insufficient: boolean; followUp?: TurnFollowUp }> {
+Promise<{ insufficient: boolean; followUp?: CompletionFollowUp }> {
   if (evidence.signal.aborted || judgment.mode('turn.completion', event.taskId) === 'off') return { insufficient: false }
   const operations = evidence.operations.filter(operation => operation.taskNodeId === event.taskNodeId &&
     operation.attemptId === event.taskAttemptId)
@@ -79,11 +81,12 @@ Promise<{ insufficient: boolean; followUp?: TurnFollowUp }> {
   }
   const allowed = evidence.allowed ?? [false, true]
   const refs = evidence.evidenceRefs ?? operations.slice(-8).map(operation => operation.id)
-  const insufficient = await judgment.decide(event, 'turn.completion', input, false, allowed, refs, { signal: evidence.signal })
+  const correlationId = randomUUID()
+  const insufficient = await judgment.decide({ ...event, correlationId }, 'turn.completion', input, false, allowed, refs, { signal: evidence.signal })
   if (evidence.signal.aborted || !insufficient) return { insufficient: false }
   const maxFollowUps = evidence.maxFollowUps ?? 1
   return evidence.attemptCount < maxFollowUps
-    ? { insufficient: true, followUp: { id: 'turn.completion', nudge: completionNudge, allowEdits: true } }
+    ? { insufficient: true, followUp: { id: 'turn.completion', nudge: completionNudge, allowEdits: true, correlationId } }
     : { insufficient: true }
 }
 

@@ -11,6 +11,7 @@ const eventLabels = {
   'model.request_started': '开始模型请求', 'model.reserved': '预留模型预算', 'model.reservation_settled': '结算模型预算',
   'model.usage': '模型用量', 'model.route_changed': '切换模型', 'model.output_recovery': '恢复模型输出',
   'tool.started': '启动工具', 'tool.finished': '工具回执', 'tool.approval_resolved': '工具审批', 'tool.evidence_replayed': '按需回放工具证据',
+  'turn.followup_triggered': '触发 Jev 补充自检',
   'operation.reconciliation_required': '等待核对副作用', 'context.compacted': '压缩上下文',
   'memory.captured': '记录记忆', 'memory.recalled': '召回记忆', 'judgment.evaluated': '策略判断',
   'verification.finished': '确定性验收',
@@ -193,6 +194,7 @@ const impactBadges = {
   fallback: ['bad', '异常回退'],
   aligned: ['good', '一致放行'],
   baseline_only: ['settled', '仅规则基线'],
+  unconfirmed: ['settled', '未记录续跑'],
 }
 
 function judgmentTrail(trace) {

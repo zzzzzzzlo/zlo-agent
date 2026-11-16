@@ -1,7 +1,8 @@
 import type { EventDraft } from './contracts/domain.ts'
 import type { LocalJudgment } from './judgment.ts'
+import { memoryEntryInScope } from './memory.ts'
 import type { LocalMemory, MemoryCandidate, MemoryEntry } from './memory.ts'
-import { workspaceTarget } from './workspace.ts'
+import { withinScopePath, workspaceTarget } from './workspace-path.ts'
 import type { CodingWorkspace, WorkspaceTool } from './workspace.ts'
 
 export interface MemoryToolRuntime {
@@ -17,20 +18,6 @@ export interface MemoryToolRuntime {
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
-}
-
-function withinScope(scope: string, target: string): boolean {
-  const left = process.platform === 'win32' ? scope.toLowerCase() : scope
-  const right = process.platform === 'win32' ? target.toLowerCase() : target
-  return right === left || right.startsWith(left + '/')
-}
-
-function matchesScopePath(entry: MemoryEntry, scopePath?: string): boolean {
-  if (!scopePath) return true
-  if (entry.paths?.length) return entry.paths.some(path => withinScope(scopePath, path))
-  if (entry.kind === 'experience') return true
-  const match = /^Confirmed workspace operation \S+ on (.+)$/u.exec(entry.text)
-  return Boolean(match && withinScope(scopePath, match[1]!))
 }
 
 function formatMemoryRow(entry: MemoryEntry) {
@@ -81,9 +68,8 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
         }
         const { memory, scopesFor } = runtime()
         const { all } = scopesFor(context?.taskId, workspace.root, context?.agentRunId)
-        const pool = memory.recallScopes(all, input.query, Math.min(64, Math.max(limit * 2, 24)))
-          .filter(entry => (!input.kind || entry.kind === input.kind) && matchesScopePath(entry, context?.scopePath))
-          .slice(0, limit)
+        const pool = memory.recallScopes(all, input.query, limit,
+          entry => (!input.kind || entry.kind === input.kind) && memoryEntryInScope(entry, context?.scopePath))
         return {
           ok: true,
           count: pool.length,
@@ -119,8 +105,8 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
         }
         const { memory, scopesFor } = runtime()
         const { all } = scopesFor(context?.taskId, workspace.root, context?.agentRunId)
-        const entries = memory.listScopes(all)
-          .filter(entry => (!input.kind || entry.kind === input.kind) && matchesScopePath(entry, context?.scopePath))
+        const entries = memory.listScopes(all,
+          entry => (!input.kind || entry.kind === input.kind) && memoryEntryInScope(entry, context?.scopePath))
           .slice(0, limit)
         return {
           ok: true,
@@ -174,12 +160,13 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
           for (const item of input.paths) {
             if (typeof item !== 'string') return { ok: false, error: 'Invalid memory path item' }
             const resolved = workspaceTarget({ path: item }, 'read')
-            if (!resolved || (context?.scopePath && !withinScope(context.scopePath, resolved))) {
+            if (!resolved || !withinScopePath(context?.scopePath, resolved)) {
               return { ok: false, error: 'Memory path is invalid or outside the assigned scope' }
             }
             normalizedPaths.push(resolved)
           }
-        } else if (context?.scopePath && input.kind === 'fact') {
+        }
+        if (context?.scopePath && !normalizedPaths?.length) {
           normalizedPaths = [context.scopePath]
         }
         if (!context?.taskId || !context?.agentRunId) {
@@ -208,11 +195,12 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
         const controller = new AbortController()
         const activeSignal = signal ?? controller.signal
         if (judgment.mode('memory.capture', context.taskId) === 'off') {
-          memory.capture(eventDraft, scoped.primary, [candidate])
+          memory.capture(eventDraft, scoped.primary, [candidate], context.scopePath)
         } else {
-          await memory.captureReviewed(eventDraft, scoped.primary, [candidate], scoped.goal ?? input.text, judgment, activeSignal)
+          await memory.captureReviewed(eventDraft, scoped.primary, [candidate], scoped.goal ?? input.text, judgment, activeSignal, context.scopePath)
         }
-        const savedEntry = memory.list(scoped.primary).find(entry => entry.sourceRefs.includes(sourceRef))
+        const savedEntry = memory.list(scoped.primary).find(entry =>
+          entry.sourceRefs.includes(sourceRef) && memoryEntryInScope(entry, context.scopePath))
         return {
           ok: true,
           saved: Boolean(savedEntry),

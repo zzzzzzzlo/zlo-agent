@@ -6,11 +6,13 @@ import { join } from 'node:path'
 import { test, type TestContext } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import type { ConversationObservatory, ManagedOperation } from '../../shared/contracts/management.ts'
+import { isCompletionFollowUp } from '../../shared/contracts/observatory.ts'
 import { FakeExecution } from '../src/fake.ts'
 import type { AgentExecution, ExecutionConfig } from '../src/execution.ts'
 import { LocalAgentHost } from '../src/host.ts'
 import type { JudgmentOptions } from '../src/judgment.ts'
 import { ExtensionRegistry } from '../src/policies.ts'
+import { telemetryEvent } from '../src/telemetry-projection.ts'
 
 async function fixture(t: TestContext) {
   const path = await mkdtemp(join(tmpdir(), 'zlo-management-'))
@@ -640,10 +642,14 @@ test('conversation observatory tracks causal Jev interventions across turns and 
   let snapshotBeforeRestart: ConversationObservatory
   try {
     convId = host.createConversation({ requestId: 'jev-obs', workspace, workspaceAccess: 'write' }).id
-    await host.sendMessage({
+    const { taskId } = await host.sendMessage({
       requestId: 'msg-1', conversationId: convId, text: 'Inspect PRIVATE_OBSERVATORY_PROMPT_SECRET and write files',
     })
     await host.idle()
+    const events = host.events(taskId).map(telemetryEvent)
+    const decision = events.find(event => event.type === 'judgment.evaluated' && event.payload.id === 'turn.completion')!
+    const trigger = events.find(event => event.type === 'turn.followup_triggered')
+    assert.ok(isCompletionFollowUp(decision, trigger))
     snapshotBeforeRestart = await host.managementCommand({
       schemaVersion: 1, type: 'conversationObservatory', conversationId: convId,
     }) as ConversationObservatory
@@ -677,5 +683,52 @@ test('conversation observatory tracks causal Jev interventions across turns and 
     assert.deepEqual(afterRestart, snapshotBeforeRestart)
   } finally {
     await restarted.close()
+  }
+})
+
+test('a user update during the completion review supersedes the suggested Jev follow-up', { timeout: 10_000 }, async (t) => {
+  const { directory, workspace } = await fixture(t)
+  const reviewing = Promise.withResolvers<void>()
+  const userUpdated = Promise.withResolvers<void>()
+  const fake = new FakeExecution()
+  const prompts: string[] = []
+  const host = new LocalAgentHost({ directory, execution: {
+    validateRoute: route => fake.validateRoute(route),
+    async open(config) {
+      const session = await fake.open(config)
+      return { ...session, async run(prompt) {
+        prompts.push(prompt)
+        return { status: 'completed', text: 'Current delivery summary' }
+      } }
+    },
+  }, judgment: {
+    modes: { 'turn.completion': 'active' },
+    judge: { async evaluate() {
+      reviewing.resolve()
+      await userUpdated.promise
+      return { output: true }
+    } },
+  } })
+  try {
+    const { id: conversationId } = host.createConversation({ requestId: 'review', workspace })
+    const { taskId } = await host.sendMessage({ requestId: 'initial', conversationId, text: 'Prepare a summary' })
+    await reviewing.promise
+    await host.steerConversation({ requestId: 'update', conversationId, taskId, text: 'Use bullet points' })
+    userUpdated.resolve()
+    await host.idle()
+    assert.equal(prompts.length, 2)
+    assert.match(prompts[1]!, /Use bullet points/)
+    assert.doesNotMatch(prompts[1]!, /Before closing, finish/)
+    assert.ok(host.events(taskId).some(event => event.type === 'judgment.evaluated' &&
+      event.payload.id === 'turn.completion' && event.payload.output === true))
+    assert.ok(!host.events(taskId).some(event => event.type === 'turn.followup_triggered'))
+    const observation = await host.managementCommand({
+      schemaVersion: 1, type: 'conversationObservatory', conversationId,
+    }) as ConversationObservatory
+    assert.equal(observation.judgments?.completionFollowUps, 0)
+    assert.equal(observation.judgments?.recent.find(item => item.point === 'turn.completion')?.impactKind, 'unconfirmed')
+  } finally {
+    userUpdated.resolve()
+    await host.close()
   }
 })

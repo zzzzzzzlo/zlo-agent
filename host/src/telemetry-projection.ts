@@ -161,6 +161,7 @@ function safePayload(type: string, p: Record<string, unknown>): Record<string, u
       operationId: ref(p.operationId), operationIds: refs(p.operationIds), changedEntries: num(p.changedEntries),
       truncated: bool(p.truncated), checkpointReady: bool(p.checkpointReady) }
     case 'verification.finished': return { ...telemetryVerification(p), executionStatus: oneOf(p.executionStatus, ['completed', 'failed']) }
+    case 'turn.followup_triggered': return { source: oneOf(p.source, ['turn.completion', 'turn.continue']) }
     case 'context.compacted': return { tokensBefore: num(p.tokensBefore), estimatedTokensAfter: num(p.estimatedTokensAfter) }
     case 'memory.captured': case 'memory.recalled': return { count: num(p.count), elapsedMs: num(p.elapsedMs),
       contextBytes: num(p.contextBytes), budgetBytes: num(p.budgetBytes), entries: list(p.entries).map(value => {

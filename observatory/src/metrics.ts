@@ -1,6 +1,7 @@
 import { resolveUsdToCnyRate, usdToCny } from '../../shared/contracts/currency.ts'
 import type { ModelRoute } from '../../shared/contracts/domain.ts'
 import type { TelemetryEvent, TelemetryTask } from '../../shared/contracts/observatory.ts'
+import { isCompletionFollowUp } from '../../shared/contracts/observatory.ts'
 import { coreJudgmentPoints } from '../../shared/contracts/jev.ts'
 import type { EvaluationJob } from './database.ts'
 import type { EvaluationResult } from './evaluation.ts'
@@ -298,7 +299,8 @@ function toolMetrics(spans: TraceSpan[], complete: boolean, includeVisual = fals
   ]
 }
 
-function judgmentMetrics(events: TelemetryEvent[], complete: boolean, usdToCnyRate: number): Metric[] {
+function judgmentMetrics(events: TelemetryEvent[], complete: boolean, usdToCnyRate: number,
+  followUps?: ReadonlyMap<string, TelemetryEvent>): Metric[] {
   const shadow = events.filter(({ payload }) => {
     const outcomes = object(payload.batch)?.judgeOutput
     return payload.mode === 'shadow' && (payload.shadow !== undefined ||
@@ -315,7 +317,8 @@ function judgmentMetrics(events: TelemetryEvent[], complete: boolean, usdToCnyRa
       const output = object(event.payload.batch)?.output
       return sum + (Array.isArray(output) ? output.filter(v => v === true).length : 0)
     }, 0)
-  const completionFollowUps = activeEvents.filter(event => event.payload.id === 'turn.completion' && event.payload.output === true).length
+  const completionFollowUps = activeEvents.filter(event => event.correlationId &&
+    isCompletionFollowUp(event, followUps?.get(event.correlationId))).length
   const admissionOmissions = activeEvents.filter(event => event.payload.id === 'tool.admission')
     .reduce((sum, event) => {
       const output = object(event.payload.batch)?.output
@@ -335,7 +338,8 @@ function judgmentMetrics(events: TelemetryEvent[], complete: boolean, usdToCnyRa
     count('judgment.active_changes', 'Active selection changes', events.filter(event => event.payload.mode === 'active' &&
       (event.payload.disagreement ?? event.payload.output !== event.payload.baseline)).length, 'Active selections different from the rule baseline.', complete),
     count('judgment.injection_blocks', 'Prompt injection blocks', injectionBlocks, 'Segments isolated under Active tool.injection policy.', complete),
-    count('judgment.completion_followups', 'Premature completion intercepts', completionFollowUps, 'Turns intercepted by Active turn.completion for supplementary work.', complete),
+    count('judgment.completion_followups', 'Premature completion intercepts', completionFollowUps,
+      'Active turn.completion decisions with a matching Host follow-up event. Older decision records without a matching event are excluded.', complete),
     count('judgment.admission_omissions', 'Low-signal excerpts omitted', admissionOmissions, 'External output segments collapsed under Active tool.admission (retained for replay).', complete),
     count('judgment.memory_filtered', 'Low-value memories filtered', memoryFiltered, 'Memory candidates withheld by Active memory.capture.', complete),
     values('judgment.mean_latency', 'Mean judgment latency', 'ms', events.map(event => quantity(event.payload.elapsedMs)),
@@ -513,6 +517,10 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
       { complete: true, estimated: true, aggregate: 'mean' })
 
   const judgment = occurrences(events, 'judgment.evaluated')
+  const followUps = new Map<string, TelemetryEvent>()
+  for (const event of occurrences(events, 'turn.followup_triggered')) {
+    if (event.correlationId) followUps.set(event.correlationId, event)
+  }
   const compactions = occurrences(events, 'context.compacted')
   const contextBuilds = occurrences(events, 'context.built')
   const recalls = occurrences(events, 'memory.recalled')
@@ -630,7 +638,7 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
         'Elapsed time for scoped recall, relevance judgment and selection when instrumented.'),
       absent('memory.cost', 'Memory model cost (CNY)', 'CNY', 'Host does not separately price memory retrieval or attribute inference spend to injected memory.'),
     ],
-    judgment: judgmentMetrics(judgment, complete, usdToCnyRate),
+    judgment: judgmentMetrics(judgment, complete, usdToCnyRate, followUps),
     reliability: [
       observed('reliability.stop_requested', 'Stop requests', 'task.stop_requested', 'Accepted stop intents.'),
       observed('reliability.stopped', 'Stopped transitions', 'task.stopped', 'Observed Task stop transitions.'),
@@ -701,7 +709,7 @@ export function buildMetrics(tasks: TelemetryTask[], input: TelemetryEvent[], as
     const point = text(group[0].payload.id)
     const mode = text(group[0].payload.mode)
     return { key, label: point ?? 'Unknown decision point', point, mode,
-      featureSchemaVersion: quantity(group[0].payload.featureSchemaVersion), metrics: judgmentMetrics(group, complete, usdToCnyRate), references: eventReferences(group) }
+      featureSchemaVersion: quantity(group[0].payload.featureSchemaVersion), metrics: judgmentMetrics(group, complete, usdToCnyRate, followUps), references: eventReferences(group) }
   })
   for (const { id: point } of coreJudgmentPoints) {
     if (!judgments.some(group => group.point === point)) {

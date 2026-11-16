@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import type { EventDraft } from '../src/contracts/domain.ts'
 import { LocalJudgment } from '../src/judgment.ts'
-import { ContextBudgetError, LocalMemory, ScopedContext, workspaceMemoryScope } from '../src/memory.ts'
+import { ContextBudgetError, LocalMemory, memoryEntryInScope, ScopedContext, workspaceMemoryScope } from '../src/memory.ts'
 import { createMemoryTools } from '../src/memory-tools.ts'
 import { LocalStore } from '../src/store.ts'
 import { CodingWorkspace } from '../src/workspace.ts'
@@ -299,8 +300,10 @@ test('Codex memory alignment: BM25 subtoken/CJK bigram ranking, MEMORY.md materi
     const legacyScope = JSON.stringify(['old-conv-id', 'openai'])
 
     // Legacy entry in [conversationId, provider] plus modern shared workspace entries.
+    const legacyTarget = 'src/LegacyModule.ts'
+    const legacyKey = 'op:edit_text_file:' + createHash('sha256').update(legacyTarget).digest('hex').slice(0, 24)
     memory.capture(event, legacyScope, [
-      { kind: 'fact', key: 'legacy-op', text: 'Confirmed workspace operation edit_text_file on src/LegacyModule.ts', sourceRefs: ['op-legacy'] },
+      { kind: 'fact', key: legacyKey, text: 'Confirmed workspace operation edit_text_file on ' + legacyTarget, sourceRefs: ['op-legacy'] },
     ])
     memory.capture(event, projectScope, [
       { kind: 'fact', key: 'noise', text: '数据库初始化与常规构建说明', sourceRefs: ['op-1'] },
@@ -325,7 +328,7 @@ test('Codex memory alignment: BM25 subtoken/CJK bigram ranking, MEMORY.md materi
     const summaryFiles = await Promise.all(scopeDirs.map(dir => readFile(join(memoriesDir, dir, 'memory_summary.md'), 'utf8')))
     assert.ok(summaryFiles.some(md => md.includes('# Memory Summary')))
 
-    // ScopedContext fallbackScopes + experience passthrough for scoped subagent + playbook summary
+    // Scoped context uses the policy shared with the memory tools.
     const judgment = new LocalJudgment(store)
     const context = new ScopedContext(memory, judgment)
     const scopedPrompt = await context.build(event, {
@@ -333,15 +336,10 @@ test('Codex memory alignment: BM25 subtoken/CJK bigram ranking, MEMORY.md materi
       fallbackScopes: [legacyScope],
       includePlaybook: true,
       goal: 'Check FeatureAuthHandler, LegacyModule, secret_notes and verification',
-      filter: (entry) => {
-        if (entry.paths?.length) return entry.paths.some(p => p === 'src' || p.startsWith('src/'))
-        if (entry.kind === 'experience') return true
-        const match = /^Confirmed workspace operation \S+ on (.+)$/u.exec(entry.text)
-        return Boolean(match && (match[1] === 'src' || match[1]!.startsWith('src/')))
-      },
+      filter: entry => memoryEntryInScope(entry, 'src'),
     })
     assert.match(scopedPrompt, /LegacyModule\.ts/)
-    assert.match(scopedPrompt, /FeatureAuthHandler/)
+    assert.doesNotMatch(scopedPrompt, /Project verification passed/)
     assert.match(scopedPrompt, /Workspace memory summary/)
     assert.doesNotMatch(scopedPrompt, /secret_notes\/Note\.md/)
 
@@ -390,8 +388,52 @@ test('Codex memory alignment: BM25 subtoken/CJK bigram ranking, MEMORY.md materi
     }) as { ok: boolean; entries: { text: string }[] }
     assert.equal(listedScoped.ok, true)
     assert.ok(listedScoped.entries.some(item => item.text.includes('LegacyModule.ts')))
-    assert.ok(listedScoped.entries.some(item => item.text.includes('Project verification passed')))
+    assert.ok(!listedScoped.entries.some(item => item.text.includes('Project verification passed')))
     assert.ok(!listedScoped.entries.some(item => item.text.includes('secret_notes/Note.md')))
+
+    // Multi-path entries crossing outside scopePath must NOT leak to scoped Workers (requires .every, not .some).
+    memory.capture(event, projectScope, [
+      {
+        kind: 'fact', key: 'mixed-rollout',
+        text: 'Task rollout updated src/MixedIn.ts and secret_notes/TopSecret.md',
+        paths: ['src/MixedIn.ts', 'secret_notes/TopSecret.md'],
+        sourceRefs: ['op-mix-1'],
+      },
+      {
+        kind: 'experience', durable: true, key: 'mixed-repair',
+        text: 'Self-repair touched src/MixedIn.ts and docs/私有笔记.md',
+        paths: ['src/MixedIn.ts', 'docs/私有笔记.md'],
+        sourceRefs: ['op-mix-2'],
+      },
+    ])
+    const mixedSearch = await search.execute('call-mixed-search', { query: 'MixedIn' }, undefined, {
+      taskId: 'task', agentRunId: 'agent-run', scopePath: 'src', defer() {}, onCleanup() {},
+    }) as { ok: boolean; entries: { text: string }[] }
+    assert.equal(mixedSearch.entries.length, 0)
+    const mixedList = await list.execute('call-mixed-list', { limit: 50 }, undefined, {
+      taskId: 'task', agentRunId: 'agent-run', scopePath: 'src', defer() {}, onCleanup() {},
+    }) as { ok: boolean; entries: { text: string }[] }
+    assert.ok(mixedList.entries.every(item => !/TopSecret\.md|私有笔记\.md/.test(item.text)))
+    const mixedContext = await context.build(event, {
+      scope: projectScope,
+      includePlaybook: true,
+      goal: 'Check MixedIn',
+      filter: entry => memoryEntryInScope(entry, 'src'),
+    })
+    assert.doesNotMatch(mixedContext, /TopSecret\.md|私有笔记\.md/)
+    assert.equal(memory.recall(projectScope, 'MixedIn').length, 2)
+
+    const scopedInvocation = { taskId: 'task', agentRunId: 'agent-run', scopePath: 'src', defer() {}, onCleanup() {} }
+    const localNote = await save.execute('call-local-note', {
+      kind: 'experience', text: 'Use the local runner for scoped checks', paths: [],
+    }, undefined, scopedInvocation) as { saved: boolean; id: string }
+    assert.equal(localNote.saved, true)
+    assert.deepEqual(memory.list(projectScope).find(item => item.id === localNote.id)?.paths, ['src'])
+    const replaceOutside = await save.execute('call-replace-outside', {
+      kind: 'experience', key: 'verify-exp', text: 'Replacement outside the assigned scope',
+    }, undefined, scopedInvocation) as { saved: boolean }
+    assert.equal(replaceOutside.saved, false)
+    assert.equal(memory.recall(projectScope, 'AuthHandler')[0]?.version, 1)
   } finally {
     store.close()
   }

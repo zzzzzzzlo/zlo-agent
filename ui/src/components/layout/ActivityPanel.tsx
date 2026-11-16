@@ -668,6 +668,7 @@ const judgmentImpactLabels: Record<ConversationJudgmentItem['impactKind'], { lab
   fallback: { label: '异常回退', tone: 'is-danger' },
   aligned: { label: '一致放行', tone: 'is-positive' },
   baseline_only: { label: '规则基线', tone: '' },
+  unconfirmed: { label: '未记录续跑', tone: '' },
 }
 
 function JevCausalCard({ item, selected, onSelect }: {
