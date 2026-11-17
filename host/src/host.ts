@@ -1,7 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { writeHostDiagnostic } from '../../shared/diagnostics.ts'
 import { existsSync, mkdirSync, readFileSync, realpathSync } from 'node:fs'
-import { isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
+import { basename, isAbsolute, join, parse, relative, resolve, sep } from 'node:path'
 import type { AgentExecution } from './execution.ts'
 import { createArtifactTools } from './artifact-tools.ts'
 import { createBrowserTools } from './browser-tools.ts'
@@ -32,11 +32,11 @@ import { installTaskDiagnostics } from './diagnostics.ts'
 import { LocalJudgment } from './judgment.ts'
 import { JevConfiguration } from './jev-settings.ts'
 import type { JudgmentOptions } from './judgment.ts'
-import { LocalMemory, ScopedContext } from './memory.ts'
+import { distillTaskMemories, LocalMemory, ScopedContext } from './memory.ts'
 import * as management from './management.ts'
 import { LocalModelScheduler } from './model-scheduler.ts'
 import type { ModelLimits } from './model-scheduler.ts'
-import { MultiAgentOrchestrator, executionFailure, memoryScope, sameRoute } from './orchestrator.ts'
+import { MultiAgentOrchestrator, executionFailure, memoryScope, sameRoute, teamMemoryScope } from './orchestrator.ts'
 import type { HarnessMode } from './orchestrator.ts'
 import { accessRank, CodingCapabilities, ExtensionRegistry } from './policies.ts'
 import { probeOperation } from './reconciliation.ts'
@@ -607,10 +607,17 @@ export class LocalAgentHost {
     const tasks = conversation ? this.#conversations.recentTaskIds(conversation.id, 20).map(id => this.#engine.get(id)) : []
     const memory: ManagedMemory | undefined = conversation ? { entries: [], recalls: [] } : undefined
     if (conversation && memory) {
-      const providers = this.#conversationMemoryProviders(conversation)
-      for (const provider of providers) {
-        for (const { id, kind, text, version, updatedAt } of this.#memory.list(management.conversationScope(conversation, provider))) {
-          memory.entries.push({ id, kind, text, version, updatedAt })
+      const seenIds = new Set<string>()
+      for (const scope of this.#conversationMemoryScopes(conversation)) {
+        for (const { id, kind, text, version, updatedAt, teamKey, confidence, sourceRefs } of this.#memory.list(scope)) {
+          if (seenIds.has(id)) continue
+          seenIds.add(id)
+          memory.entries.push({
+            id, kind, text, version, updatedAt,
+            ...(teamKey ? { teamKey } : {}),
+            ...(confidence ? { confidence } : {}),
+            ...(sourceRefs.length ? { sourceRefs: [...sourceRefs] } : {}),
+          })
         }
       }
       memory.entries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
@@ -704,13 +711,14 @@ export class LocalAgentHost {
     return this.#conversations.get(conversation.id)
   }
 
-  #conversationMemoryProviders(conversation: ConversationSummary): Set<string> {
+  #conversationMemoryScopes(conversation: ConversationSummary): string[] {
     const providers = new Set<string>([
       ...management.providers,
       'chatgpt',
       'xai',
       ...(this.#store.get<string[]>('conversation-memory-providers', conversation.id) ?? []),
     ])
+    const teams = new Set<string>(this.#store.get<string[]>('conversation-memory-teams', conversation.id) ?? [])
     if (conversation.route) providers.add(conversation.route.provider)
     const activeRoute = this.#orchestrator.conversationRoute(conversation.id)
     if (activeRoute) providers.add(activeRoute.provider)
@@ -718,21 +726,27 @@ export class LocalAgentHost {
       try {
         const task = this.#engine.get(taskId)
         if (task.route) providers.add(task.route.provider)
+        for (const node of task.nodes ?? []) {
+          if (node.teamKey) teams.add(node.teamKey)
+        }
         for (const item of this.#store.eventsOfTypes(taskId, ['agent.started', 'model.route_changed'])) {
           const route = item.payload.route as { provider?: unknown } | undefined
           if (typeof route?.provider === 'string' && route.provider) providers.add(route.provider)
         }
       } catch { /* Historical task lookup is best-effort. */ }
     }
-    return providers
+    const scopes = new Set<string>([management.conversationScope(conversation)])
+    for (const provider of providers) scopes.add(management.conversationScope(conversation, provider))
+    const teamTask = { conversationId: conversation.id, cwd: conversation.workspace } as TaskSnapshot
+    for (const teamKey of teams) scopes.add(teamMemoryScope(teamTask, teamKey))
+    return [...scopes]
   }
 
   #removeMemory(conversationId: string, ids: unknown): number {
     const conversation = this.#conversations.get(management.id(conversationId))
     const selected = management.memoryIds(ids)
-    const providers = this.#conversationMemoryProviders(conversation)
-    return [...providers].reduce((count, provider) => count +
-      this.#memory.remove(management.conversationScope(conversation, provider), selected), 0)
+    return this.#conversationMemoryScopes(conversation).reduce((count, scope) => count +
+      this.#memory.remove(scope, selected), 0)
   }
 
   async #reconcile(command: Extract<ManagementCommand, { type: 'reconcileOperation' }>): Promise<ManagedOperation> {
@@ -1046,7 +1060,14 @@ export class LocalAgentHost {
     for (let boundary = 0; boundary < 4; boundary++) {
       const result = await this.#orchestrator.run(this.#engine.get(task.id), workspace, signal)
       if (result.status !== 'completed') {
-        this.#engine.end(task.id, executionFailure(result.status))
+        const ended = this.#engine.end(task.id, executionFailure(result.status))
+        if (result.status !== 'interrupted' && result.status !== 'checkpoint_error' && !signal.aborted &&
+          ended.status === 'failed') {
+          await this.#captureMemorySafely(ended, {
+            taskId: ended.id, taskRunId: ended.taskRunId, taskNodeId: ended.rootNodeId, agentRunId: ended.taskRunId,
+            type: 'memory.captured', payload: {},
+          }, signal)
+        }
         return
       }
       if (signal.aborted || this.#engine.operations(task.id).some(item => isUnresolvedEffect(item) || item.status === 'started')) {
@@ -1064,7 +1085,7 @@ export class LocalAgentHost {
           evidence: snapshot.worker.result?.remainingRisks.includes('handoff_insufficient')
             ? 'worker_handoff_rejected' : 'worker_verification_failed',
         }
-        : snapshot.nodes?.some(node => node.status !== 'succeeded')
+        : this.#engine.hasRunningNodes(snapshot) || this.#engine.hasUnconvergedFormalNodes(snapshot)
           ? { passed: false, evidence: 'dag_not_converged' }
         : snapshot.check?.command && !this.#capabilities.enabled('run_project_command')
           ? { passed: false, evidence: 'project_command_disabled' }
@@ -1082,60 +1103,78 @@ export class LocalAgentHost {
       }
       const latest = this.#engine.get(task.id)
       if (latest.instructions.some((item) => !item.delivered) || latest.worker?.status === 'ready' ||
+        this.#engine.hasRunningNodes(latest) || this.#engine.runnableNodes(task.id).length > 0 ||
         latest.planVersion !== snapshot.planVersion ||
         (!latest.conversationId && latest.route && !sameRoute(latest.route, result.route))) {
         this.#engine.continueExecution(task.id)
         continue
       }
       const settled = this.#engine.verify(task.id, verification)
-      if (settled.status === 'succeeded') {
-        try {
-          await this.#captureMemory(settled, result.route, result.event, signal)
-        } catch (error) {
-          if (this.#closed || this.#store.isClosed) return
-          if (error instanceof StorePersistenceError) this.#failStorage()
-          else writeHostDiagnostic('host.memory_capture_failed', settled.id)
-        }
+      if (settled.status === 'succeeded' || settled.status === 'failed') {
+        await this.#captureMemorySafely(settled, result.event, signal)
       }
       return
     }
     this.#engine.end(task.id, 'budget_exhausted')
   }
 
-  async #captureMemory(task: TaskSnapshot, route: ModelRoute, event: EventDraft, signal: AbortSignal): Promise<void> {
-    const failedNodes = new Set<string>([
-      ...(task.worker && task.worker.status !== 'succeeded' ? [task.worker.id] : []),
-      ...(task.nodes ?? []).filter(node => node.status !== 'succeeded').map(node => node.id),
-    ])
-    const writes = this.#engine.operations(task.id).filter(item =>
-      item.effect === 'write' && item.status === 'succeeded' && (!item.taskNodeId || !failedNodes.has(item.taskNodeId)))
-    const entries = writes.flatMap(item => {
-      const targets = item.target ? [item.target] : (item.changedPaths ?? [])
-      return targets.map(target => ({
-        kind: 'fact' as const,
-        key: 'op:' + item.tool + ':' + createHash('sha256').update(target).digest('hex').slice(0, 24),
-        text: 'Confirmed workspace operation ' + item.tool + ' on ' + target,
-        sourceRefs: [item.id],
-      }))
-    }).slice(-12)
-    const scope = memoryScope(task, route)
-    const experiences = task.check && task.verification?.passed ? [{
-      kind: 'experience' as const,
-      text: task.check.command ? 'Project verification passed using ' + task.check.command.command
-        : 'A workspace check passed for ' + task.check.path,
-      sourceRefs: [task.id],
-    }] : []
-    if (this.#judgment.mode('memory.capture', task.id) === 'off') {
-      this.#memory.capture(event, scope, entries)
-      if (experiences.length) this.#memory.capture(event, scope, experiences)
-    } else {
-      await this.#memory.captureReviewed(event, scope, [...entries, ...experiences], task.goal, this.#judgment, signal)
+  async #captureMemorySafely(task: TaskSnapshot, event: EventDraft, signal: AbortSignal): Promise<void> {
+    try {
+      await this.#captureMemory(task, event, signal)
+    } catch (error) {
+      if (this.#closed || this.#store.isClosed) return
+      if (error instanceof StorePersistenceError) this.#failStorage()
+      else writeHostDiagnostic('host.memory_capture_failed', task.id)
     }
-    if (task.conversationId && (entries.length || experiences.length)) {
-      const known = new Set(this.#store.get<string[]>('conversation-memory-providers', task.conversationId) ?? [])
-      if (!known.has(route.provider)) {
-        known.add(route.provider)
-        this.#store.transaction(() => this.#store.put('conversation-memory-providers', task.conversationId!, [...known]))
+  }
+
+  async #captureMemory(task: TaskSnapshot, event: EventDraft, signal: AbortSignal): Promise<void> {
+    if (task.status !== 'succeeded' && task.status !== 'failed') return
+    const operations = this.#engine.operations(task.id)
+    const nodes = [
+      ...(task.nodes ?? []),
+      ...(task.worker && task.worker.status === 'failed' ? [task.worker] : []),
+    ]
+    const candidates = distillTaskMemories({
+      taskId: task.id,
+      rootNodeId: task.rootNodeId,
+      goal: task.goal,
+      project: basename(task.cwd),
+      status: task.status,
+      reason: task.reason,
+      route: task.route,
+      check: task.check,
+      verification: task.verification,
+      nodes,
+      operations: operations.map(op => ({
+        id: op.id,
+        tool: op.tool,
+        effect: op.effect,
+        status: op.status,
+        target: op.target,
+        changedPaths: op.changedPaths,
+        taskNodeId: op.taskNodeId,
+      })),
+    })
+    if (!candidates.length) return
+    const scope = memoryScope(task)
+    const facts = candidates.filter(entry => entry.kind === 'fact')
+    const structured = candidates.filter(entry => entry.kind !== 'fact')
+    if (this.#judgment.mode('memory.capture', task.id) === 'off') {
+      if (facts.length) this.#memory.capture(event, scope, facts)
+      if (structured.length) this.#memory.capture(event, scope, structured)
+    } else {
+      await this.#memory.captureReviewed(event, scope, candidates, task.goal, this.#judgment, signal)
+    }
+    if (task.conversationId) {
+      const teams = [...new Set(candidates.map(entry => entry.teamKey).filter((key): key is string => Boolean(key)))]
+      if (teams.length) {
+        const knownTeams = new Set(this.#store.get<string[]>('conversation-memory-teams', task.conversationId) ?? [])
+        const before = knownTeams.size
+        for (const teamKey of teams) knownTeams.add(teamKey)
+        if (knownTeams.size > before) {
+          this.#store.transaction(() => this.#store.put('conversation-memory-teams', task.conversationId!, [...knownTeams]))
+        }
       }
     }
   }
