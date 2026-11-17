@@ -250,3 +250,66 @@ test('P1-5: model.task_fit baseline keeps parent model when parent is already ch
     }
   }
 })
+
+test('unavailable primary uses top fallback baseline (index 0), reserveAsync queues slots across suspend/resume, and planned DAG nodes scale default request limits', async () => {
+  const downPrimary = { provider: 'authorized', model: 'down-primary' }
+  const firstFallback = { provider: 'authorized', model: 'best-fallback' }
+  const secondFallback = { provider: 'authorized', model: 'second-fallback' }
+  const execution: AgentExecution = {
+    async open() { throw new Error('Unexpected open') },
+    async validateRoute(route) {
+      if (route.model === downPrimary.model) throw new Error('Primary down')
+      if (route.provider !== 'authorized' || (route.model !== firstFallback.model && route.model !== secondFallback.model)) {
+        throw new Error('Unknown route')
+      }
+    },
+    async discoverModels() {
+      return [
+        { route: secondFallback, estimatedCost: 5, contextWindow: 32_768, input: ['text'], reasoning: false },
+        { route: firstFallback, estimatedCost: 2, contextWindow: 65_536, input: ['text'], reasoning: false },
+      ]
+    },
+  }
+
+  const store = new LocalStore(':memory:')
+  try {
+    const scheduler = new LocalModelScheduler(execution, store, new LocalJudgment(store), { activeAgents: 2 })
+    // 1. When primary fails validation with allowFallback: true, baselineIndex must stay 0 (best alternative), not skip to index 1.
+    const selected = await scheduler.allocate(event, downPrimary, undefined, true, 'Fallback task', undefined, { allowFallback: true })
+    assert.deepEqual(selected, firstFallback)
+
+    // 2. reserveAsync queues when activeAgents is saturated and resumes cleanly on suspend/release.
+    const r1 = await scheduler.reserveAsync(() => ({ ...event, agentRunId: 'run-1' }), 'root')
+    const r2 = await scheduler.reserveAsync(() => ({ ...event, agentRunId: 'run-2' }), 'team')
+    let thirdAcquired = false
+    const r3Promise = scheduler.reserveAsync(() => ({ ...event, agentRunId: 'run-3' }), 'worker').then(res => {
+      thirdAcquired = true
+      return res
+    })
+    await Promise.resolve()
+    assert.equal(thirdAcquired, false)
+    assert.equal(r2.suspend(), true)
+    const r3 = await r3Promise
+    assert.equal(thirdAcquired, true)
+    let resumed = false
+    const resumePromise = r2.resume().then(() => { resumed = true })
+    await Promise.resolve()
+    assert.equal(resumed, false)
+    r3.release()
+    await resumePromise
+    assert.equal(resumed, true)
+    r2.release()
+    r1.release()
+    assert.deepEqual(scheduler.getRouteStatus(), { quota: 'unknown', activeReservations: 0 })
+
+    // 3. registerPlannedNodes scales default request budget above 96, while explicit limits.requests enforces a hard ceiling.
+    scheduler.registerPlannedNodes('big-dag', 30)
+    assert.equal(scheduler.taskRequestLimit('big-dag'), 336)
+
+    const cappedScheduler = new LocalModelScheduler(execution, store, new LocalJudgment(store), { requests: 10 })
+    cappedScheduler.registerPlannedNodes('big-dag-capped', 30)
+    assert.equal(cappedScheduler.taskRequestLimit('big-dag-capped'), 10)
+  } finally {
+    store.close()
+  }
+})
