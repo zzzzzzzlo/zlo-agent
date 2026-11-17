@@ -238,10 +238,10 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
 
   function browserTool(name: string, description: string, effect: WorkspaceTool['effect'],
     properties: Record<string, unknown>, required: string[],
-    action: (active: BrowserRun, args: Record<string, unknown>, signal: AbortSignal | undefined, key: string) => Promise<unknown>,
+    action: (active: BrowserRun, args: Record<string, unknown>, signal: AbortSignal | undefined, key: string, context?: ToolInvocationContext) => Promise<unknown>,
     extra?: NonNullable<WorkspaceTool['policy']>): WorkspaceTool {
     return tool(name, description, effect, { browserId: idSchema, ...properties }, ['browserId', ...required],
-      async (_call, input, signal, context) => scoped(input, signal, context, (active, args, key) => action(active, args, signal, key)), extra)
+      async (_call, input, signal, context) => scoped(input, signal, context, (active, args, key) => action(active, args, signal, key, context)), extra)
   }
 
   return [
@@ -419,7 +419,7 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
         return { ok: true }
       }),
     browserTool('browser_screenshot', 'Return the current viewport as an image to a vision-capable model. Optionally save a new workspace PNG with write permission.',
-      'read', { path: { type: 'string', maxLength: 512 } }, [], async (active, args, signal) => {
+      'read', { path: { type: 'string', maxLength: 512 } }, [], async (active, args, signal, _key, context) => {
         const path = workspaceTarget(args)
         if (args.path !== undefined && (!path || !/\.png$/iu.test(path))) return error('Screenshot path must end in .png')
         pageLocation(active)
@@ -436,7 +436,7 @@ export function createBrowserTools(workspace: CodingWorkspace, options: { client
         pageLocation(active)
         signal?.throwIfAborted()
         if (png.length > 4 * 1024 * 1024) return error('Screenshot PNG exceeds the file byte budget')
-        const release = workspace.acquireWrite()
+        const release = workspace.acquireWrite(context?.agentRunId)
         if (!release) return error('Another workspace write is in progress')
         try {
           let handle

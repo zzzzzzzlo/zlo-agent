@@ -362,7 +362,7 @@ export function createGitTools(workspace: CodingWorkspace, worktrees?: ManagedGi
         if (!input || Object.keys(input).some(key => !Object.hasOwn(properties, key)) ||
           required.some(key => !Object.hasOwn(input, key)) || signal?.aborted) return rejected('Invalid or interrupted Git request')
         const targetsWorktree = name === 'git_commit' && input.worktreeId !== undefined
-        const release = targetsWorktree ? () => {} : workspace.acquireWrite()
+        const release = targetsWorktree ? () => {} : workspace.acquireWrite(context?.agentRunId)
         if (!release) return rejected('Another workspace write is active')
         try {
           const primary = await hasPrimaryRepository(workspace)
@@ -406,7 +406,7 @@ export function createGitTools(workspace: CodingWorkspace, worktrees?: ManagedGi
         activeWorktrees.add(worktreeKey)
         try {
           const linked = new CodingWorkspace(path)
-          const release = linked.acquireWrite()
+          const release = linked.acquireWrite(context?.agentRunId)
           if (!release) return rejected('Another worktree write is active')
           try { return await commitFiles(linked, input, signal) } finally { release() }
         } finally {

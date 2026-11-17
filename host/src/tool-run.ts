@@ -9,7 +9,7 @@ import type { LocalJudgment } from './judgment.ts'
 import type { TaskEngine, ToolFailureReason } from './task-engine.ts'
 import type { ToolApprovalBroker } from './tool-approval.ts'
 import { workspaceTarget } from './workspace.ts'
-import type { CodingWorkspace, DeferredToolOperation, WorkspaceTool } from './workspace.ts'
+import type { CodingWorkspace, DeferredToolOperation, WorkspaceLease, WorkspaceTool } from './workspace.ts'
 import { redactProcessOutput } from './workspace-process.ts'
 import { prepareFilePostcondition } from './reconciliation.ts'
 import { evaluateToolExecutionPolicy } from './execution-policy.ts'
@@ -126,9 +126,8 @@ export class ToolRun {
   }
 
   #effectiveAccess(taskId: string, taskNodeId?: string): WorkspaceAccess {
-    const taskSnapshot = this.#tasks.get(taskId)
-    const node = [...(taskSnapshot.worker ? [taskSnapshot.worker] : []), ...(taskSnapshot.nodes ?? [])]
-      .find(item => item.id === taskNodeId)
+    const taskSnapshot = this.#tasks.getMeta(taskId)
+    const node = taskNodeId ? this.#tasks.getNode(taskId, taskNodeId) : undefined
     return taskSnapshot.workspaceAccess === 'trusted' && (!node || node.access === 'trusted')
       ? 'trusted' : (node?.access ?? taskSnapshot.workspaceAccess ?? (taskSnapshot.check ? 'write' : 'read'))
   }
@@ -143,14 +142,18 @@ export class ToolRun {
         const combined = toolSignal ? AbortSignal.any([signal, toolSignal]) : signal
         if (this.#closed || combined.aborted) return unavailable
         const ref = event()
-        let effect = tool.effect
+        let effect: 'read' | 'write' = 'write'
         const deny = (reason: 'policy' | 'approval_safety' | 'approval_unattended') => {
           try { this.#tasks.auditToolDenial(ref, tool.name, effect, reason) } catch { /* A diagnostic cannot change a denial. */ }
         }
         let approvalKind
+        let selectsWorktree = false
         try {
-          effect = tool.policy?.effectFor?.(input) ?? effect
+          const rawEffect = tool.policy?.effectFor?.(input) ?? tool.effect
+          // Treat any non-'read' or indeterminate effect conservatively as an exclusive write.
+          effect = rawEffect === 'read' ? 'read' : 'write'
           approvalKind = tool.policy?.approvalFor?.(input) ?? tool.policy?.approval
+          selectsWorktree = tool.policy?.selectsTaskWorkspace?.(input) === true
         } catch { deny('policy'); return unavailable }
         if (!authorize(input)) { deny('policy'); return unavailable }
         const fingerprint = callFingerprint(tool.name, input)
@@ -195,7 +198,7 @@ export class ToolRun {
           }
           let contextMeta: { conversationId?: string; conversationTitle?: string } | undefined
           try {
-            contextMeta = this.#approvalContext?.(ref.taskId) ?? { conversationId: this.#tasks.get(ref.taskId).conversationId }
+            contextMeta = this.#approvalContext?.(ref.taskId) ?? { conversationId: this.#tasks.getMeta(ref.taskId).conversationId }
           } catch { /* Approval metadata is best-effort. */ }
           const approval = await this.#approval.request({
             kind: approvalKind!, tool: tool.name, detail: JSON.stringify(input) ?? 'null', workspace: workspace.root,
@@ -208,14 +211,22 @@ export class ToolRun {
           if (!approved) return { ok: false, code: 'APPROVAL_NOT_GRANTED', error: 'Operation was not authorized. It did not run. Use an already authorized alternative or explain which step needs approval.' }
           destination = approval.approved ? approval.destination : undefined
         }
+        let lease: WorkspaceLease | undefined
         try {
+          if (!selectsWorktree) {
+            lease = await workspace.acquireLease(effect, { ownerId: ref.agentRunId, signal: combined })
+          }
           const postconditionAccess = this.#effectiveAccess(ref.taskId, ref.taskNodeId)
           const filePostcondition = effect === 'write'
             ? await prepareFilePostcondition(tool.name, workspace, target, input, postconditionAccess) : undefined
-          if (this.#closed || combined.aborted || !authorize(input)) return unavailable
+          if (this.#closed || combined.aborted || !authorize(input)) {
+            lease?.release()
+            return unavailable
+          }
           this.#tasks.beginTool(ref.taskId, ref, operationId, tool.name, effect,
             effect === 'write' ? target : undefined, undefined, tool.policy, filePostcondition, fingerprint)
         } catch {
+          lease?.release()
           return unavailable
         }
         let deferred = false
@@ -228,7 +239,9 @@ export class ToolRun {
               if (!tool.policy?.deferred || deferred || this.#closed) throw new Error('Deferred operation not permitted')
               if (operation.pid !== undefined) this.#tasks.attachProcess(ref.taskId, operationId, operation.pid)
               deferred = true
-              this.#register(operationId, ref, operation, callFingerprint(tool.name, input), toolPaths(tool, input), combined)
+              const heldLease = lease
+              lease = undefined
+              this.#register(operationId, ref, operation, callFingerprint(tool.name, input), toolPaths(tool, input), combined, heldLease)
             },
             onCleanup: (cleanup) => {
               if (this.#closed || this.#cleanup.size >= 32) throw new Error('Tool resource capacity exhausted')
@@ -239,6 +252,8 @@ export class ToolRun {
           if (!deferred) this.#finish(ref, operationId, effect === 'write' ? 'unknown_effect' : 'failed',
             combined.aborted ? 'tool_cancelled' : 'tool_exception')
           return { ok: false, error: effect === 'write' ? 'Write result requires reconciliation' : 'Tool failed' }
+        } finally {
+          if (!deferred) lease?.release()
         }
         const successful = Boolean(result && typeof result === 'object' && 'ok' in result && result.ok === true)
         if (!deferred) {
@@ -340,12 +355,13 @@ export class ToolRun {
 
   #finish(event: EventDraft, id: string, status: 'succeeded' | 'failed' | 'unknown_effect', reason?: ToolFailureReason,
     changedPaths?: readonly string[]) {
-    if (this.#tasks.operations(event.taskId).some(operation => operation.id === id && operation.status === 'started')) {
+    if (this.#tasks.hasOpenOperation(id)) {
       this.#tasks.finishTool(event, id, status, reason, changedPaths)
     }
   }
 
-  #register(id: string, event: EventDraft, operation: DeferredToolOperation, key: string | undefined, paths: string[], signal: AbortSignal): void {
+  #register(id: string, event: EventDraft, operation: DeferredToolOperation, key: string | undefined, paths: string[],
+    signal: AbortSignal, lease?: WorkspaceLease): void {
     const settled = operation.completion.catch(() => 'unknown_effect' as const)
       .then(status => {
         this.#finish(event, id, status)
@@ -354,7 +370,10 @@ export class ToolRun {
           if (status === 'succeeded') this.#failures.delete(key)
         }
         return status
-      }).finally(() => this.#deferred.delete(id))
+      }).finally(() => {
+        lease?.release()
+        this.#deferred.delete(id)
+      })
     this.#deferred.set(id, { stop: () => operation.stop(), settled })
     void settled.catch(() => {})
   }

@@ -13,10 +13,10 @@ export async function verifyWorkspace(
     passed: result.passed, evidence: result.evidence, verdict: result.passed ? 'verified' : 'failed',
     basis: check.command ? 'project_command' : 'workspace_path',
   })
-  if (!check.command) return checked(await workflow.verify(workspace, check, signal, access))
+  if (!check.command) return checked(await workflow.verify(workspace, check, signal, access, event.agentRunId))
   if (access !== 'trusted' || signal.aborted) return checked({ passed: false, evidence: 'project_command_not_authorized' })
   const operations = tasks.operations(event.taskId)
-  const version = tasks.get(event.taskId).planVersion
+  const version = tasks.getMeta(event.taskId).planVersion
   const writes = operations.filter(item => item.effect === 'write' && item.tool !== 'verify_project_command')
   const versionId = createHash('sha256').update(JSON.stringify([version, check, writes.map(item => item.id)])).digest('hex')
   const id = event.taskAttemptId + ':verification:' + versionId
@@ -25,14 +25,24 @@ export async function verifyWorkspace(
     passed: previous.status === 'succeeded',
     evidence: previous.status === 'succeeded' ? 'project_command_exit_zero' : 'project_command_previous_result',
   })
-  tasks.beginTool(event.taskId, event, id, 'verify_project_command', 'write', workspaceTarget(check.command), phase)
-  let result: VerificationResult
+  let lease
   try {
-    result = await workflow.verify(workspace, check, signal, access)
+    lease = await workspace.acquireLease('write', { ownerId: event.agentRunId, signal })
   } catch {
-    tasks.finishTool(event, id, 'unknown_effect')
-    return checked({ passed: false, evidence: 'project_command_effect_unknown' })
+    return checked({ passed: false, evidence: signal.aborted ? 'verification_interrupted' : 'workspace_write_active' })
   }
-  tasks.finishTool(event, id, result.passed ? 'succeeded' : 'failed')
-  return checked(result)
+  try {
+    tasks.beginTool(event.taskId, event, id, 'verify_project_command', 'write', workspaceTarget(check.command), phase)
+    let result: VerificationResult
+    try {
+      result = await workflow.verify(workspace, check, signal, access, event.agentRunId)
+    } catch {
+      tasks.finishTool(event, id, 'unknown_effect')
+      return checked({ passed: false, evidence: 'project_command_effect_unknown' })
+    }
+    tasks.finishTool(event, id, result.passed ? 'succeeded' : 'failed')
+    return checked(result)
+  } finally {
+    lease.release()
+  }
 }

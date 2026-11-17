@@ -68,7 +68,292 @@ const invalidTextCharacter = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/u
 const pathProperty = { type: 'string', maxLength: maxPathLength }
 const textProperty = { type: 'string', maxLength: maxBytes }
 const scriptExtensions = /\.(?:[cm]?[jt]s)$/iu
-const activeWrites = new Set<string>()
+
+export interface WorkspaceLease {
+  readonly root: string
+  readonly mode: 'read' | 'write'
+  readonly ownerId: string
+  readonly suspended: boolean
+  release(): void
+  suspend(): boolean
+  resume(signal?: AbortSignal): Promise<void>
+  suspendAndRun<T>(fn: () => Promise<T>, resumeSignal?: AbortSignal): Promise<T>
+}
+
+interface LeaseWaiter {
+  seq: number
+  root: string
+  mode: 'read' | 'write'
+  ownerKey: string
+  cancelled: boolean
+  resolve: (lease: WorkspaceLease) => void
+  reject: (error: unknown) => void
+  cleanup?: () => void
+}
+
+interface RootLeaseState {
+  readers: Map<string, number>
+  writer?: { ownerKey: string; refs: number }
+}
+
+class WorkspaceLeaseManager {
+  readonly #states = new Map<string, RootLeaseState>()
+  readonly #waiters: LeaseWaiter[] = []
+  #nextSeq = 1
+
+  #state(root: string): RootLeaseState {
+    let entry = this.#states.get(root)
+    if (!entry) {
+      entry = { readers: new Map() }
+      this.#states.set(root, entry)
+    }
+    return entry
+  }
+
+  #cleanupState(root: string): void {
+    const entry = this.#states.get(root)
+    if (entry && !entry.writer && entry.readers.size === 0) {
+      this.#states.delete(root)
+    }
+  }
+
+  #overlappingRoots(root: string): [string, RootLeaseState][] {
+    const matches: [string, RootLeaseState][] = []
+    for (const [otherRoot, state] of this.#states) {
+      if (otherRoot === root || containsPath(otherRoot, root) || containsPath(root, otherRoot)) {
+        matches.push([otherRoot, state])
+      }
+    }
+    return matches
+  }
+
+  #hasWaitingWriterBefore(root: string, beforeSeq: number, ownerKey: string): boolean {
+    return this.#waiters.some(waiter =>
+      !waiter.cancelled &&
+      waiter.seq < beforeSeq &&
+      waiter.mode === 'write' &&
+      waiter.ownerKey !== ownerKey &&
+      (waiter.root === root || containsPath(waiter.root, root) || containsPath(root, waiter.root)),
+    )
+  }
+
+  #canGrantRead(root: string, ownerKey: string, waiterSeq?: number): boolean {
+    const ownState = this.#states.get(root)
+    // Active non-suspended owners can re-enter to execute read tools without deadlocking behind queued writers.
+    if (ownState?.writer?.ownerKey === ownerKey || (ownState?.readers.get(ownerKey) ?? 0) > 0) {
+      return true
+    }
+    for (const [, state] of this.#overlappingRoots(root)) {
+      if (state.writer && state.writer.ownerKey !== ownerKey) return false
+    }
+    if (waiterSeq !== undefined) {
+      if (this.#hasWaitingWriterBefore(root, waiterSeq, ownerKey)) return false
+    } else if (this.#waiters.some(w => !w.cancelled && w.mode === 'write' && w.ownerKey !== ownerKey &&
+      (w.root === root || containsPath(w.root, root) || containsPath(root, w.root)))) {
+      return false
+    }
+    return true
+  }
+
+  #canGrantWrite(root: string, ownerKey: string): boolean {
+    for (const [, state] of this.#overlappingRoots(root)) {
+      if (state.writer && state.writer.ownerKey !== ownerKey) return false
+      for (const readerKey of state.readers.keys()) {
+        if (readerKey !== ownerKey) return false
+      }
+    }
+    const ownState = this.#states.get(root)
+    if (ownState?.readers.size && !ownState.writer) {
+      // Do not allow upgrading own read lease while holding read refs on same owner key if others wait.
+      if (ownState.readers.has(ownerKey)) return false
+    }
+    return true
+  }
+
+  #addHold(root: string, mode: 'read' | 'write', ownerKey: string): void {
+    const state = this.#state(root)
+    if (mode === 'write') {
+      if (state.writer && state.writer.ownerKey === ownerKey) {
+        state.writer.refs++
+      } else {
+        state.writer = { ownerKey, refs: 1 }
+      }
+      return
+    }
+    if (state.writer?.ownerKey === ownerKey) {
+      state.writer.refs++
+      return
+    }
+    state.readers.set(ownerKey, (state.readers.get(ownerKey) ?? 0) + 1)
+  }
+
+  #removeHold(root: string, mode: 'read' | 'write', ownerKey: string): void {
+    const state = this.#states.get(root)
+    if (!state) return
+    if (mode === 'write' || state.writer?.ownerKey === ownerKey) {
+      if (state.writer && state.writer.ownerKey === ownerKey) {
+        state.writer.refs--
+        if (state.writer.refs <= 0) state.writer = undefined
+      }
+    } else {
+      const prev = state.readers.get(ownerKey) ?? 0
+      if (prev <= 1) state.readers.delete(ownerKey)
+      else state.readers.set(ownerKey, prev - 1)
+    }
+    this.#cleanupState(root)
+  }
+
+  #makeLease(root: string, initialMode: 'read' | 'write', ownerKey: string): WorkspaceLease {
+    const manager = this
+    let held = true
+    let suspended = false
+    const handle: WorkspaceLease = {
+      root,
+      mode: initialMode,
+      ownerId: ownerKey,
+      get suspended() { return suspended },
+      release() {
+        if (!held) return
+        held = false
+        if (!suspended) {
+          manager.#removeHold(root, initialMode, ownerKey)
+          manager.#drainWaiters()
+        } else {
+          suspended = false
+        }
+      },
+      suspend() {
+        if (!held || suspended) return false
+        suspended = true
+        manager.#removeHold(root, initialMode, ownerKey)
+        manager.#drainWaiters()
+        return true
+      },
+      async resume(signal?: AbortSignal) {
+        if (!held || !suspended) return
+        await manager.#acquireRawHold(root, initialMode, ownerKey, signal)
+        if (!held) {
+          manager.#removeHold(root, initialMode, ownerKey)
+          manager.#drainWaiters()
+          return
+        }
+        suspended = false
+      },
+      async suspendAndRun<T>(fn: () => Promise<T>, resumeSignal?: AbortSignal): Promise<T> {
+        const didSuspend = handle.suspend()
+        try {
+          return await fn()
+        } finally {
+          if (didSuspend && held && !resumeSignal?.aborted) {
+            try {
+              await handle.resume(resumeSignal)
+            } catch {
+              // If aborted while resuming, leave release() to clean up.
+            }
+          }
+        }
+      },
+    }
+    return handle
+  }
+
+  #drainWaiters(): void {
+    if (!this.#waiters.length) return
+    for (let i = 0; i < this.#waiters.length;) {
+      const waiter = this.#waiters[i]!
+      if (waiter.cancelled) {
+        this.#waiters.splice(i, 1)
+        continue
+      }
+      const canGrant = waiter.mode === 'read'
+        ? this.#canGrantRead(waiter.root, waiter.ownerKey, waiter.seq)
+        : this.#canGrantWrite(waiter.root, waiter.ownerKey)
+      if (!canGrant) {
+        i++
+        continue
+      }
+      this.#waiters.splice(i, 1)
+      waiter.cleanup?.()
+      this.#addHold(waiter.root, waiter.mode, waiter.ownerKey)
+      waiter.resolve(this.#makeLease(waiter.root, waiter.mode, waiter.ownerKey))
+    }
+  }
+
+  tryAcquire(root: string, mode: 'read' | 'write', ownerId?: string): (() => void) | undefined {
+    const ownerKey = ownerId ?? ('sync:' + randomUUID())
+    if (mode === 'write') {
+      if (!this.#canGrantWrite(root, ownerKey)) return undefined
+      if (ownerId && this.#hasWaitingWriterBefore(root, Infinity, ownerKey) &&
+        this.#states.get(root)?.writer?.ownerKey !== ownerKey) {
+        return undefined
+      }
+    } else {
+      const ownState = this.#states.get(root)
+      const isReentering = ownState?.writer?.ownerKey === ownerKey || (ownState?.readers.get(ownerKey) ?? 0) > 0
+      if (!isReentering && !this.#canGrantRead(root, ownerKey)) return undefined
+    }
+    this.#addHold(root, mode, ownerKey)
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.#removeHold(root, mode, ownerKey)
+      this.#drainWaiters()
+    }
+  }
+
+  acquireAsync(root: string, mode: 'read' | 'write', ownerId?: string, signal?: AbortSignal): Promise<WorkspaceLease> {
+    const ownerKey = ownerId ?? ('lease:' + randomUUID())
+    return this.#acquireRawHold(root, mode, ownerKey, signal).then(() => this.#makeLease(root, mode, ownerKey))
+  }
+
+  #acquireRawHold(root: string, mode: 'read' | 'write', ownerKey: string, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('Workspace lease acquisition aborted', 'AbortError'))
+    }
+    const seq = this.#nextSeq++
+    const canGrant = mode === 'read'
+      ? this.#canGrantRead(root, ownerKey, seq)
+      : this.#canGrantWrite(root, ownerKey)
+    if (canGrant) {
+      this.#addHold(root, mode, ownerKey)
+      return Promise.resolve()
+    }
+    return new Promise<void>((resolve, reject) => {
+      const waiter: LeaseWaiter = {
+        seq, root, mode, ownerKey, cancelled: false,
+        resolve: () => resolve(),
+        reject,
+      }
+      if (signal) {
+        const onAbort = () => {
+          waiter.cancelled = true
+          const idx = this.#waiters.indexOf(waiter)
+          if (idx >= 0) this.#waiters.splice(idx, 1)
+          this.#drainWaiters()
+          reject(new DOMException('Workspace lease acquisition aborted', 'AbortError'))
+        }
+        signal.addEventListener('abort', onAbort, { once: true })
+        waiter.cleanup = () => signal.removeEventListener('abort', onAbort)
+      }
+      this.#waiters.push(waiter)
+    })
+  }
+
+  snapshot(root: string): { readers: string[]; writer?: string; waitingCount: number } {
+    const readers: string[] = []
+    let writer: string | undefined
+    for (const [, state] of this.#overlappingRoots(root)) {
+      if (state.writer) writer = state.writer.ownerKey
+      for (const r of state.readers.keys()) readers.push(r)
+    }
+    const waitingCount = this.#waiters.filter(w =>
+      !w.cancelled && (w.root === root || containsPath(w.root, root) || containsPath(root, w.root))).length
+    return { readers, ...(writer ? { writer } : {}), waitingCount }
+  }
+}
+
+const leaseManager = new WorkspaceLeaseManager()
 
 function lineAt(text: string, offset: number): number {
   return (text.slice(0, offset).match(/\r\n|\n|\r/gu)?.length ?? 0) + 1
@@ -300,13 +585,20 @@ export class CodingWorkspace implements Verifier {
     }
   }
 
-  acquireWrite(): (() => void) | undefined {
-    if (!this.#startWrite()) return undefined
-    let held = true
-    return () => {
-      if (held) activeWrites.delete(this.root)
-      held = false
-    }
+  acquireWrite(ownerId?: string): (() => void) | undefined {
+    return leaseManager.tryAcquire(this.root, 'write', ownerId)
+  }
+
+  acquireRead(ownerId?: string): (() => void) | undefined {
+    return leaseManager.tryAcquire(this.root, 'read', ownerId)
+  }
+
+  acquireLease(mode: 'read' | 'write', options: { ownerId?: string; signal?: AbortSignal } = {}): Promise<WorkspaceLease> {
+    return leaseManager.acquireAsync(this.root, mode, options.ownerId, options.signal)
+  }
+
+  leaseState() {
+    return leaseManager.snapshot(this.root)
   }
 
   tools(role: 'root' | 'team' | 'worker', access: WorkspaceAccess = role === 'root' ? 'write' : 'read'): WorkspaceTool[] {
@@ -397,10 +689,11 @@ export class CodingWorkspace implements Verifier {
     return writeTools
   }
 
-  async verify(check: VerificationCheck, signal?: AbortSignal, access?: WorkspaceAccess): Promise<VerificationResult> {
+  async verify(check: VerificationCheck, signal?: AbortSignal, access?: WorkspaceAccess, ownerId?: string): Promise<VerificationResult> {
     if (check.command) {
       if (access !== 'trusted') return { passed: false, evidence: 'workspace_command_not_authorized' }
-      if (!this.#startWrite()) return { passed: false, evidence: 'workspace_write_active' }
+      const release = this.acquireWrite(ownerId)
+      if (!release) return { passed: false, evidence: 'workspace_write_active' }
       try {
         const result = await this.#project(check.command, signal)
         if (result.state !== 'exited') {
@@ -413,7 +706,7 @@ export class CodingWorkspace implements Verifier {
         if (error instanceof WorkspaceDenied) return { passed: false, evidence: 'workspace_command_unavailable' }
         throw error
       } finally {
-        activeWrites.delete(this.root)
+        release()
       }
     }
     try {
@@ -428,14 +721,6 @@ export class CodingWorkspace implements Verifier {
     } catch {
       return { passed: false, evidence: signal?.aborted ? 'verification_interrupted' : 'workspace_file_unavailable' }
     }
-  }
-
-  #startWrite(): boolean {
-    for (const active of activeWrites) {
-      if (containsPath(active, this.root) || containsPath(this.root, active)) return false
-    }
-    activeWrites.add(this.root)
-    return true
   }
 
   #tool(
@@ -461,7 +746,12 @@ export class CodingWorkspace implements Verifier {
         if (!input || typeof input !== 'object' || Array.isArray(input) ||
           Object.keys(input).some((key) => !Object.hasOwn(properties, key))) return { ok: false, error: 'Invalid arguments' }
         if (signal?.aborted) return { ok: false, error: 'Tool interrupted before execution' }
-        if (effect === 'write' && !this.#startWrite()) return { ok: false, error: 'Another workspace write is active' }
+        const release = effect === 'write'
+          ? this.acquireWrite(context?.agentRunId)
+          : this.acquireRead(context?.agentRunId)
+        if (!release) {
+          return { ok: false, error: effect === 'write' ? 'Another workspace write is active' : 'Another workspace write is active' }
+        }
         try {
           return await execute(input as Record<string, unknown>, signal, context)
         } catch (error) {
@@ -473,7 +763,7 @@ export class CodingWorkspace implements Verifier {
           if (error instanceof UnknownProcessEffect) throw error
           throw new Error('Workspace write could not be confirmed')
         } finally {
-          if (effect === 'write') activeWrites.delete(this.root)
+          release()
         }
       },
     }

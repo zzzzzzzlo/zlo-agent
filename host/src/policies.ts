@@ -27,7 +27,7 @@ export interface CapabilityPlugin {
 export interface WorkflowPack {
   id: string
   systemPrompt(role: AgentRole, access: WorkspaceAccess, check?: VerificationCheck): string
-  verify(workspace: CodingWorkspace, check: VerificationCheck, signal: AbortSignal, access: WorkspaceAccess): Promise<VerificationResult>
+  verify(workspace: CodingWorkspace, check: VerificationCheck, signal: AbortSignal, access: WorkspaceAccess, ownerId?: string): Promise<VerificationResult>
 }
 
 export interface AgentProfile extends CodingProfile {
@@ -53,7 +53,7 @@ const codingWorkflow: WorkflowPack = {
       'Never request credentials or bypass the tool scope.',
     ].join(' ')
   },
-  verify: (workspace, check, signal, access) => workspace.verify(check, signal, access),
+  verify: (workspace, check, signal, access, ownerId) => workspace.verify(check, signal, access, ownerId),
 }
 
 /** Only the trusted Host composition root registers executable plugins and workflows. */

@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
-import { delegationTool, handoffs, planTool, replanTool } from './agent-plan.ts'
+import { delegationTool, handoffs, inspectDagTool, planTool, replanTool } from './agent-plan.ts'
+import type { DagInspectQuery } from './agent-plan.ts'
 import { ModelUnavailableError } from './execution.ts'
 import type { AgentExecution, ExecutionConfig, ExecutionSession, ExecutionTool, RuntimeEvent } from './execution.ts'
 import type { EndReason, EventDraft, ModelRoute, SessionRef } from './contracts/domain.ts'
@@ -23,7 +24,7 @@ import type { CompletionFollowUp } from './turn-judgment.ts'
 import { verifyWorkspace } from './verification.ts'
 import { VisualTelemetry } from './visual-workflow.ts'
 import { workspaceTarget } from './workspace.ts'
-import type { CodingWorkspace } from './workspace.ts'
+import type { CodingWorkspace, WorkspaceLease } from './workspace.ts'
 
 interface AgentRecord {
   schemaVersion: 1
@@ -155,12 +156,12 @@ export class MultiAgentOrchestrator {
 
   async validatePlan(taskId: string, workspace: CodingWorkspace, proposals: NodeProposal[]): Promise<void> {
     if (!Array.isArray(proposals) || !proposals.length) throw new Error('Invalid plan size')
-    const task = this.#tasks.get(taskId)
+    const task = this.#tasks.getMeta(taskId)
     const rootScope = this.#capabilities.root(task.workspaceAccess, Boolean(task.check))
     const currentRoute = this.rootRoute(taskId) ?? task.route
     const teamScopes = new Map<string, CapabilityScope>()
-    for (const existing of task.nodes ?? []) {
-      if (existing.role === 'team' && existing.parentNodeId === task.rootNodeId) {
+    for (const existing of this.#tasks.nodesByParent(taskId, task.rootNodeId)) {
+      if (existing.role === 'team') {
         teamScopes.set(existing.id, this.#childScope(workspace, rootScope, existing, 'team'))
       }
     }
@@ -191,7 +192,7 @@ export class MultiAgentOrchestrator {
   }
 
   rootRoute(taskId: string): ModelRoute | undefined {
-    const task = this.#tasks.get(taskId)
+    const task = this.#tasks.getMeta(taskId)
     return task.conversationId ? this.conversationRoute(task.conversationId) : this.#db.get<AgentRecord>('agents', taskId)?.route
   }
 
@@ -208,18 +209,77 @@ export class MultiAgentOrchestrator {
   }
 
   session(taskId: string): SessionRef | undefined {
-    const task = this.#tasks.get(taskId)
+    const task = this.#tasks.getMeta(taskId)
     return this.#db.get<SessionRef>('task-sessions', taskId)
       ?? this.#db.get<AgentRecord>('agents', task.conversationId ?? taskId)?.session
   }
 
   clearBrokenSession(taskId: string): void {
     this.#db.transaction(() => {
-      const task = this.#tasks.get(taskId)
+      const task = this.#tasks.getMeta(taskId)
       const agentKey = task.conversationId ?? taskId
       this.#db.delete('task-sessions', taskId)
       this.#db.delete('agents', agentKey)
     })
+  }
+
+  #inspectDag(taskId: string, query: DagInspectQuery, scopedTeamId?: string): Record<string, unknown> {
+    try {
+      const limit = query.limit ?? 50
+      if (query.view === 'active') {
+        const nodes = this.#tasks.activeNodes(taskId, scopedTeamId ?? query.parentNodeId).slice(0, limit)
+        return {
+          ok: true,
+          count: nodes.length,
+          nodes: nodes.map(node => ({
+            id: node.id,
+            parentNodeId: node.parentNodeId,
+            role: node.role ?? 'worker',
+            status: node.status,
+            access: node.access ?? 'read',
+            goal: node.goal.slice(0, 200),
+            dependencies: node.dependencies,
+            ...(node.verification ? { verification: node.verification } : {}),
+            ...(node.result ? { resultSummary: node.result.summary.slice(0, 240) } : {}),
+          })),
+        }
+      }
+      if (query.view === 'team_summaries') {
+        const summaries = this.#tasks.teamSummaries(taskId, scopedTeamId ?? query.teamNodeId).slice(0, limit)
+        return { ok: true, count: summaries.length, summaries }
+      }
+      if (query.view === 'history_page') {
+        const page = this.#tasks.listNodesPage(taskId, {
+          limit,
+          afterOrdinal: query.afterOrdinal,
+          parentNodeId: scopedTeamId ?? query.parentNodeId,
+        })
+        return { ok: true, ...page }
+      }
+      if (query.view === 'node_detail') {
+        if (!query.nodeId) return { ok: false, error: 'nodeId is required for node_detail view' }
+        const detail = this.#tasks.getNodeDetail(taskId, query.nodeId)
+        if (!detail) return { ok: false, error: 'DAG node not found' }
+        if (scopedTeamId !== undefined && detail.node.id !== scopedTeamId && detail.node.parentNodeId !== scopedTeamId) {
+          return { ok: false, error: 'Requested node is outside this Team scope' }
+        }
+        return { ok: true, ...detail }
+      }
+      if (query.view === 'evidence') {
+        if (!query.evidenceRef) return { ok: false, error: 'evidenceRef is required for evidence view' }
+        const resolved = this.#tasks.resolveEvidence(taskId, query.evidenceRef)
+        if (!resolved) return { ok: false, error: 'Evidence reference not found' }
+        if (scopedTeamId !== undefined) {
+          const belongs = resolved.nodeId === scopedTeamId ||
+            (resolved.nodeId !== undefined && this.#tasks.getNode(taskId, resolved.nodeId)?.parentNodeId === scopedTeamId)
+          if (!belongs) return { ok: false, error: 'Evidence reference is outside this Team scope' }
+        }
+        return { ok: true, ...resolved }
+      }
+      return { ok: false, error: 'Unsupported DAG inspection view' }
+    } catch {
+      return { ok: false, error: 'Could not inspect task DAG' }
+    }
   }
 
   recover(): void {
@@ -227,7 +287,7 @@ export class MultiAgentOrchestrator {
       for (const run of this.#db.list<AgentRun>('agent-runs')) {
         if (run.status !== 'active' || !run.event.agentRunId) continue
         this.#db.put('agent-runs', run.event.agentRunId, { ...run, status: 'interrupted' })
-        const taskRunId = this.#tasks.get(run.event.taskId).taskRunId
+        const taskRunId = this.#tasks.getMeta(run.event.taskId).taskRunId
         this.#db.append({ ...run.event, taskRunId, type: 'agent.finished', payload: {
           role: run.role, status: 'interrupted', reason: 'process_interrupted',
           lifecycle: run.role === 'team' ? 'idle' : 'released',
@@ -283,7 +343,7 @@ export class MultiAgentOrchestrator {
     this.#db.transaction(() => {
       const run: AgentRun = { schemaVersion: 1, event, status, role }
       this.#db.put('agent-runs', event.agentRunId!, run)
-      const taskStatus = this.#tasks.get(event.taskId).status
+      const taskStatus = this.#tasks.getMeta(event.taskId).status
       if (taskStatus === 'succeeded' || taskStatus === 'failed' || taskStatus === 'blocked' ||
         taskStatus === 'stopped' || taskStatus === 'needs_reconciliation') {
         return
@@ -341,7 +401,9 @@ export class MultiAgentOrchestrator {
     let started = false
     let registered = false
     let teamLease: string | undefined
-    let childActive = false
+    let workspaceLease: WorkspaceLease | undefined
+    let activeChildCount = 0
+    let activeChildWrite = false
     let workspaceActive = false
     let exhausted = false
     const blockingWrite = (managedOwner?: string) => this.#tasks.blocksToolWork(task.id, managedOwner, node.worktreeId)
@@ -355,7 +417,9 @@ export class MultiAgentOrchestrator {
         if (!isolated) throw new Error('Worktree ownership or registration could not be verified')
         workspace = isolated
       }
-      const parentNode = this.#tasks.get(task.id).nodes?.find(item => item.id === node.parentNodeId)
+      const leaseMode = node.access === 'write' || node.access === 'trusted' ? 'write' : 'read'
+      workspaceLease = await workspace.acquireLease(leaseMode, { ownerId: event.agentRunId, signal })
+      const parentNode = node.parentNodeId !== task.rootNodeId ? this.#tasks.getNode(task.id, node.parentNodeId) : undefined
       const scopes = [node, ...(parentNode ? [parentNode] : [])].flatMap(({ id, budget }) =>
         budget?.requests === undefined ? [] : [{ nodeId: id, requests: budget.requests }])
       lease = this.#scheduler.reserve(() => event, role, scopes)
@@ -377,7 +441,7 @@ export class MultiAgentOrchestrator {
       const tools = availableTools
         .map(tool => {
           const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input =>
-            !childActive &&
+            activeChildCount === 0 &&
             followUpAllows(followUp, tool.name) && this.#capabilities.authorize(scope, tool, input), evidence, artifacts, node.goal, scope.path)
           return {
             ...wrapped,
@@ -395,18 +459,48 @@ export class MultiAgentOrchestrator {
           this.#capabilities.describe(scope, tool) && followUpAllows(followUp, tool.name)))
       if (replay) tools.push(replay)
       const runChild = async (child: WorkerNode) => {
-        if (followUp || childActive || workspaceActive || signal.aborted || !session) return undefined
-        childActive = true
+        if (followUp || workspaceActive || signal.aborted || !session) return undefined
+        const isWriteChild = child.access === 'write' || child.access === 'trusted'
+        if (activeChildCount > 0 && (isWriteChild || activeChildWrite)) return undefined
+        activeChildCount++
+        if (isWriteChild) activeChildWrite = true
         try {
           return await this.#worker(task, child, event, workspace, session.route, scope, signal, true)
         } finally {
-          childActive = false
+          activeChildCount--
+          if (isWriteChild) activeChildWrite = false
         }
+      }
+      const drainTeamChildren = async () => {
+        if (followUp || workspaceActive || signal.aborted || !session) return
+        const inFlight = new Map<string, Promise<void>>()
+        try {
+          while (!signal.aborted && !blockingWrite()) {
+            const runnable = this.#tasks.runnableNodes(task.id, node.id)
+            for (const child of runnable) {
+              if (inFlight.has(child.id)) continue
+              const isWriteChild = child.access === 'write' || child.access === 'trusted'
+              if (inFlight.size > 0 && (isWriteChild || activeChildWrite)) continue
+              const promise = runChild(child).finally(() => { inFlight.delete(child.id) }).then(() => undefined)
+              inFlight.set(child.id, promise)
+            }
+            if (inFlight.size === 0) break
+            await Promise.race(inFlight.values())
+          }
+        } finally {
+          if (inFlight.size > 0) await Promise.allSettled(inFlight.values())
+        }
+      }
+      if (role === 'team' && this.#profile.delegation &&
+        (scope.tools === undefined || scope.tools.includes('inspect_task_dag')) &&
+        !scope.disallowedTools?.includes('inspect_task_dag') &&
+        this.#capabilities.enabled('inspect_task_dag')) {
+        tools.push(inspectDagTool(query => Promise.resolve(this.#inspectDag(task.id, query, node.id))))
       }
       if (role === 'team' && this.#profile.delegation && this.#capabilities.enabled('delegate_worker')) tools.push(delegationTool('delegate_worker',
         async (id, input, toolSignal) => {
           if (!this.#capabilities.enabled('delegate_worker') ||
-            followUp || signal.aborted || toolSignal?.aborted || childActive || workspaceActive || blockingWrite()) {
+            followUp || signal.aborted || toolSignal?.aborted || activeChildCount > 0 || workspaceActive || blockingWrite()) {
             return { ok: false, error: 'Delegation unavailable' }
           }
           const goal = input.goal
@@ -416,13 +510,16 @@ export class MultiAgentOrchestrator {
             role, goalLength: goal.length, nonEmptyGoal, goal, parentGoal: node.goal,
           }, nonEmptyGoal,
             nonEmptyGoal ? [true, false] : [false], [node.id], { planRequestId: requestId, signal }) || !this.#capabilities.enabled('delegate_worker') ||
-            signal.aborted || toolSignal?.aborted || childActive || workspaceActive || blockingWrite()) {
+            signal.aborted || toolSignal?.aborted || activeChildCount > 0 || workspaceActive || blockingWrite()) {
             return { ok: false, error: 'Delegation declined' }
           }
           try {
             this.#childScope(workspace, scope, input, 'worker')
             const child = this.#tasks.delegateScoped(task.id, requestId, node.id, input)
-            const result = child.result ? { ...child.result, verification: child.verification } : await runChild(child)
+            const invokeChild = () => runChild(child)
+            const result = child.result
+              ? { ...child.result, verification: child.verification }
+              : await (workspaceLease ? workspaceLease.suspendAndRun(invokeChild, signal) : invokeChild())
             return result ? { ok: result.resultStatus === 'succeeded', ...result } : { ok: false, error: 'Worker interrupted' }
           } catch {
             return { ok: false, error: 'Delegation rejected by task scope or budget' }
@@ -458,19 +555,23 @@ export class MultiAgentOrchestrator {
       event = this.#register(task, session, event, teamKey ?? event.agentId!, role, timeMs, parent.agentId)
       registered = true
       unwatch = this.#watchStop(session, signal)
-      while (role === 'team' && !signal.aborted) {
-        const child = this.#tasks.runnableNodes(task.id, node.id)[0]
-        if (!child || !await runChild(child)) break
+      if (role === 'team' && !signal.aborted && this.#tasks.runnableNodes(task.id, node.id).length > 0) {
+        if (workspaceLease) await workspaceLease.suspendAndRun(drainTeamChildren, signal)
+        else await drainTeamChildren()
       }
       if (!signal.aborted) {
-        const nodes = this.#tasks.get(task.id).nodes ?? []
-        const childNodes = nodes.filter(child => child.parentNodeId === node.id)
-        const dependencies = nodes.filter(item => node.dependencies.includes(item.id))
+        const childNodes = role === 'team' ? this.#tasks.nodesByParent(task.id, node.id) : []
+        const activeChildHandoffs = childNodes.filter(child => !child.archivedAt).slice(-24)
+        const teamStage = role === 'team' ? this.#tasks.teamSummaries(task.id, node.id)[0] : undefined
+        const dependencies = node.dependencies
+          .map(depId => this.#tasks.getNode(task.id, depId))
+          .filter((item): item is WorkerNode => Boolean(item))
         const constraints = [
           scope.access === 'read' ? 'Read-only workspace access.' : 'Workspace changes must remain inside the assigned scope.',
           scope.path ? 'Use workspace-relative paths under ' + scope.path + '.' : 'Use workspace-relative paths.',
           'Return a short summary of observed evidence and any remaining risks.',
-          ...(childNodes.length ? ['Child handoffs: ' + JSON.stringify(handoffs(childNodes)).slice(0, 8000)] : []),
+          ...(teamStage ? ['Team stage summary: ' + JSON.stringify(teamStage).slice(0, 4000)] : []),
+          ...(activeChildHandoffs.length ? ['Child handoffs: ' + JSON.stringify(handoffs(activeChildHandoffs)).slice(0, 8000)] : []),
           ...(dependencies.length ? ['Completed prerequisites: ' + JSON.stringify(dependencies.map(item => ({
             id: item.id, status: item.status, evidenceRefs: item.result?.evidenceRefs, verification: item.verification,
           }))).slice(0, 4000)] : []),
@@ -507,8 +608,7 @@ export class MultiAgentOrchestrator {
             verification = await verifyWorkspace(this.#tasks, this.#extensions.workflow,
               workspace, event, node.check, signal, scope.access)
           }
-          const completedChildren = this.#tasks.get(task.id).nodes?.filter(child =>
-            child.parentNodeId === node.id && child.status === 'succeeded').length ?? 0
+          const completedChildren = this.#tasks.completedChildCount(task.id, node.id)
           hardEvidence = node.check ? verification?.passed === true : evidence.size > 0 || completedChildren > 0
           const successfulTools = [...new Set(this.#tasks.operations(task.id)
             .filter(operation => evidence.has(operation.id)).map(operation => operation.tool))].slice(0, 24)
@@ -579,9 +679,13 @@ export class MultiAgentOrchestrator {
           : deadline.signal.aborted ? 'worker_deadline' : exhausted ? 'budget_exhausted' : 'worker_failed'],
       }
       if (rootSignal.aborted) result = undefined
-      if (started && !this.#db.isClosed) {
-        const settled = this.#tasks.settleWorker(task.id, node.id, result, verification, event.taskAttemptId)
-        result = settled?.result ? { ...settled.result, verification: settled.verification } : undefined
+      try {
+        if (started && !this.#db.isClosed) {
+          const settled = this.#tasks.settleWorker(task.id, node.id, result, verification, event.taskAttemptId)
+          result = settled?.result ? { ...settled.result, verification: settled.verification } : undefined
+        }
+      } finally {
+        workspaceLease?.release()
       }
       if (registered) this.#finish(event, rootSignal.aborted ? 'interrupted'
         : result?.resultStatus === 'succeeded' ? 'completed' : result ? 'failed' : 'interrupted', result, role)
@@ -678,29 +782,49 @@ export class MultiAgentOrchestrator {
       if (!session || !dispatchAllowed()) return []
       const route = session.route
       workerActive = true
+      const inFlight = new Map<string, Promise<void>>()
+      let firstRejection: unknown
+      let hasRejection = false
       try {
-        while (!signal.aborted && !hasUnknownWrite()) {
-          const batch = this.#tasks.runnableNodes(task.id)
-          if (!batch.length) break
-          const settled = await Promise.allSettled(batch.map(node =>
-            this.#worker(task, node, event, workspace, route, rootScope, signal)))
-          const failure = settled.find(outcome => outcome.status === 'rejected')
-          if (failure) throw failure.reason
-          const latest = this.#tasks.get(task.id)
-          let progressed = false
-          for (const previous of batch) {
-            const node = latest.worker?.id === previous.id ? latest.worker : latest.nodes?.find(item => item.id === previous.id)
-            if (!node || node.status === 'ready') continue
-            progressed = true
-            completed.add(node.id)
+        while ((!signal.aborted && !hasUnknownWrite()) || inFlight.size > 0) {
+          if (!signal.aborted && !hasUnknownWrite() && !hasRejection) {
+            const batch = this.#tasks.runnableNodes(task.id)
+            for (const node of batch) {
+              if (inFlight.has(node.id)) continue
+              const runNode = this.#worker(task, node, event, workspace, route, rootScope, signal)
+                .then(() => {
+                  const latestNode = this.#tasks.getNode(task.id, node.id)
+                  if (latestNode && latestNode.status !== 'ready') completed.add(node.id)
+                }, (error) => {
+                  if (!hasRejection) {
+                    hasRejection = true
+                    firstRejection = error
+                  }
+                })
+                .finally(() => { inFlight.delete(node.id) })
+              inFlight.set(node.id, runNode)
+            }
           }
-          if (!progressed) break
+          if (inFlight.size === 0) break
+          await Promise.race(inFlight.values())
+          if (hasRejection) {
+            await Promise.allSettled(inFlight.values())
+            throw firstRejection
+          }
+          if (this.#tasks.needsArchive(task.id)) {
+            try { this.#tasks.archiveCompletedNodes(task.id) } catch { /* Stage archiving must never break running tasks. */ }
+          }
         }
       } finally {
+        if (inFlight.size > 0) await Promise.allSettled(inFlight.values())
         workerActive = false
       }
-      const latest = this.#tasks.get(task.id)
-      return [latest.worker, ...(latest.nodes ?? [])].filter((node): node is WorkerNode => Boolean(node && completed.has(node.id)))
+      const finished: WorkerNode[] = []
+      for (const id of completed) {
+        const node = this.#tasks.getNode(task.id, id)
+        if (node) finished.push(node)
+      }
+      return finished
     }
     const availableTools = this.#extensions.tools(workspace, 'root', rootScope.access)
       .filter(tool => this.#capabilities.describe(rootScope, tool))
@@ -755,15 +879,15 @@ export class MultiAgentOrchestrator {
           return result ? { ok: result.resultStatus === 'succeeded', ...result } : { ok: false, error: 'Worker interrupted' }
         }))
       if (this.#capabilities.enabled('propose_task_plan')) tools.push(planTool(async (id, proposals, toolSignal) => {
-        if (!this.#capabilities.enabled('propose_task_plan') || !dispatchAllowed(toolSignal) || !session || !proposals.length || proposals.length > 8) {
+        if (!this.#capabilities.enabled('propose_task_plan') || !dispatchAllowed(toolSignal) || !session || !proposals.length || proposals.length > 64) {
           return { ok: false, error: 'Planning unavailable' }
         }
         try {
           const requestId = 'plan:' + event.agentRunId + ':' + receiptId(id)
           const planned: NodeProposal[] = []
           const teamScopes = new Map<string, CapabilityScope>()
-          for (const existing of this.#tasks.get(task.id).nodes ?? []) {
-            if (existing.role === 'team' && existing.parentNodeId === task.rootNodeId) {
+          for (const existing of this.#tasks.nodesByParent(task.id, task.rootNodeId)) {
+            if (existing.role === 'team') {
               teamScopes.set(existing.id, this.#childScope(workspace, rootScope, existing, 'team'))
             }
           }
@@ -790,11 +914,12 @@ export class MultiAgentOrchestrator {
             planned.push(effectiveProposal)
           }
           if (!this.#capabilities.enabled('propose_task_plan') || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Planning interrupted' }
-          const current = this.#tasks.get(task.id)
+          const current = this.#tasks.getMeta(task.id)
           const nodes = this.#tasks.proposePlan(task.id, requestId, current.planVersion, planned)
           await drain()
-          const latest = this.#tasks.get(task.id)
-          const handoff = handoffs((latest.nodes ?? []).filter(node => nodes.some(({ id }) => id === node.id)))
+          const latest = this.#tasks.getMeta(task.id)
+          const settledNodes = nodes.map(({ id }) => this.#tasks.getNode(task.id, id)).filter((item): item is WorkerNode => Boolean(item))
+          const handoff = handoffs(settledNodes)
           return { ok: handoff.every(node => node.status === 'succeeded'), planVersion: latest.planVersion, nodes: handoff }
         } catch {
           return { ok: false, error: 'Plan rejected by task scope, dependency, or budget' }
@@ -802,11 +927,11 @@ export class MultiAgentOrchestrator {
       }))
       if (this.#capabilities.enabled('replan_task_node')) tools.push(replanTool(async (id, nodeId, update, toolSignal) => {
         if (!this.#capabilities.enabled('replan_task_node') || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Replanning unavailable' }
-        const current = this.#tasks.get(task.id)
-        const node = current.nodes?.find(item => item.id === nodeId)
+        const current = this.#tasks.getMeta(task.id)
+        const node = this.#tasks.getNode(task.id, nodeId)
         const isRootChild = node?.parentNodeId === task.rootNodeId
-        const hasWrite = Boolean(node && this.#tasks.operations(task.id)
-          .some(operation => operation.taskNodeId === node.id && operation.effect === 'write'))
+        const hasWrite = Boolean(node && this.#db.operationsForNode<{ effect: string }>(task.id, node.id)
+          .some(operation => operation.effect === 'write'))
         const replanCount = node?.replans ?? 0
         const safe = isRootChild && !replanCount && (node?.status === 'ready' || node?.status === 'failed') && !hasWrite
         const requestId = 'replan:' + event.agentRunId + ':' + receiptId(id)
@@ -820,12 +945,14 @@ export class MultiAgentOrchestrator {
         try {
           this.#tasks.replanNode(task.id, requestId, current.planVersion, nodeId, update)
           await drain()
-          const latest = this.#tasks.get(task.id)
-          return { ok: true, planVersion: latest.planVersion, nodes: handoffs(latest.nodes?.filter(node => node.id === nodeId) ?? []) }
+          const latest = this.#tasks.getMeta(task.id)
+          const updatedNode = this.#tasks.getNode(task.id, nodeId)
+          return { ok: true, planVersion: latest.planVersion, nodes: handoffs(updatedNode ? [updatedNode] : []) }
         } catch {
           return { ok: false, error: 'Replan rejected by task scope, version, or budget' }
         }
       }))
+      if (this.#capabilities.enabled('inspect_task_dag')) tools.push(inspectDagTool(query => Promise.resolve(this.#inspectDag(task.id, query))))
     }
     const previousAttempt = task.attemptCount > 1 ? this.#tasks.attempts(task.id)
       .filter(attempt => attempt.nodeId === task.rootNodeId && attempt.finishedAt)
@@ -913,7 +1040,7 @@ export class MultiAgentOrchestrator {
       deadline = setTimeout(() => budget.abort(), deadlines[this.#mode].root)
       deadline.unref()
       lockRoute()
-      const initialRoute = this.#tasks.get(task.id).route ?? saved?.route
+      const initialRoute = this.#tasks.getMeta(task.id).route ?? saved?.route
       if (saved && initialRoute && !this.#scheduler.canSwitch(saved.route, initialRoute)) return { status: 'model_error' }
       if (initialRoute) {
         try {
@@ -940,7 +1067,7 @@ export class MultiAgentOrchestrator {
         registered = true
         this.#steering.set(task.id, async (id, text) => {
           if (!session || signal.aborted || prompted.has(id) || queuedSteers.has(id)) return false
-          const item = this.#tasks.get(task.id).instructions.find((instruction) => instruction.id === id)
+          const item = this.#tasks.getMeta(task.id).instructions.find((instruction) => instruction.id === id)
           if (!item || item.delivered) return false
           queuedSteers.add(id)
           try {
@@ -966,7 +1093,7 @@ export class MultiAgentOrchestrator {
         const priorUnconfirmed = priorTaskId ? this.#tasks.operations(priorTaskId)
           .filter(operation => operation.effect === 'write' && operation.status === 'unknown_effect') : []
         const previousGoal = saved && saved.taskId !== task.id && this.#judgment.mode('task.frame', task.id) !== 'off'
-          ? this.#tasks.get(saved.taskId).goal : ''
+          ? this.#tasks.getMeta(saved.taskId).goal : ''
         let nextPrompt = saved?.taskId === task.id
           ? 'Resume the task using the saved conversation. Recheck current workspace state before new edits and avoid repeating confirmed changes.\n\nOriginal task goal: ' + task.goal
           : await frameInstruction(this.#judgment, event, previousGoal, task.goal, signal, true)
@@ -976,7 +1103,7 @@ export class MultiAgentOrchestrator {
         }
         if (advice.hint) nextPrompt += '\n\n' + advice.hint
         while (!signal.aborted) {
-          const current = this.#tasks.get(task.id)
+          const current = this.#tasks.getMeta(task.id)
           if (current.route && !sameRoute(current.route, session.route)) {
             if (!this.#scheduler.canSwitch(session.route, current.route)) throw new ModelUnavailableError('Route conflicts with current provider')
             lockRoute()
@@ -1004,8 +1131,17 @@ export class MultiAgentOrchestrator {
           }
           const completedNodes = followUp ? [] : await drain()
           if (signal.aborted) break
-          if (completedNodes.length) nextPrompt += '\nAgent handoffs:\n' + JSON.stringify(handoffs(completedNodes)).slice(0, 8000)
-          const latest = this.#tasks.get(task.id)
+          if (completedNodes.length) {
+            const rootDirect = completedNodes.filter(item => item.parentNodeId === task.rootNodeId)
+            const selected = (rootDirect.length ? rootDirect : completedNodes).slice(-24)
+            const summaries = this.#tasks.teamSummaries(task.id).slice(-8)
+            nextPrompt += '\nAgent handoffs:\n' + JSON.stringify(handoffs(selected)).slice(0, 6000)
+            if (summaries.length) {
+              nextPrompt += '\nTeam stage summaries (use inspect_task_dag for node/evidence details):\n' +
+                JSON.stringify(summaries).slice(0, 4000)
+            }
+          }
+          const latest = this.#tasks.getMeta(task.id)
           if (conversationId && latest.route && !sameRoute(latest.route, session.route)) continue
           const instructions = latest.instructions.filter((item) => !item.delivered)
           if (followUp && instructions.length) {
@@ -1061,12 +1197,11 @@ export class MultiAgentOrchestrator {
             nextPrompt = deferredResultPrompt(receipts)
             continue
           }
-          const after = this.#tasks.get(task.id)
+          const after = this.#tasks.getMeta(task.id)
           const more = after.instructions.some((item) => !item.delivered) || this.#tasks.runnableNodes(task.id).length > 0 ||
             (!conversationId && after.route && !sameRoute(after.route, session.route))
           if (!more && !hasUnknownWrite() && completionAttempts < 1 && this.#judgment.mode('turn.completion', task.id) !== 'off') {
-            const children = this.#tasks.get(task.id).nodes ?? []
-            const completedChildren = children.filter(child => child.status === 'succeeded').length
+            const completedChildren = this.#tasks.completedChildCount(task.id, task.rootNodeId)
             const review = await reviewCompletion(this.#judgment, event, {
               goal: task.goal, summary: result.text, role: 'root', access: rootScope.access,
               checkConfigured: Boolean(task.check), completedChildren,
@@ -1076,7 +1211,7 @@ export class MultiAgentOrchestrator {
             completionAttempts++
             followUp = review.followUp
             if (signal.aborted) break
-            const postReview = this.#tasks.get(task.id)
+            const postReview = this.#tasks.getMeta(task.id)
             const arrivedDuringReview = postReview.instructions.some((item) => !item.delivered) ||
               this.#tasks.runnableNodes(task.id).length > 0 ||
               (!conversationId && postReview.route && !sameRoute(postReview.route, session.route))

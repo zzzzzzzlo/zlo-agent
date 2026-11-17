@@ -494,7 +494,7 @@ export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] 
         }
         const invocation = shellInvocation(args.shell, args.command, workspace.root)
         if (!invocation) return { ok: false, error: 'Requested system shell is unavailable' }
-        const release = workspace.acquireWrite()
+        const release = workspace.acquireWrite(context.agentRunId)
         if (!release) return { ok: false, error: 'Another workspace write is active' }
         let process: ReturnType<typeof startProcess>
         try {
@@ -503,7 +503,7 @@ export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] 
           release()
           return { ok: false, error: 'Shell command could not start' }
         }
-        void process.completion.then(release)
+        void process.completion.finally(release)
         processes.set(process.id, { taskId: context.taskId, agentRunId: context.agentRunId, process })
         if (processes.size > maxHandles) {
           for (const [key, entry] of processes) {

@@ -330,14 +330,16 @@ export function createFileTools(workspace: CodingWorkspace): WorkspaceTool[] {
     return {
       name, description, effect, policy: { targets, approval },
       parameters: { type: 'object', properties, required, additionalProperties: false },
-      async execute(_id, raw, signal) {
+      async execute(_id, raw, signal, context) {
         const input = object(raw)
         if (!input || Object.keys(input).some(key => !Object.hasOwn(properties, key)) ||
           required.some(key => !Object.hasOwn(input, key)) || signal?.aborted) return rejected('Invalid or interrupted file request')
         if (effect === 'read') {
-          try { return await execute(input, signal) } catch { return rejected('File search unavailable or timed out') }
+          const releaseRead = workspace.acquireRead(context?.agentRunId)
+          if (!releaseRead) return rejected('Another workspace write is active')
+          try { return await execute(input, signal) } catch { return rejected('File search unavailable or timed out') } finally { releaseRead() }
         }
-        const release = workspace.acquireWrite()
+        const release = workspace.acquireWrite(context?.agentRunId)
         if (!release) return rejected('Another workspace write is active')
         try { return await execute(input, signal) } finally { release() }
       },

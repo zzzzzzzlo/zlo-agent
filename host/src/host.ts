@@ -243,7 +243,7 @@ export class LocalAgentHost {
 
   #recover(): void {
     this.#orchestrator.recover()
-    for (const task of this.#engine.list()) {
+    for (const task of this.#engine.listMeta()) {
       if (!recoverableAfterCrash.has(task.status)) continue
       const session = this.#orchestrator.session(task.id)
       const reason = !this.#isSessionValid(session, task.cwd) ? 'checkpoint_error' : 'process_interrupted'
@@ -283,6 +283,26 @@ export class LocalAgentHost {
     return this.#engine.get(taskId)
   }
 
+  getTaskNodeDetail(taskId: string, nodeId: string) {
+    this.#assertOpen()
+    return this.#engine.getNodeDetail(taskId, nodeId)
+  }
+
+  listTaskNodesPage(taskId: string, options?: Parameters<TaskEngine['listNodesPage']>[1]) {
+    this.#assertOpen()
+    return this.#engine.listNodesPage(taskId, options)
+  }
+
+  getTeamSummaries(taskId: string, teamNodeId?: string) {
+    this.#assertOpen()
+    return this.#engine.teamSummaries(taskId, teamNodeId)
+  }
+
+  resolveTaskEvidence(taskId: string, evidenceRef: string) {
+    this.#assertOpen()
+    return this.#engine.resolveEvidence(taskId, evidenceRef)
+  }
+
   getHistory(taskId: string) {
     this.#assertOpen()
     return {
@@ -298,7 +318,7 @@ export class LocalAgentHost {
 
   telemetryHeads(before: string | null, limit: number) {
     this.#assertOpen()
-    return this.#engine.listPage(before, limit).map(task => ({ id: task.id, cursor: this.#store.eventCursor(task.id) }))
+    return this.#engine.listPageMeta(before, limit).map(task => ({ id: task.id, cursor: this.#store.eventCursor(task.id) }))
   }
 
   telemetrySnapshot(taskId: string) {
@@ -720,7 +740,7 @@ export class LocalAgentHost {
     if (activeRoute) providers.add(activeRoute.provider)
     for (const taskId of this.#conversations.recentTaskIds(conversation.id, 50)) {
       try {
-        const task = this.#engine.get(taskId)
+        const task = this.#engine.getMeta(taskId)
         if (task.route) providers.add(task.route.provider)
         for (const item of this.#store.eventsOfTypes(taskId, ['agent.started', 'model.route_changed'])) {
           const route = item.payload.route as { provider?: unknown } | undefined
@@ -738,7 +758,7 @@ export class LocalAgentHost {
       scopesFor: (taskId: string | undefined, workspaceRoot: string, agentRunId?: string) => {
         let task: TaskSnapshot | undefined
         if (taskId) {
-          try { task = this.#engine.get(taskId) } catch { /* Missing task falls back to workspace root. */ }
+          try { task = this.#engine.getMeta(taskId) } catch { /* Missing task falls back to workspace root. */ }
         }
         const primary = workspaceMemoryScope(task?.cwd ?? workspaceRoot)
         const all = [primary]
@@ -756,12 +776,14 @@ export class LocalAgentHost {
             all.push(legacyMemoryScope(task, { provider, model: '' }))
           }
         }
+        const activeRun = agentRunId ? this.#store.get<{ event: EventDraft }>('agent-runs', agentRunId) : undefined
+        const runEvent = activeRun?.event.taskId === task?.id ? activeRun?.event : undefined
         const event: EventDraft | undefined = task
           ? {
             taskId: task.id,
             taskRunId: task.taskRunId,
-            taskNodeId: task.rootNodeId,
-            taskAttemptId: task.attemptId,
+            taskNodeId: runEvent?.taskNodeId ?? task.rootNodeId,
+            taskAttemptId: runEvent?.taskAttemptId ?? task.attemptId,
             agentRunId,
             type: '',
             payload: {},
@@ -850,7 +872,7 @@ export class LocalAgentHost {
     this.#credentialMutation = true
     try {
       const active = this.#active
-      for (const task of this.#engine.list()) {
+      for (const task of this.#engine.listMeta()) {
         if (task.id !== active?.taskId && task.status !== 'ready') continue
         const route = this.#orchestrator.rootRoute(task.id) ?? task.route
         if (!route || matches(route.provider) || (task.route && matches(task.route.provider))) {
@@ -1096,7 +1118,7 @@ export class LocalAgentHost {
       return
     }
     for (let boundary = 0; boundary < 4; boundary++) {
-      const result = await this.#orchestrator.run(this.#engine.get(task.id), workspace, signal)
+      const result = await this.#orchestrator.run(this.#engine.getMeta(task.id), workspace, signal)
       if (result.status !== 'completed') {
         this.#engine.end(task.id, executionFailure(result.status))
         return
@@ -1106,17 +1128,18 @@ export class LocalAgentHost {
         return
       }
       this.#engine.beginVerification(task.id)
-      const snapshot = this.#engine.get(task.id)
+      const snapshot = this.#engine.getMeta(task.id)
+      const legacyWorker = snapshot.legacyWorkerId ? this.#engine.getNode(task.id, snapshot.legacyWorkerId) : undefined
       const operations = this.#engine.operations(task.id)
       const confirmedOperation = operations.some(item => item.status === 'succeeded')
       const access = this.#capabilities.root(snapshot.workspaceAccess, Boolean(snapshot.check)).access
-      const verification = snapshot.worker?.status === 'failed'
+      const verification = legacyWorker?.status === 'failed'
         ? {
           passed: false,
-          evidence: snapshot.worker.result?.remainingRisks.includes('handoff_insufficient')
+          evidence: legacyWorker.result?.remainingRisks.includes('handoff_insufficient')
             ? 'worker_handoff_rejected' : 'worker_verification_failed',
         }
-        : snapshot.nodes?.some(node => node.status !== 'succeeded')
+        : this.#engine.hasIncompleteNodes(task.id)
           ? { passed: false, evidence: 'dag_not_converged' }
         : snapshot.check?.command && !this.#capabilities.enabled('run_project_command')
           ? { passed: false, evidence: 'project_command_disabled' }
@@ -1132,8 +1155,9 @@ export class LocalAgentHost {
         this.#engine.end(task.id, signal.aborted ? 'model_interrupted' : 'unknown_effect')
         return
       }
-      const latest = this.#engine.get(task.id)
-      if (latest.instructions.some((item) => !item.delivered) || latest.worker?.status === 'ready' ||
+      const latest = this.#engine.getMeta(task.id)
+      const latestLegacyWorker = latest.legacyWorkerId ? this.#engine.getNode(task.id, latest.legacyWorkerId) : undefined
+      if (latest.instructions.some((item) => !item.delivered) || latestLegacyWorker?.status === 'ready' ||
         latest.planVersion !== snapshot.planVersion ||
         (!latest.conversationId && latest.route && !sameRoute(latest.route, result.route))) {
         this.#engine.continueExecution(task.id)
@@ -1148,6 +1172,13 @@ export class LocalAgentHost {
           if (error instanceof StorePersistenceError) this.#failStorage()
           else writeHostDiagnostic('host.memory_capture_failed', settled.id)
         }
+        if (!this.#closed && !this.#store.isClosed && this.#engine.needsArchive(settled.id)) {
+          try {
+            this.#engine.archiveCompletedNodes(settled.id)
+          } catch (error) {
+            if (error instanceof StorePersistenceError) this.#failStorage()
+          }
+        }
       }
       return
     }
@@ -1155,10 +1186,7 @@ export class LocalAgentHost {
   }
 
   async #captureMemory(task: TaskSnapshot, route: ModelRoute, event: EventDraft, signal: AbortSignal): Promise<void> {
-    const failedNodes = new Set<string>([
-      ...(task.worker && task.worker.status !== 'succeeded' ? [task.worker.id] : []),
-      ...(task.nodes ?? []).filter(node => node.status !== 'succeeded').map(node => node.id),
-    ])
+    const failedNodes = this.#engine.failedNodeIds(task.id)
     const allOps = this.#engine.operations(task.id)
     const writes = allOps.filter(item =>
       item.effect === 'write' && item.status === 'succeeded' && (!item.taskNodeId || !failedNodes.has(item.taskNodeId)))
@@ -1170,6 +1198,10 @@ export class LocalAgentHost {
         text: 'Confirmed workspace operation ' + item.tool + ' on ' + target,
         paths: [target],
         sourceRefs: [item.id],
+        taskId: task.id,
+        ...(item.taskNodeId ? { nodeId: item.taskNodeId } : {}),
+        ...(item.attemptId ? { attemptId: item.attemptId } : {}),
+        evidenceRefs: [item.id],
       }))
     })
     const uniqueTargets = [...new Set(operationEntries.flatMap(entry => entry.paths ?? []))]
@@ -1182,11 +1214,14 @@ export class LocalAgentHost {
         (uniqueTargets.length > 12 ? ', ...' : '') + ') across ' + writes.length + ' confirmed write operations.',
       paths: uniqueTargets.slice(0, 24),
       sourceRefs: writes.slice(0, 16).map(item => item.id),
+      taskId: task.id,
+      evidenceRefs: writes.slice(0, 16).map(item => item.id),
     }] : []
     const entries = [...rolloutSummary, ...operationEntries]
     const scope = memoryScope(task, route)
     const experiences: {
-      kind: 'experience'; text: string; sourceRefs: readonly string[]; key?: string; paths?: readonly string[]; durable?: boolean
+      kind: 'experience'; text: string; sourceRefs: readonly string[]; key?: string; paths?: readonly string[]; durable?: boolean;
+      taskId?: string; nodeId?: string; attemptId?: string; evidenceRefs?: readonly string[];
     }[] = []
     if (task.check && task.verification?.passed) {
       experiences.push({
@@ -1197,6 +1232,8 @@ export class LocalAgentHost {
           : 'A workspace check passed for ' + task.check.path,
         ...(task.check.path ? { paths: [task.check.path] } : {}),
         sourceRefs: [task.id],
+        taskId: task.id,
+        evidenceRefs: [task.id],
       })
     }
     const failedTools = [...new Set(allOps.filter(item => item.status === 'failed').map(item => item.tool))]
@@ -1210,13 +1247,16 @@ export class LocalAgentHost {
           : 'Task converged to verified completion after retry attempt ' + task.attemptCount,
         ...(uniqueTargets.length ? { paths: uniqueTargets.slice(0, 12) } : {}),
         sourceRefs: [task.id],
+        taskId: task.id,
+        evidenceRefs: [task.id],
       })
     }
+    const combined = [...entries, ...experiences]
+    if (!combined.length) return
     if (this.#judgment.mode('memory.capture', task.id) === 'off') {
-      this.#memory.capture(event, scope, entries)
-      if (experiences.length) this.#memory.capture(event, scope, experiences)
+      this.#memory.capture(event, scope, combined)
     } else {
-      await this.#memory.captureReviewed(event, scope, [...entries, ...experiences], task.goal, this.#judgment, signal)
+      await this.#memory.captureReviewed(event, scope, combined, task.goal, this.#judgment, signal)
     }
     if (task.conversationId && (entries.length || experiences.length)) {
       const known = new Set(this.#store.get<string[]>('conversation-memory-providers', task.conversationId) ?? [])
