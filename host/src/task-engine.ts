@@ -1057,6 +1057,7 @@ export class TaskEngine {
     visited.add(nodeId)
     const node = graph.nodesById.get(nodeId)
     if (!node || node.status !== 'ready') return false
+    if (this.#nodeRunCapacity(graph) <= 0 || graph.unknownWriteOps.size > 0) return true
     if (node.parentNodeId !== task.rootNodeId) {
       const parent = graph.nodesById.get(node.parentNodeId)
       if (!parent || parent.status === 'failed' || parent.status === 'succeeded') return true
@@ -1090,6 +1091,42 @@ export class TaskEngine {
   hasNodeWriteOperations(taskId: string, nodeId: string): boolean {
     this.#getRawMeta(taskId)
     return this.#db.operationsForNode<Pick<Operation, 'effect'>>(taskId, nodeId).some(op => op.effect === 'write')
+  }
+
+  hasAttemptOperations(taskId: string, attemptId: string): boolean {
+    this.#getRawMeta(taskId)
+    return this.#db.operationsForAttempt<Pick<Operation, 'id'>>(taskId, attemptId).length > 0
+  }
+
+  hasUnrecoveredFailedChildren(taskId: string, nodeId: string, evidenceRefs?: ReadonlySet<string>): boolean {
+    const task = this.getMeta(taskId)
+    const graph = this.#graph(taskId, task)
+    const node = graph.nodesById.get(nodeId)
+    if (!node) return false
+    const childIds = graph.childrenByParent.get(nodeId)
+    if (!childIds?.size) return false
+    const children: StoredTaskNode[] = []
+    for (const childId of childIds) {
+      const child = graph.nodesById.get(childId)
+      if (child) children.push(child)
+    }
+    const failedChildren = children.filter(child => child.status === 'failed')
+    if (!failedChildren.length) return false
+    const succeededChildren = children.filter(child => child.status === 'succeeded')
+    const receipts = node.attemptId ? this.#db.operationsForAttempt<Operation>(taskId, node.attemptId) : []
+    return !failedChildren.every(failedChild => {
+      const fSeq = failedChild.settledSeq ?? 0
+      const needsWriteOrCheck = canWrite(failedChild.access) || Boolean(failedChild.check)
+      const parentRecovered = receipts.some(op =>
+        op.status === 'succeeded' &&
+        (!evidenceRefs || evidenceRefs.has(op.id)) &&
+        (op.finishedSeq ?? 0) > fSeq &&
+        (!needsWriteOrCheck || op.effect === 'write' || op.tool === 'run_project_command'))
+      if (parentRecovered) return true
+      return succeededChildren.some(sibling =>
+        (sibling.startedSeq ?? 0) > fSeq &&
+        (!needsWriteOrCheck || canWrite(sibling.access) || Boolean(sibling.check)))
+    })
   }
 
   nodesForInspection(taskId: string, nodeIds?: readonly string[], limit = 64): WorkerNode[] {
@@ -1888,7 +1925,7 @@ export class TaskEngine {
             op.status === 'succeeded' &&
             result.evidenceRefs.includes(op.id) &&
             (op.finishedSeq ?? 0) > fSeq &&
-            (!needsWriteOrCheck || op.effect === 'write'))
+            (!needsWriteOrCheck || op.effect === 'write' || op.tool === 'run_project_command'))
           if (parentRecovered) return true
           return succeededChildren.some(sibling =>
             (sibling.startedSeq ?? 0) > fSeq &&

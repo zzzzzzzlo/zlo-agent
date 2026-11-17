@@ -411,7 +411,7 @@ export class LocalModelScheduler {
         return entry?.id
       },
       suspend: () => {
-        if (released || suspended || this.#pending.has(runId)) return false
+        if (released || suspended) return false
         suspended = true
         if (this.#active.delete(runId)) this.#wakeSlotWaiters()
         return true
