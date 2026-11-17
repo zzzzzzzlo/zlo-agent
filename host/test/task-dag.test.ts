@@ -235,7 +235,7 @@ test('an unconfirmed node write blocks further work and survives a crash as unkn
 test('node and activation budgets survive replanning and repeated interruptions', (t) => {
   const store = new LocalStore(':memory:')
   t.after(() => store.close())
-  const engine = new TaskEngine(store)
+  const engine = new TaskEngine(store, { maxPlanNodes: 16, maxNodeRuns: 32 })
   const { taskId } = engine.create({ requestId: 'root', goal: 'Bound repeated runs', cwd: 'ignored' })
   const plan = Array.from({ length: 16 }, (_, index) => ({ ref: 'node' + index, goal: 'Read input ' + index }))
   const [first] = engine.proposePlan(taskId, 'plan', 0, plan)

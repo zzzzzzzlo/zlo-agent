@@ -19,7 +19,7 @@ interface Subscription {
   active: boolean;
 }
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const REPLAY_BATCH_SIZE = 128;
 
 export class StorePersistenceError extends Error {
@@ -238,7 +238,10 @@ export class LocalStore {
         nodes?: { status: string }[];
       };
       const task = typeof row.taskJson === 'string'
-        ? JSON.parse(row.taskJson) as { attemptCount?: number; instructions?: unknown[]; nodes?: { replans?: number; status?: string }[] }
+        ? JSON.parse(row.taskJson) as {
+          attemptCount?: number; instructions?: unknown[]; replannedCount?: number;
+          nodes?: { replans?: number; status?: string }[];
+        }
         : undefined;
       const requests = Number(row.requests ?? 0);
       const reports = Number(row.reports ?? 0);
@@ -264,7 +267,7 @@ export class LocalStore {
         : turn.verification?.basis === 'project_command' ? 'T3' : cleanVisual ? 'T2' : 'T1';
       const steered = (turn.instructions?.length ?? 0) > 0 || Number(row.steerEvents ?? 0) > 0 ||
         Number(row.resumes ?? 0) > 0 || (task?.instructions?.length ?? 0) > 0;
-      const hasReplans = (task?.nodes ?? []).some(node => (node.replans ?? 0) > 0);
+      const hasReplans = (task?.replannedCount ?? 0) > 0 || (task?.nodes ?? []).some(node => (node.replans ?? 0) > 0);
       const attemptCount = task?.attemptCount ?? 1;
       const toolCalls = turn.tools?.length ?? 0;
       const toolFailed = turn.tools?.filter(item => item.status === 'failed').length ?? 0;
@@ -350,6 +353,180 @@ export class LocalStore {
       ? `SELECT value FROM records INDEXED BY idx_records_operations_task WHERE namespace = 'operations' AND json_extract(value, '$.taskId') = ? ORDER BY id`
       : `SELECT value FROM records INDEXED BY idx_records_attempts_task WHERE namespace = 'attempts' AND json_extract(value, '$.taskId') = ? ORDER BY id`;
     return this.#db.prepare(sql).all(taskId).map(row => JSON.parse(row.value as string) as T);
+  }
+
+  operationsForNode<T>(taskId: string, nodeId: string): T[] {
+    return this.#db.prepare(`
+      SELECT value FROM records INDEXED BY idx_records_operations_node
+      WHERE namespace = 'operations' AND json_extract(value, '$.taskId') = ? AND json_extract(value, '$.taskNodeId') = ?
+      ORDER BY id
+    `).all(taskId, nodeId).map(row => JSON.parse(row.value as string) as T);
+  }
+
+  operationsForAttempt<T>(taskId: string, attemptId: string): T[] {
+    return this.#db.prepare(`
+      SELECT value FROM records INDEXED BY idx_records_operations_attempt
+      WHERE namespace = 'operations' AND json_extract(value, '$.taskId') = ? AND json_extract(value, '$.attemptId') = ?
+      ORDER BY id
+    `).all(taskId, attemptId).map(row => JSON.parse(row.value as string) as T);
+  }
+
+  attemptsForNode<T>(taskId: string, nodeId: string): T[] {
+    return this.#db.prepare(`
+      SELECT value FROM records INDEXED BY idx_records_attempts_node
+      WHERE namespace = 'attempts' AND json_extract(value, '$.taskId') = ? AND json_extract(value, '$.nodeId') = ?
+      ORDER BY id
+    `).all(taskId, nodeId).map(row => JSON.parse(row.value as string) as T);
+  }
+
+  childAttemptCount(taskId: string, rootNodeId: string): number {
+    const row = this.#db.prepare(`
+      SELECT count(*) AS cnt
+      FROM records INDEXED BY idx_records_attempts_task
+      WHERE namespace = 'attempts' AND json_extract(value, '$.taskId') = ? AND json_extract(value, '$.nodeId') != ?
+    `).get(taskId, rootNodeId);
+    return Number(row?.cnt ?? 0);
+  }
+
+  openWriteOperations<T>(taskId: string): T[] {
+    return this.#db.prepare(`
+      SELECT value FROM records INDEXED BY idx_records_operations_task
+      WHERE namespace = 'operations' AND json_extract(value, '$.taskId') = ?
+        AND json_extract(value, '$.effect') = 'write'
+        AND json_extract(value, '$.status') IN ('started', 'unknown_effect')
+      ORDER BY id
+    `).all(taskId).map(row => JSON.parse(row.value as string) as T);
+  }
+
+  taskNodes<T>(taskId: string, options: { includeArchived?: boolean } = {}): T[] {
+    const sql = options.includeArchived === false
+      ? `SELECT value FROM records INDEXED BY idx_records_task_nodes_active
+         WHERE namespace = 'task-nodes' AND json_extract(value, '$.taskId') = ? AND json_extract(value, '$.archivedAt') IS NULL
+         ORDER BY COALESCE(json_extract(value, '$.ordinal'), 0), id`
+      : `SELECT value FROM records INDEXED BY idx_records_task_nodes_task
+         WHERE namespace = 'task-nodes' AND json_extract(value, '$.taskId') = ?
+         ORDER BY COALESCE(json_extract(value, '$.ordinal'), 0), id`;
+    return this.#db.prepare(sql).all(taskId).map(row => JSON.parse(row.value as string) as T);
+  }
+
+  taskNodesByParent<T>(taskId: string, parentNodeId: string, options: { includeArchived?: boolean } = {}): T[] {
+    const extra = options.includeArchived === false ? ` AND json_extract(value, '$.archivedAt') IS NULL` : '';
+    return this.#db.prepare(`
+      SELECT value FROM records INDEXED BY idx_records_task_nodes_parent
+      WHERE namespace = 'task-nodes' AND json_extract(value, '$.taskId') = ? AND json_extract(value, '$.parentNodeId') = ?${extra}
+      ORDER BY COALESCE(json_extract(value, '$.ordinal'), 0), id
+    `).all(taskId, parentNodeId).map(row => JSON.parse(row.value as string) as T);
+  }
+
+  taskNodesByStatus<T>(taskId: string, status: string): T[] {
+    return this.#db.prepare(`
+      SELECT value FROM records INDEXED BY idx_records_task_nodes_status
+      WHERE namespace = 'task-nodes' AND json_extract(value, '$.taskId') = ? AND json_extract(value, '$.status') = ?
+      ORDER BY COALESCE(json_extract(value, '$.ordinal'), 0), id
+    `).all(taskId, status).map(row => JSON.parse(row.value as string) as T);
+  }
+
+  taskNodesPage<T>(taskId: string, options: {
+    afterOrdinal?: number; offset?: number; limit: number;
+    parentNodeId?: string; status?: string; includeArchived?: boolean;
+  }): { items: T[]; nextOrdinal: number | null; hasMore: boolean } {
+    if (!Number.isSafeInteger(options.limit) || options.limit < 1 || options.limit > 500) {
+      throw new RangeError('Invalid task nodes page limit');
+    }
+    const afterOrdinal = options.afterOrdinal ?? -1;
+    if (!Number.isSafeInteger(afterOrdinal) || afterOrdinal < -1) {
+      throw new RangeError('Invalid task nodes cursor');
+    }
+    const offset = options.offset ?? 0;
+    if (!Number.isSafeInteger(offset) || offset < 0) {
+      throw new RangeError('Invalid task nodes offset');
+    }
+    const clauses = [
+      `namespace = 'task-nodes'`,
+      `json_extract(value, '$.taskId') = ?`,
+      `COALESCE(json_extract(value, '$.ordinal'), 0) > ?`,
+    ];
+    const params: (string | number)[] = [taskId, afterOrdinal];
+    let indexName = 'idx_records_task_nodes_task';
+    if (options.parentNodeId !== undefined) {
+      clauses.push(`json_extract(value, '$.parentNodeId') = ?`);
+      params.push(options.parentNodeId);
+      indexName = 'idx_records_task_nodes_parent';
+    } else if (options.status !== undefined) {
+      clauses.push(`json_extract(value, '$.status') = ?`);
+      params.push(options.status);
+      indexName = 'idx_records_task_nodes_status';
+    } else if (options.includeArchived === false) {
+      indexName = 'idx_records_task_nodes_active';
+    }
+    if (options.includeArchived === false) {
+      clauses.push(`json_extract(value, '$.archivedAt') IS NULL`);
+    }
+    if (options.status !== undefined && options.parentNodeId !== undefined) {
+      clauses.push(`json_extract(value, '$.status') = ?`);
+      params.push(options.status);
+    }
+    params.push(options.limit + 1, offset);
+    const rows = this.#db.prepare(`
+      SELECT COALESCE(json_extract(value, '$.ordinal'), 0) AS ord, value
+      FROM records INDEXED BY ${indexName}
+      WHERE ${clauses.join(' AND ')}
+      ORDER BY COALESCE(json_extract(value, '$.ordinal'), 0), id
+      LIMIT ? OFFSET ?
+    `).all(...params) as { ord: number; value: string }[];
+    const hasMore = rows.length > options.limit;
+    const sliced = hasMore ? rows.slice(0, options.limit) : rows;
+    const items = sliced.map(row => JSON.parse(row.value) as T);
+    const nextOrdinal = hasMore && sliced.length ? Number(sliced.at(-1)!.ord) : null;
+    return { items, nextOrdinal, hasMore };
+  }
+
+  taskRecordsByTaskId<T>(namespace: 'task-node-archives' | 'task-team-summaries', taskId: string): T[] {
+    const sql = namespace === 'task-node-archives'
+      ? `SELECT value FROM records INDEXED BY idx_records_task_node_archives_task WHERE namespace = 'task-node-archives' AND json_extract(value, '$.taskId') = ? ORDER BY id`
+      : `SELECT value FROM records INDEXED BY idx_records_task_team_summaries_task WHERE namespace = 'task-team-summaries' AND json_extract(value, '$.taskId') = ? ORDER BY id`;
+    return this.#db.prepare(sql).all(taskId).map(row => JSON.parse(row.value as string) as T);
+  }
+
+  storageStats(taskId?: string): {
+    pageSize: number; pageCount: number; freelistCount: number;
+    usedBytes: number; totalBytes: number;
+    namespaces: Record<string, { count: number; bytes: number }>;
+  } {
+    const pageSize = Number(this.#db.prepare('PRAGMA page_size').get()?.page_size ?? 4096);
+    const pageCount = Number(this.#db.prepare('PRAGMA page_count').get()?.page_count ?? 0);
+    const freelistCount = Number(this.#db.prepare('PRAGMA freelist_count').get()?.freelist_count ?? 0);
+    const rows = (taskId
+      ? this.#db.prepare(`
+          SELECT namespace, count(*) AS cnt, COALESCE(sum(length(CAST(value AS BLOB))), 0) AS bytes
+          FROM records
+          WHERE (namespace = 'tasks' AND id = ?) OR json_extract(value, '$.taskId') = ?
+          GROUP BY namespace
+        `).all(taskId, taskId)
+      : this.#db.prepare(`
+          SELECT namespace, count(*) AS cnt, COALESCE(sum(length(CAST(value AS BLOB))), 0) AS bytes
+          FROM records
+          GROUP BY namespace
+        `).all()) as { namespace: string; cnt: number; bytes: number }[];
+    const namespaces: Record<string, { count: number; bytes: number }> = {};
+    for (const row of rows) {
+      namespaces[row.namespace] = { count: Number(row.cnt), bytes: Number(row.bytes) };
+    }
+    return {
+      pageSize,
+      pageCount,
+      freelistCount,
+      usedBytes: Math.max(0, pageCount - freelistCount) * pageSize,
+      totalBytes: pageCount * pageSize,
+      namespaces,
+    };
+  }
+
+  compact(): void {
+    if (this.#changedTasks || this.#db.isTransaction) {
+      throw new Error('Cannot compact store during a transaction');
+    }
+    this.#db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM;');
   }
 
   firstReadyTask<T>(): T | undefined {
@@ -492,6 +669,37 @@ export class LocalStore {
           CREATE INDEX IF NOT EXISTS idx_records_task_status
             ON records(json_extract(value, '$.status'), id)
             WHERE namespace = 'tasks';
+        `);
+      }
+      if (version < 3) {
+        this.#db.exec(`
+          CREATE INDEX IF NOT EXISTS idx_records_operations_node
+            ON records(json_extract(value, '$.taskId'), json_extract(value, '$.taskNodeId'), id)
+            WHERE namespace = 'operations';
+          CREATE INDEX IF NOT EXISTS idx_records_operations_attempt
+            ON records(json_extract(value, '$.taskId'), json_extract(value, '$.attemptId'), id)
+            WHERE namespace = 'operations';
+          CREATE INDEX IF NOT EXISTS idx_records_attempts_node
+            ON records(json_extract(value, '$.taskId'), json_extract(value, '$.nodeId'), id)
+            WHERE namespace = 'attempts';
+          CREATE INDEX IF NOT EXISTS idx_records_task_nodes_task
+            ON records(json_extract(value, '$.taskId'), COALESCE(json_extract(value, '$.ordinal'), 0), id)
+            WHERE namespace = 'task-nodes';
+          CREATE INDEX IF NOT EXISTS idx_records_task_nodes_active
+            ON records(json_extract(value, '$.taskId'), COALESCE(json_extract(value, '$.ordinal'), 0), id)
+            WHERE namespace = 'task-nodes' AND json_extract(value, '$.archivedAt') IS NULL;
+          CREATE INDEX IF NOT EXISTS idx_records_task_nodes_parent
+            ON records(json_extract(value, '$.taskId'), json_extract(value, '$.parentNodeId'), COALESCE(json_extract(value, '$.ordinal'), 0), id)
+            WHERE namespace = 'task-nodes';
+          CREATE INDEX IF NOT EXISTS idx_records_task_nodes_status
+            ON records(json_extract(value, '$.taskId'), json_extract(value, '$.status'), COALESCE(json_extract(value, '$.ordinal'), 0), id)
+            WHERE namespace = 'task-nodes';
+          CREATE INDEX IF NOT EXISTS idx_records_task_node_archives_task
+            ON records(json_extract(value, '$.taskId'), id)
+            WHERE namespace = 'task-node-archives';
+          CREATE INDEX IF NOT EXISTS idx_records_task_team_summaries_task
+            ON records(json_extract(value, '$.taskId'), id)
+            WHERE namespace = 'task-team-summaries';
         `);
       }
       this.#db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);

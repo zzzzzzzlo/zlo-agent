@@ -17,6 +17,10 @@ export interface MemoryCandidate {
   paths?: readonly string[]
   durable?: boolean
   title?: string
+  taskId?: string
+  nodeId?: string
+  attemptId?: string
+  evidenceRefs?: readonly string[]
 }
 
 export interface MemoryEntry extends MemoryCandidate {
@@ -126,6 +130,15 @@ function normalizedCandidate(candidate: MemoryCandidate): MemoryCandidate | unde
     if (!target || sensitiveText.test(target)) return undefined
     paths.add(target)
   }
+  const cleanRef = (value: unknown) =>
+    typeof value === 'string' && referencePattern.test(value) && !sensitiveText.test(value) ? value : undefined
+  if (candidate.taskId !== undefined && !cleanRef(candidate.taskId)) return undefined
+  if (candidate.nodeId !== undefined && !cleanRef(candidate.nodeId)) return undefined
+  if (candidate.attemptId !== undefined && !cleanRef(candidate.attemptId)) return undefined
+  if (candidate.evidenceRefs !== undefined && !Array.isArray(candidate.evidenceRefs)) return undefined
+  const evidenceRefs = candidate.evidenceRefs
+    ? [...new Set(candidate.evidenceRefs.slice(0, maxSourceRefs).map(cleanRef).filter((ref): ref is string => ref !== undefined))]
+    : undefined
   return {
     kind: candidate.kind,
     text,
@@ -134,6 +147,10 @@ function normalizedCandidate(candidate: MemoryCandidate): MemoryCandidate | unde
     ...(paths.size ? { paths: [...paths] } : {}),
     ...(candidate.durable === true ? { durable: true } : {}),
     ...(title ? { title } : {}),
+    ...(candidate.taskId ? { taskId: candidate.taskId } : {}),
+    ...(candidate.nodeId ? { nodeId: candidate.nodeId } : {}),
+    ...(candidate.attemptId ? { attemptId: candidate.attemptId } : {}),
+    ...(evidenceRefs?.length ? { evidenceRefs } : {}),
   }
 }
 
@@ -184,15 +201,28 @@ function termCounts(tokens: readonly string[]): Map<string, number> {
   return counts
 }
 
+const bm25DocCache = new Map<string, { tf: Map<string, number>; dl: number }>()
+
+function cachedDocStats(entry: StoredMemoryEntry): { entry: StoredMemoryEntry; tf: Map<string, number>; dl: number } {
+  const cacheKey = `${entry.id}:${entry.version}:${entry.updatedAt}`
+  let stats = bm25DocCache.get(cacheKey)
+  if (!stats) {
+    const searchable = [entry.text, entry.title ?? '', ...(entry.paths ?? [])].filter(Boolean).join(' ')
+    const tokens = tokenize(searchable)
+    stats = { tf: termCounts(tokens), dl: Math.max(1, tokens.length) }
+    bm25DocCache.set(cacheKey, stats)
+    if (bm25DocCache.size > 4096) {
+      bm25DocCache.delete(bm25DocCache.keys().next().value!)
+    }
+  }
+  return { entry, tf: stats.tf, dl: stats.dl }
+}
+
 function rankBm25(entries: readonly StoredMemoryEntry[], query: string, limit: number): MemoryEntry[] {
   const queryTokens = tokenize(query)
   if (!queryTokens.length || !limit || !entries.length) return []
   const querySet = new Set(queryTokens)
-  const docStats = entries.map(entry => {
-    const searchable = [entry.text, entry.title ?? '', ...(entry.paths ?? [])].filter(Boolean).join(' ')
-    const tokens = tokenize(searchable)
-    return { entry, tf: termCounts(tokens), dl: Math.max(1, tokens.length) }
-  })
+  const docStats = entries.map(cachedDocStats)
   const avgdl = docStats.reduce((sum, doc) => sum + doc.dl, 0) / docStats.length
   const df = new Map<string, number>()
   for (const token of querySet) {
@@ -337,9 +367,7 @@ export class LocalMemory {
       batch.flatMap(entry => entry.sourceRefs), { signal }))
     if (signal.aborted) return
     const retained = batches.flatMap((batch, batchIndex) => batch.filter((_, itemIndex) => verdicts[batchIndex]?.[itemIndex]))
-    this.capture(event, scope, retained.filter(entry => entry.kind === 'fact'), scopePath)
-    const experiences = retained.filter(entry => entry.kind === 'experience')
-    if (experiences.length) this.capture(event, scope, experiences, scopePath)
+    if (retained.length) this.capture(event, scope, retained, scopePath)
   }
 
   capture(event: EventDraft, scope: string, entries: readonly MemoryCandidate[], scopePath?: string): void {
@@ -364,9 +392,13 @@ export class LocalMemory {
           previous.title !== candidate.title)
         const sourceRefs = superseded ? newSources : [...(previous?.sourceRefs ?? []), ...newSources].slice(0, maxSourceRefs)
         if (previous && !superseded && sourceRefs.length === previous.sourceRefs.length) continue
+        const mergedEvidence = candidate.evidenceRefs || previous?.evidenceRefs
+          ? [...new Set([...(superseded ? [] : (previous?.evidenceRefs ?? [])), ...(candidate.evidenceRefs ?? [])])].slice(0, maxSourceRefs)
+          : undefined
         const entry: StoredMemoryEntry = {
           ...candidate,
           sourceRefs,
+          ...(mergedEvidence?.length ? { evidenceRefs: mergedEvidence } : {}),
           seenSources: [...newSources, ...(previous?.seenSources ?? [])].slice(0, maxSeenSources),
           schemaVersion: 1,
           id,

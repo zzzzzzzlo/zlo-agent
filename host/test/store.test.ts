@@ -175,7 +175,7 @@ test('configures SQLite busy_timeout on WAL database while wrapping persistence 
   assert.throws(() => store.transaction(() => 1), (error: unknown) => error instanceof StorePersistenceError);
 });
 
-test('P2-1: migrates v1 SQLite stores to v2 and uses expression indexes for taskId and ready-status queries', (t) => {
+test('P2-1: migrates v1 SQLite stores to v3 and uses expression indexes for tasks, operations and task-nodes', (t) => {
   const path = databasePath(t);
   const legacy = new DatabaseSync(path);
   legacy.exec(`
@@ -204,17 +204,56 @@ test('P2-1: migrates v1 SQLite stores to v2 and uses expression indexes for task
   try {
     assert.deepEqual(store.firstReadyTask(), { id: '02', status: 'ready' });
     assert.deepEqual(store.recordsByTaskId('operations', '02'), [{ id: 'op-1', taskId: '02' }]);
+    store.transaction(() => {
+      store.put('operations', 'op-1', { id: 'op-1', taskId: '02', taskNodeId: 'n1', attemptId: 'att-1' });
+      store.put('attempts', 'att-1', { id: 'att-1', taskId: '02', nodeId: 'n1' });
+      store.put('task-nodes', '02:n1', { id: 'n1', taskId: '02', parentNodeId: 'root', ordinal: 1, status: 'succeeded', archivedAt: '2026-01-01T00:00:00Z' });
+      store.put('task-nodes', '02:n2', { id: 'n2', taskId: '02', parentNodeId: 'root', ordinal: 2, status: 'ready' });
+      store.put('task-nodes', '02:n3', { id: 'n3', taskId: '02', parentNodeId: 'team-1', ordinal: 3, status: 'running' });
+    });
+    assert.equal(store.operationsForNode('02', 'n1').length, 1);
+    assert.equal(store.operationsForAttempt('02', 'att-1').length, 1);
+    assert.equal(store.attemptsForNode('02', 'n1').length, 1);
+    assert.equal(store.taskNodes('02').length, 3);
+    assert.equal(store.taskNodes('02', { includeArchived: false }).length, 2);
+    assert.equal(store.taskNodesByParent('02', 'team-1').length, 1);
+    assert.equal(store.taskNodesByStatus('02', 'ready').length, 1);
+    const page1 = store.taskNodesPage<{ id: string }>('02', { limit: 2 });
+    assert.deepEqual(page1.items.map(item => item.id), ['n1', 'n2']);
+    assert.equal(page1.hasMore, true);
+    assert.equal(page1.nextOrdinal, 2);
+    const page2 = store.taskNodesPage<{ id: string }>('02', { afterOrdinal: page1.nextOrdinal!, limit: 2 });
+    assert.deepEqual(page2.items.map(item => item.id), ['n3']);
+    assert.equal(page2.hasMore, false);
     const reader = new DatabaseSync(path, { readOnly: true });
     try {
-      assert.equal(reader.prepare('PRAGMA user_version').get()?.user_version, 2);
+      assert.equal(reader.prepare('PRAGMA user_version').get()?.user_version, 3);
       const opPlan = reader.prepare(`
         EXPLAIN QUERY PLAN SELECT value FROM records INDEXED BY idx_records_operations_task WHERE namespace = 'operations' AND json_extract(value, '$.taskId') = ? ORDER BY id
       `).all('02').map(row => String(row.detail)).join('\n');
       assert.match(opPlan, /SEARCH records USING INDEX idx_records_operations_task/);
+      const opNodePlan = reader.prepare(`
+        EXPLAIN QUERY PLAN SELECT value FROM records INDEXED BY idx_records_operations_node WHERE namespace = 'operations' AND json_extract(value, '$.taskId') = ? AND json_extract(value, '$.taskNodeId') = ? ORDER BY id
+      `).all('02', 'n1').map(row => String(row.detail)).join('\n');
+      assert.match(opNodePlan, /SEARCH records USING INDEX idx_records_operations_node/);
+      const opAttemptPlan = reader.prepare(`
+        EXPLAIN QUERY PLAN SELECT value FROM records INDEXED BY idx_records_operations_attempt WHERE namespace = 'operations' AND json_extract(value, '$.taskId') = ? AND json_extract(value, '$.attemptId') = ? ORDER BY id
+      `).all('02', 'att-1').map(row => String(row.detail)).join('\n');
+      assert.match(opAttemptPlan, /SEARCH records USING INDEX idx_records_operations_attempt/);
+      const attemptNodePlan = reader.prepare(`
+        EXPLAIN QUERY PLAN SELECT value FROM records INDEXED BY idx_records_attempts_node WHERE namespace = 'attempts' AND json_extract(value, '$.taskId') = ? AND json_extract(value, '$.nodeId') = ? ORDER BY id
+      `).all('02', 'n1').map(row => String(row.detail)).join('\n');
+      assert.match(attemptNodePlan, /SEARCH records USING INDEX idx_records_attempts_node/);
       const readyPlan = reader.prepare(`
         EXPLAIN QUERY PLAN SELECT value FROM records INDEXED BY idx_records_task_status WHERE namespace = 'tasks' AND json_extract(value, '$.status') = 'ready' ORDER BY id ASC LIMIT 1
       `).all().map(row => String(row.detail)).join('\n');
       assert.match(readyPlan, /SEARCH records USING INDEX idx_records_task_status/);
+      const activeNodesPlan = reader.prepare(`
+        EXPLAIN QUERY PLAN SELECT value FROM records INDEXED BY idx_records_task_nodes_active
+        WHERE namespace = 'task-nodes' AND json_extract(value, '$.taskId') = ? AND json_extract(value, '$.archivedAt') IS NULL
+        ORDER BY COALESCE(json_extract(value, '$.ordinal'), 0), id
+      `).all('02').map(row => String(row.detail)).join('\n');
+      assert.match(activeNodesPlan, /SEARCH records USING INDEX idx_records_task_nodes_active/);
     } finally {
       reader.close();
     }

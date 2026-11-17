@@ -122,6 +122,10 @@ function safePayload(type: string, p: Record<string, unknown>): Record<string, u
           role: oneOf(node.role, roles), access: oneOf(node.access, accessLevels) }
       }),
     }
+    case 'task.nodes_archived': return {
+      count: num(p.count),
+      nodeIds: refs(p.nodeIds),
+    }
     case 'task.node_started': case 'task.node_settled': case 'task.worker_settled': return {
       status, parentNodeId: ref(p.parentNodeId), role: oneOf(p.role, roles), worktreeId: ref(p.worktreeId),
       attemptStatus: oneOf(p.attemptStatus, states), executionStatus: oneOf(p.executionStatus, ['completed', 'failed']),

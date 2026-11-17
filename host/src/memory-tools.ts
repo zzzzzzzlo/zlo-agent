@@ -28,6 +28,10 @@ function formatMemoryRow(entry: MemoryEntry) {
     text: entry.text,
     ...(entry.paths?.length ? { paths: entry.paths } : {}),
     ...(entry.durable ? { durable: true } : {}),
+    ...(entry.taskId ? { taskId: entry.taskId } : {}),
+    ...(entry.nodeId ? { nodeId: entry.nodeId } : {}),
+    ...(entry.attemptId ? { attemptId: entry.attemptId } : {}),
+    ...(entry.evidenceRefs?.length ? { evidenceRefs: entry.evidenceRefs } : {}),
     version: entry.version,
     updatedAt: entry.updatedAt,
   }
@@ -191,6 +195,10 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
           ...(input.title ? { title: input.title } : {}),
           ...(normalizedPaths?.length ? { paths: normalizedPaths } : {}),
           durable: input.durable ?? true,
+          taskId: context.taskId,
+          ...(eventDraft.taskNodeId ? { nodeId: eventDraft.taskNodeId } : {}),
+          ...(eventDraft.taskAttemptId ? { attemptId: eventDraft.taskAttemptId } : {}),
+          evidenceRefs: [sourceRef],
         }
         const controller = new AbortController()
         const activeSignal = signal ?? controller.signal

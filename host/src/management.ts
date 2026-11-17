@@ -82,10 +82,12 @@ export function toolCatalog(extensions: ReturnType<ExtensionRegistry['resolve']>
     }
   }
   if (extensions.profile.delegation) {
-    for (const name of ['delegate_task', 'delegate_worker', 'propose_task_plan', 'replan_task_node']) {
+    for (const name of ['delegate_task', 'delegate_worker', 'propose_task_plan', 'replan_task_node', 'inspect_task_dag']) {
       const enabledHere = enabled(name)
       catalog.set(name, { name, plugin: 'collaboration', effect: 'read', approval: false, enabled: enabledHere,
-        root: enabledHere && name !== 'delegate_worker', team: enabledHere && name === 'delegate_worker', worker: false })
+        root: enabledHere && name !== 'delegate_worker',
+        team: enabledHere && (name === 'delegate_worker' || name === 'inspect_task_dag'),
+        worker: false })
     }
   }
   return [...catalog.values()].sort((left, right) => left.name.localeCompare(right.name))

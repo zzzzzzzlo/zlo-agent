@@ -4,7 +4,18 @@ import type { NodeProposal, NodeReplan, WorkerNode } from './task-engine.ts'
 const string = { type: 'string' }
 const ref = { ...string, maxLength: 100 }
 const goal = { ...string, minLength: 1, maxLength: 8000 }
-const dependencies = { type: 'array', maxItems: 16, items: ref }
+const dependencies = { type: 'array', maxItems: 64, items: ref }
+const inspectViews = ['active', 'team_summaries', 'node_detail', 'evidence', 'history_page'] as const
+export type DagInspectView = (typeof inspectViews)[number]
+export interface DagInspectQuery {
+  view: DagInspectView
+  teamNodeId?: string
+  nodeId?: string
+  evidenceRef?: string
+  parentNodeId?: string
+  afterOrdinal?: number
+  limit?: number
+}
 type CommandName = NonNullable<NonNullable<NodeProposal['check']>['command']>['command']
 const commandNames: readonly CommandName[] = ['npm_test', 'npm_build', 'npm_lint', 'npm_typecheck', 'node_script']
 const fileCheck = {
@@ -94,10 +105,10 @@ export function delegationTool(name: 'delegate_task' | 'delegate_worker', execut
 export function planTool(execute: (id: string, proposals: NodeProposal[], signal?: AbortSignal) => Promise<unknown>): ExecutionTool {
   return {
     name: 'propose_task_plan',
-    description: 'Execute a bounded task DAG. Use local refs in dependencies. Parallel write nodes each require a distinct approved git_worktree ID. Use a stable teamKey for persistent specialists and explicit write access for coding nodes. Verification check accepts { path, contains? } or { command: { command, path, args? } } for trusted nodes.',
+    description: 'Execute a dynamically extensible task DAG (up to 64 nodes per batch, repeatable across waves). Use local refs in dependencies. Parallel write nodes each require a distinct approved git_worktree ID, while multiple read nodes run in parallel automatically. Use a stable teamKey for persistent specialists and explicit write access for coding nodes. Verification check accepts { path, contains? } or { command: { command, path, args? } } for trusted nodes.',
     parameters: {
       type: 'object', additionalProperties: false, required: ['nodes'],
-      properties: { nodes: { type: 'array', minItems: 1, maxItems: 8, items: {
+      properties: { nodes: { type: 'array', minItems: 1, maxItems: 64, items: {
         type: 'object', additionalProperties: false, required: ['ref', 'goal'], properties,
       } } },
     },
@@ -135,6 +146,63 @@ export function replanTool(execute: (
         ...(goal !== undefined ? { goal } : {}),
         ...(dependencies !== undefined ? { dependencies } : {}),
         ...(check !== undefined ? { check } : {}),
+      }, signal)
+    },
+  }
+}
+
+export function inspectDagTool(execute: (query: DagInspectQuery, signal?: AbortSignal) => Promise<unknown>): ExecutionTool {
+  return {
+    name: 'inspect_task_dag',
+    description: 'On-demand inspection of active DAG nodes, Team stage summaries, full historical node details (including archived nodes), paginated node history, or an execution evidenceRef.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      required: ['view'],
+      properties: {
+        view: { type: 'string', enum: [...inspectViews] },
+        teamNodeId: { type: 'string', minLength: 1, maxLength: 100 },
+        nodeId: { type: 'string', minLength: 1, maxLength: 100 },
+        evidenceRef: { type: 'string', minLength: 1, maxLength: 200 },
+        parentNodeId: { type: 'string', minLength: 1, maxLength: 100 },
+        afterOrdinal: { type: 'integer', minimum: -1, maximum: 10_000_000 },
+        limit: { type: 'integer', minimum: 1, maximum: 100 },
+      },
+    },
+    execute(_id, raw, signal) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        return Promise.resolve({ ok: false, error: 'Invalid DAG inspection arguments' })
+      }
+      const input = raw as Record<string, unknown>
+      const allowed = new Set(['view', 'teamNodeId', 'nodeId', 'evidenceRef', 'parentNodeId', 'afterOrdinal', 'limit'])
+      if (Object.keys(input).some(key => !allowed.has(key))) {
+        return Promise.resolve({ ok: false, error: 'Unsupported DAG inspection argument' })
+      }
+      if (typeof input.view !== 'string' || !(inspectViews as readonly string[]).includes(input.view)) {
+        return Promise.resolve({ ok: false, error: 'Invalid DAG inspection view' })
+      }
+      for (const field of ['teamNodeId', 'nodeId', 'evidenceRef', 'parentNodeId'] as const) {
+        const val = input[field]
+        if (val !== undefined && (typeof val !== 'string' || !val.trim() || val.length > 200)) {
+          return Promise.resolve({ ok: false, error: `Invalid ${field}` })
+        }
+      }
+      if (input.afterOrdinal !== undefined &&
+        (typeof input.afterOrdinal !== 'number' || !Number.isSafeInteger(input.afterOrdinal) || input.afterOrdinal < -1 || input.afterOrdinal > 10_000_000)) {
+        return Promise.resolve({ ok: false, error: 'Invalid afterOrdinal cursor' })
+      }
+      if (input.limit !== undefined &&
+        (typeof input.limit !== 'number' || !Number.isSafeInteger(input.limit) || input.limit < 1 || input.limit > 100)) {
+        return Promise.resolve({ ok: false, error: 'Invalid page limit' })
+      }
+      return execute({
+        view: input.view as DagInspectView,
+        ...(typeof input.teamNodeId === 'string' ? { teamNodeId: input.teamNodeId } : {}),
+        ...(typeof input.nodeId === 'string' ? { nodeId: input.nodeId } : {}),
+        ...(typeof input.evidenceRef === 'string' ? { evidenceRef: input.evidenceRef } : {}),
+        ...(typeof input.parentNodeId === 'string' ? { parentNodeId: input.parentNodeId } : {}),
+        ...(typeof input.afterOrdinal === 'number' ? { afterOrdinal: input.afterOrdinal } : {}),
+        ...(typeof input.limit === 'number' ? { limit: input.limit } : {}),
       }, signal)
     },
   }
