@@ -63,6 +63,12 @@ export function operationId(value: unknown): string {
   return value
 }
 
+function catalogToolEffect(plugin: string, tool: { name: string; effect: 'read' | 'write' }): ManagedTool['effect'] {
+  if (tool.effect === 'write') return 'write'
+  if (plugin === 'memory' && tool.name === 'memory_save') return 'memory'
+  return 'read'
+}
+
 export function toolCatalog(extensions: ReturnType<ExtensionRegistry['resolve']>, capabilities: CodingCapabilities,
   workspace: CodingWorkspace, rootAccess: WorkspaceAccess, enabled: (name: string) => boolean): ManagedTool[] {
   const rootScope = capabilities.root(rootAccess, false)
@@ -71,7 +77,7 @@ export function toolCatalog(extensions: ReturnType<ExtensionRegistry['resolve']>
   for (const role of roles) {
     for (const { plugin, tool } of extensions.catalog(workspace, role, 'trusted')) {
       const entry = catalog.get(tool.name) ?? {
-        name: tool.name, plugin, effect: tool.effect, approval: Boolean(tool.policy?.approval || tool.policy?.approvalFor), enabled: enabled(tool.name),
+        name: tool.name, plugin, effect: catalogToolEffect(plugin, tool), approval: Boolean(tool.policy?.approval || tool.policy?.approvalFor), enabled: enabled(tool.name),
         root: false, team: false, worker: false,
       }
       if (entry.enabled && capabilities.enabled(tool.name)) {

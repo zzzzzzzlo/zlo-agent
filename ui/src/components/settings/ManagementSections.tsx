@@ -202,7 +202,7 @@ function Tools({ snapshot, busy, save }: PreferencesProps) {
           <label className="management-row" key={tool.name}>
             <div>
               <strong>{tool.name}</strong>
-              <small>{tool.plugin} · {tool.effect === 'write' ? '可能修改状态' : '只读'}{tool.approval && ' · 需要审批'}</small>
+              <small>{tool.plugin} · {tool.effect === 'write' ? '可能修改状态' : tool.effect === 'memory' ? '修改持久记忆' : '只读'}{tool.approval && ' · 需要审批'}</small>
               <small>{[tool.root && 'Root', tool.team && 'Team', tool.worker && 'Worker'].filter(Boolean).join(' / ') || '当前角色不可用'}</small>
             </div>
             <input type="checkbox" checked={tool.enabled} disabled={busy} aria-label={tool.name + ' 已启用'} onChange={(event) => {
