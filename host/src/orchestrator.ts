@@ -1,17 +1,18 @@
 import { createHash, randomUUID } from 'node:crypto'
 import { dirname, join } from 'node:path'
-import { delegationTool, handoffs, inspectDagTool, planTool, replanTool } from './agent-plan.ts'
+import { AgentMailbox, formatMailboxPrompt, nodeEventKey, nodeFailureReason, notificationFromNode } from './agent-mailbox.ts'
+import { delegationTool, handoffs, inspectDagTool, inspectNodesTool, planTool, replanTool, waitNodesTool } from './agent-plan.ts'
 import type { DagInspectQuery } from './agent-plan.ts'
 import { ModelUnavailableError } from './execution.ts'
 import type { AgentExecution, ExecutionConfig, ExecutionSession, ExecutionTool, RuntimeEvent } from './execution.ts'
-import type { EndReason, EventDraft, ModelRoute, SessionRef } from './contracts/domain.ts'
+import type { EndReason, EventDraft, ModelRoute, SessionRef, WorkspaceAccess } from './contracts/domain.ts'
 import type { LocalJudgment } from './judgment.ts'
 import { frameInstruction, preflight, skillDisclosure } from './input-judgment.ts'
 import { memoryEntryInScope, workspaceMemoryScope } from './memory.ts'
 import type { ScopedContext } from './memory.ts'
-import { ModelBudgetError } from './model-scheduler.ts'
+import { inferTaskRole, ModelBudgetError } from './model-scheduler.ts'
 import type { LocalModelScheduler } from './model-scheduler.ts'
-import type { AgentRole, CapabilityScope, CodingCapabilities, CodingProfile, ExtensionRegistry } from './policies.ts'
+import type { AgentRole, CapabilityGrant, CodingCapabilities, CodingProfile, ExtensionRegistry } from './policies.ts'
 import type { LocalStore } from './store.ts'
 import { isUnresolvedEffect } from './task-engine.ts'
 import type { NodeProposal, TaskEngine, TaskSnapshot, WorkerNode, WorkerResult } from './task-engine.ts'
@@ -25,6 +26,7 @@ import { verifyWorkspace } from './verification.ts'
 import { VisualTelemetry } from './visual-workflow.ts'
 import { workspaceTarget } from './workspace.ts'
 import type { CodingWorkspace, WorkspaceLease } from './workspace.ts'
+import { redactProcessOutput } from './workspace-process.ts'
 
 interface AgentRecord {
   schemaVersion: 1
@@ -35,12 +37,33 @@ interface AgentRecord {
   session: SessionRef
   route: ModelRoute
 }
+
+interface TeamIdentityRecord {
+  schemaVersion: 1
+  id: string
+  teamKey: string
+  taskId: string
+  conversationId?: string
+  createdAt: string
+}
+
+interface TeamSessionRecord {
+  schemaVersion: 1
+  identityKey: string
+  agentId: string
+  session: SessionRef
+  route: ModelRoute
+  cwd: string
+  updatedAt: string
+}
+
 interface AgentRun {
   schemaVersion: 1
   event: EventDraft
   status: 'active' | 'completed' | 'interrupted' | 'failed'
   role?: AgentRole
 }
+
 export interface OutputEvent {
   taskId: string
   agentRunId: string
@@ -57,7 +80,33 @@ const deadlines: Record<HarnessMode, { root: number; child: number }> = {
   fast: { root: 600_000, child: 120_000 }, quality: { root: 900_000, child: 300_000 },
 }
 type ProfileRuntime = ReturnType<ExtensionRegistry['resolve']>
-type WorkerHandoff = WorkerResult & { verification?: WorkerNode['verification'] }
+type WorkerHandoff = WorkerResult & { verification?: WorkerNode['verification']; failureReason?: string }
+
+interface ActiveScope {
+  event: EventDraft
+  route: ModelRoute
+  workspace: CodingWorkspace
+  signal: AbortSignal
+  lease?: WorkspaceLease
+  canDispatch?: () => boolean
+}
+
+interface TaskCoordinator {
+  mailbox: AgentMailbox
+  activeNodes: Map<string, Promise<WorkerHandoff | undefined>>
+  activeScopes: Map<string, ActiveScope>
+  scheduleAll(): void
+  launchNode(
+    node: WorkerNode,
+    parent: EventDraft,
+    workspace: CodingWorkspace,
+    parentRoute: ModelRoute,
+    parentScope: CapabilityGrant,
+    signal: AbortSignal,
+    suspendParent: boolean,
+  ): Promise<WorkerHandoff | undefined>
+  hasPendingWork(ownerNodeId: string): boolean
+}
 
 export function memoryScope(task: TaskSnapshot, _route?: ModelRoute): string {
   return workspaceMemoryScope(task.cwd)
@@ -65,6 +114,19 @@ export function memoryScope(task: TaskSnapshot, _route?: ModelRoute): string {
 
 export function legacyMemoryScope(task: TaskSnapshot, route: ModelRoute): string {
   return JSON.stringify([task.conversationId ?? task.cwd, route.provider])
+}
+
+export function teamMemoryScope(task: TaskSnapshot, teamKey: string): string {
+  return JSON.stringify([task.conversationId ?? task.cwd, 'team', teamKey])
+}
+
+/** Stable logical Team identifier decoupled from access, scopePath, tools, worktreeId, and Provider. */
+export function stableTeamIdentityKey(task: Pick<TaskSnapshot, 'id' | 'conversationId'>, teamKey: string): string {
+  return 'team-' + createHash('sha256').update(JSON.stringify([task.conversationId ?? task.id, teamKey])).digest('hex')
+}
+
+function teamSessionStorageKey(identityKey: string, provider: string, cwd: string): string {
+  return 'session-' + createHash('sha256').update(JSON.stringify([identityKey, provider, cwd])).digest('hex')
 }
 
 function receiptId(id: string): string {
@@ -75,6 +137,13 @@ function deferredResultPrompt(receipts: readonly string[]): string {
   return 'A shell command was still running when you responded. Its recorded result is now: ' + receipts.join(', ') +
     '. Check the process status and output before finalizing. If the result is uncertain, inspect using scoped read-only tools and explain what needs verification. Do not rerun a command with unknown effects.'
 }
+
+function safeErrorReason(error: unknown): string | undefined {
+  if (!(error instanceof Error) || !error.message) return undefined
+  const clean = redactProcessOutput(error.message).replace(/[\p{Cc}\p{Cf}]+/gu, ' ').trim().slice(0, 180)
+  return clean || undefined
+}
+
 
 export class MultiAgentOrchestrator {
   readonly #db: LocalStore
@@ -132,7 +201,7 @@ export class MultiAgentOrchestrator {
     this.#onCheckpoint = ports.onCheckpoint
   }
 
-  #runtimePolicy(workspace: CodingWorkspace, scope: CapabilityScope) {
+  #runtimePolicy(workspace: CodingWorkspace, scope: CapabilityGrant) {
     return {
       instructionScopes: { user: join(dirname(this.#sessions), 'instructions'),
         ...(scope.access === 'trusted' && !scope.path ? { project: workspace.root } : {}) },
@@ -142,7 +211,27 @@ export class MultiAgentOrchestrator {
     }
   }
 
-  #childScope(workspace: CodingWorkspace, parent: CapabilityScope, proposal: Partial<NodeProposal>, role: 'team' | 'worker') {
+  #resolveRootGrant(taskId: string): CapabilityGrant {
+    const current = this.#tasks.getMeta(taskId)
+    return this.#capabilities.root(current.workspaceAccess, Boolean(current.check))
+  }
+
+  #resolveNodeGrant(taskId: string, nodeId: string): CapabilityGrant | undefined {
+    const current = this.#tasks.getMeta(taskId)
+    const rootGrant = this.#capabilities.root(current.workspaceAccess, Boolean(current.check))
+    if (nodeId === current.rootNodeId) return rootGrant
+    const node = this.#tasks.getNode(taskId, nodeId)
+    if (!node) return undefined
+    let parentGrant = rootGrant
+    if (node.parentNodeId !== current.rootNodeId) {
+      const parentNode = this.#tasks.getNode(taskId, node.parentNodeId)
+      if (!parentNode) return undefined
+      parentGrant = this.#capabilities.clamp(rootGrant, parentNode.access, parentNode.scopePath, 'team', parentNode.tools, parentNode.disallowedTools)
+    }
+    return this.#capabilities.clamp(parentGrant, node.access, node.scopePath, node.role ?? 'worker', node.tools, node.disallowedTools)
+  }
+
+  #childScope(workspace: CodingWorkspace, parent: CapabilityGrant, proposal: Partial<NodeProposal>, role: 'team' | 'worker'): CapabilityGrant {
     const scope = this.#capabilities.child(parent, proposal.access, proposal.scopePath, role, proposal.tools, proposal.disallowedTools)
     const checkedTools = new Set([...(proposal.tools ?? []), ...(proposal.disallowedTools ?? [])])
     if (checkedTools.size) {
@@ -158,8 +247,7 @@ export class MultiAgentOrchestrator {
     if (!Array.isArray(proposals) || !proposals.length) throw new Error('Invalid plan size')
     const task = this.#tasks.getMeta(taskId)
     const rootScope = this.#capabilities.root(task.workspaceAccess, Boolean(task.check))
-    const currentRoute = this.rootRoute(taskId) ?? task.route
-    const teamScopes = new Map<string, CapabilityScope>()
+    const teamScopes = new Map<string, CapabilityGrant>()
     for (const existing of this.#tasks.nodesByParent(taskId, task.rootNodeId)) {
       if (existing.role === 'team') {
         teamScopes.set(existing.id, this.#childScope(workspace, rootScope, existing, 'team'))
@@ -177,12 +265,8 @@ export class MultiAgentOrchestrator {
         if (!parentScope || role !== 'worker') throw new Error('Invalid nested node scope')
         this.#childScope(workspace, parentScope, proposal, 'worker')
       }
-      if (proposal.route) {
-        if (currentRoute && !this.#scheduler.canSwitch(currentRoute, proposal.route)) {
-          throw new Error('Cross-provider delegation is not authorized')
-        }
-        await this.#scheduler.validateRoute(proposal.route)
-      }
+      // Fresh planned nodes can select any authorized model route, including cross-provider routes.
+      if (proposal.route) await this.#scheduler.validateRoute(proposal.route)
     }
   }
 
@@ -297,7 +381,6 @@ export class MultiAgentOrchestrator {
   }
 
   #emit(event: EventDraft, runtime: RuntimeEvent, role: AgentRecord['role']): void {
-    // Pi can emit the switch while opening the Session. Route changes are recorded after registration.
     if (runtime.type === 'model.route_changed' || runtime.type === 'instruction.applied' || runtime.type === 'prompt.accepted') return
     if (runtime.type === 'message.delta') {
       if (role === 'root' && runtime.delta) this.#onOutput?.(event, runtime.delta)
@@ -323,12 +406,35 @@ export class MultiAgentOrchestrator {
   }
 
   #register(task: TaskSnapshot, session: ExecutionSession, event: EventDraft, agentKey: string, role: AgentRole,
-    maxDurationMs: number, parentAgentId?: string): EventDraft {
+    maxDurationMs: number, parentAgentId?: string, teamBinding?: { key: string; teamKey: string; cwd: string }): EventDraft {
     const recorded = { ...event, sessionId: session.ref.id }
     this.#db.transaction(() => {
       const agent: AgentRecord = { schemaVersion: 1, id: event.agentId!, taskId: task.id, role, session: session.ref, route: session.route, parentAgentId }
       const run: AgentRun = { schemaVersion: 1, event: recorded, role, status: 'active' }
       this.#db.put('agents', agentKey, agent)
+      if (teamBinding) {
+        const existingIdentity = this.#db.get<TeamIdentityRecord>('team-identities', teamBinding.key)
+        if (!existingIdentity) {
+          this.#db.put('team-identities', teamBinding.key, {
+            schemaVersion: 1,
+            id: event.agentId!,
+            teamKey: teamBinding.teamKey,
+            taskId: task.id,
+            conversationId: task.conversationId,
+            createdAt: new Date().toISOString(),
+          } satisfies TeamIdentityRecord)
+        }
+        const sessionKey = teamSessionStorageKey(teamBinding.key, session.route.provider, teamBinding.cwd)
+        this.#db.put('team-sessions', sessionKey, {
+          schemaVersion: 1,
+          identityKey: teamBinding.key,
+          agentId: event.agentId!,
+          session: session.ref,
+          route: session.route,
+          cwd: teamBinding.cwd,
+          updatedAt: new Date().toISOString(),
+        } satisfies TeamSessionRecord)
+      }
       if (role === 'root') this.#db.put('task-sessions', task.id, session.ref)
       this.#db.put('agent-runs', event.agentRunId!, run)
       this.#db.append({ ...recorded, type: 'agent.started', payload: { role, route: session.route, parentAgentId,
@@ -374,8 +480,18 @@ export class MultiAgentOrchestrator {
     }
   }
 
+  #isCompatibleTeamSession(record: { session: SessionRef; route: ModelRoute; cwd?: string } | undefined,
+    expectedRoute: ModelRoute | undefined, cwd: string): SessionRef | undefined {
+    if (!record) return undefined
+    if (record.cwd && record.cwd !== cwd) return undefined
+    if (expectedRoute && !this.#scheduler.canResumeSession(record.route, expectedRoute)) return undefined
+    if (this.#execution.verifySession && !this.#execution.verifySession(record.session, cwd)) return undefined
+    return record.session
+  }
+
   async #worker(task: TaskSnapshot, node: WorkerNode, parent: EventDraft, workspace: CodingWorkspace,
-    parentRoute: ModelRoute, parentScope: CapabilityScope, rootSignal: AbortSignal, suspendParent = false): Promise<WorkerHandoff | undefined> {
+    parentRoute: ModelRoute, parentScope: CapabilityGrant, rootSignal: AbortSignal,
+    suspendParent: boolean, coordinator: TaskCoordinator): Promise<WorkerHandoff | undefined> {
     const role = node.role ?? 'worker'
     const deadline = new AbortController()
     const stalled = new AbortController()
@@ -383,6 +499,8 @@ export class MultiAgentOrchestrator {
     const timer = setTimeout(() => deadline.abort(), timeMs)
     timer.unref()
     const signal = AbortSignal.any([rootSignal, deadline.signal, stalled.signal])
+    const stopChildren = new AbortController()
+    const childSignal = AbortSignal.any([signal, stopChildren.signal])
     let event: EventDraft = {
       taskId: task.id, taskRunId: task.taskRunId, taskNodeId: node.id,
       agentId: randomUUID(), agentRunId: randomUUID(), parentAgentRunId: parent.agentRunId, type: '', payload: {},
@@ -402,16 +520,19 @@ export class MultiAgentOrchestrator {
     let registered = false
     let teamLease: string | undefined
     let workspaceLease: WorkspaceLease | undefined
-    let activeChildCount = 0
-    let activeChildWrite = false
     let workspaceActive = false
     let exhausted = false
+    let modelFailed = false
+    let caughtReason: string | undefined
+    let lastOutcomeStatus: string | undefined
     const blockingWrite = (managedOwner?: string) => this.#tasks.blocksToolWork(task.id, managedOwner, node.worktreeId)
+
     try {
       if (rootSignal.aborted || blockingWrite()) return undefined
       const attemptId = this.#tasks.startWorker(task.id, node.id, { suspendParent })
       event = { ...event, taskAttemptId: attemptId }
       started = true
+
       if (node.worktreeId && parent.taskNodeId === task.rootNodeId) {
         const isolated = await this.#resolveWorkspace?.(workspace, task.id, node.worktreeId, signal)
         if (!isolated) throw new Error('Worktree ownership or registration could not be verified')
@@ -422,120 +543,201 @@ export class MultiAgentOrchestrator {
       const parentNode = node.parentNodeId !== task.rootNodeId ? this.#tasks.getNode(task.id, node.parentNodeId) : undefined
       const scopes = [node, ...(parentNode ? [parentNode] : [])].flatMap(({ id, budget }) =>
         budget?.requests === undefined ? [] : [{ nodeId: id, requests: budget.requests }])
-      lease = this.#scheduler.reserve(() => event, role, scopes)
-      const scope = this.#childScope(workspace, parentScope, node, role)
-      const teamKey = role === 'team'
-        ? 'team-' + createHash('sha256').update(JSON.stringify([task.conversationId ?? task.id, node.teamKey, parentRoute.provider,
-          { access: scope.access, path: scope.path, tools: scope.tools, disallowedTools: scope.disallowedTools, worktreeId: node.worktreeId }])).digest('hex')
-        : undefined
-      const saved = teamKey ? this.#db.get<AgentRecord>('agents', teamKey) : undefined
-      if (teamKey) {
-        if (this.#activeTeams.has(teamKey)) throw new Error('Team Session is active')
-        this.#activeTeams.add(teamKey)
-        teamLease = teamKey
-        if (saved) event = { ...event, agentId: saved.id }
+      if (!this.#scheduler.hasBudget(task.id, scopes)) {
+        exhausted = true
+        throw new ModelBudgetError('Delegated model budget exhausted')
       }
-      const route = await this.#scheduler.allocate(event, parentRoute, node.route ?? saved?.route, Boolean(node.role), node.goal, signal)
-      const availableTools = this.#extensions.tools(workspace, role, scope.access)
-        .filter(tool => this.#capabilities.describe(scope, tool))
-      const tools = availableTools
+      lease = this.#scheduler.reserve(() => event, role, scopes)
+
+      // Freshly resolve the runtime CapabilityGrant from current Task + Parent permissions (decoupled from Identity/Session).
+      const liveGrant = this.#resolveNodeGrant(task.id, node.id) ?? this.#childScope(workspace, parentScope, node, role)
+      const currentGrant = () => this.#resolveNodeGrant(task.id, node.id) ?? liveGrant
+
+      // Decoupled stable logical Team identity (independent of access, path, tools, worktreeId, Provider).
+      const teamIdentityKey = role === 'team' && node.teamKey
+        ? stableTeamIdentityKey(task, node.teamKey)
+        : undefined
+      const existingIdentity = teamIdentityKey ? this.#db.get<TeamIdentityRecord>('team-identities', teamIdentityKey) : undefined
+      const legacyAgent = teamIdentityKey ? this.#db.get<AgentRecord>('agents', teamIdentityKey) : undefined
+      if (teamIdentityKey) {
+        if (this.#activeTeams.has(teamIdentityKey)) throw new Error('Team Session is active')
+        this.#activeTeams.add(teamIdentityKey)
+        teamLease = teamIdentityKey
+        const stableId = existingIdentity?.id ?? legacyAgent?.id
+        if (stableId) event = { ...event, agentId: stableId }
+      }
+
+      // Resolve compatible saved Pi Session (strictly same Provider + same canonical cwd) vs fresh Session (allows cross-provider).
+      let resumeCandidate: { session: SessionRef; route: ModelRoute; cwd?: string } | undefined
+      if (teamIdentityKey) {
+        const requestedProvider = node.route?.provider
+        const exactKey = requestedProvider ? teamSessionStorageKey(teamIdentityKey, requestedProvider, workspace.root) : undefined
+        const providerSession = exactKey ? this.#db.get<TeamSessionRecord>('team-sessions', exactKey) : undefined
+        if (providerSession && this.#isCompatibleTeamSession(providerSession, node.route ?? providerSession.route, workspace.root)) {
+          resumeCandidate = providerSession
+        } else if (!node.route && legacyAgent && this.#isCompatibleTeamSession({
+          session: legacyAgent.session, route: legacyAgent.route, cwd: task.cwd,
+        }, legacyAgent.route, workspace.root)) {
+          resumeCandidate = { session: legacyAgent.session, route: legacyAgent.route, cwd: task.cwd }
+        }
+      }
+
+      const canResume = Boolean(resumeCandidate)
+      const route = await this.#scheduler.allocate(
+        event,
+        parentRoute,
+        node.route ?? resumeCandidate?.route,
+        Boolean(node.role),
+        node.goal,
+        signal,
+        {
+          sessionMode: canResume ? 'resume' : 'fresh',
+          ...(resumeCandidate ? { sessionRoute: resumeCandidate.route } : {}),
+          taskRole: inferTaskRole(node.goal, Boolean(node.role)),
+          remainingRequests: node.budget?.requests,
+          allowFallback: !node.route && !canResume,
+        },
+      )
+      const sessionToResume = this.#isCompatibleTeamSession(resumeCandidate, route, workspace.root)
+
+      const availableTools = this.#extensions.tools(workspace, role, liveGrant.access)
+        .filter(tool => this.#capabilities.describe(liveGrant, tool))
+      const hasActiveChildren = () => this.#tasks.hasRunningNodes(task.id, node.id)
+      const tools: ExecutionTool[] = availableTools
         .map(tool => {
           const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input =>
-            activeChildCount === 0 &&
-            followUpAllows(followUp, tool.name) && this.#capabilities.authorize(scope, tool, input), evidence, artifacts, node.goal, scope.path)
+            !hasActiveChildren() && followUpAllows(followUp, tool.name) &&
+            this.#capabilities.authorize(currentGrant(), tool, input), evidence, artifacts, node.goal, liveGrant.path)
           return {
             ...wrapped,
             execute: async (id: string, input: unknown, toolSignal?: AbortSignal) => {
               if (workspaceActive) return { ok: false, error: 'Another workspace tool is active' }
               workspaceActive = true
-              try { return await wrapped.execute(id, input, toolSignal) } finally { workspaceActive = false }
+              try {
+                const toolWait = toolSignal ? AbortSignal.any([signal, toolSignal]) : signal
+                if (workspaceLease?.suspended) {
+                  await coordinator.mailbox.waitForActivity(node.id, hasActiveChildren, toolWait, { wakeOnUnread: false })
+                  if (!toolWait.aborted && !blockingWrite()) await workspaceLease.resume(toolWait)
+                }
+                return await wrapped.execute(id, input, toolSignal)
+              } finally {
+                workspaceActive = false
+                coordinator.scheduleAll()
+              }
             },
           } as ExecutionTool
         })
-      const replay = !scope.disallowedTools?.includes('read_tool_evidence') &&
-        (!scope.tools || scope.tools.includes('read_tool_evidence')) &&
+
+      const replay = !liveGrant.disallowedTools?.includes('read_tool_evidence') &&
+        (!liveGrant.tools || liveGrant.tools.includes('read_tool_evidence')) &&
         this.#canArchiveToolEvidence(task.id) &&
         toolRun.replayTool(() => event, signal, name => availableTools.some(tool => tool.name === name &&
-          this.#capabilities.describe(scope, tool) && followUpAllows(followUp, tool.name)))
+          this.#capabilities.describe(currentGrant(), tool) && followUpAllows(followUp, tool.name)))
       if (replay) tools.push(replay)
-      const runChild = async (child: WorkerNode) => {
-        if (followUp || workspaceActive || signal.aborted || !session) return undefined
-        const isWriteChild = child.access === 'write' || child.access === 'trusted'
-        if (activeChildCount > 0 && (isWriteChild || activeChildWrite)) return undefined
-        activeChildCount++
-        if (isWriteChild) activeChildWrite = true
-        try {
-          return await this.#worker(task, child, event, workspace, session.route, scope, signal, true)
-        } finally {
-          activeChildCount--
-          if (isWriteChild) activeChildWrite = false
+
+      const teamScopeNodes = () => this.#tasks.nodesByParent(task.id, node.id)
+
+      if (role === 'team' && this.#profile.delegation) {
+        if ((liveGrant.tools === undefined || liveGrant.tools.includes('inspect_task_dag')) &&
+          !liveGrant.disallowedTools?.includes('inspect_task_dag') && this.#capabilities.enabled('inspect_task_dag')) {
+          tools.push(inspectDagTool(query => Promise.resolve(this.#inspectDag(task.id, query, node.id))))
         }
-      }
-      const drainTeamChildren = async () => {
-        if (followUp || workspaceActive || signal.aborted || !session) return
-        const inFlight = new Map<string, Promise<void>>()
-        try {
-          while (!signal.aborted && !blockingWrite()) {
-            const runnable = this.#tasks.runnableNodes(task.id, node.id)
-            for (const child of runnable) {
-              if (inFlight.has(child.id)) continue
-              const isWriteChild = child.access === 'write' || child.access === 'trusted'
-              if (inFlight.size > 0 && (isWriteChild || activeChildWrite)) continue
-              const promise = runChild(child).finally(() => { inFlight.delete(child.id) }).then(() => undefined)
-              inFlight.set(child.id, promise)
+        if (this.#capabilities.enabled('delegate_worker')) tools.push(delegationTool('delegate_worker',
+          async (id, input, toolSignal) => {
+            const freshGrant = currentGrant()
+            if (!this.#capabilities.enabled('delegate_worker') ||
+              followUp || signal.aborted || toolSignal?.aborted || workspaceActive || blockingWrite()) {
+              return { ok: false, error: 'Delegation unavailable' }
             }
-            if (inFlight.size === 0) break
-            await Promise.race(inFlight.values())
-          }
-        } finally {
-          if (inFlight.size > 0) await Promise.allSettled(inFlight.values())
-        }
-      }
-      if (role === 'team' && this.#profile.delegation &&
-        (scope.tools === undefined || scope.tools.includes('inspect_task_dag')) &&
-        !scope.disallowedTools?.includes('inspect_task_dag') &&
-        this.#capabilities.enabled('inspect_task_dag')) {
-        tools.push(inspectDagTool(query => Promise.resolve(this.#inspectDag(task.id, query, node.id))))
-      }
-      if (role === 'team' && this.#profile.delegation && this.#capabilities.enabled('delegate_worker')) tools.push(delegationTool('delegate_worker',
-        async (id, input, toolSignal) => {
-          if (!this.#capabilities.enabled('delegate_worker') ||
-            followUp || signal.aborted || toolSignal?.aborted || activeChildCount > 0 || workspaceActive || blockingWrite()) {
-            return { ok: false, error: 'Delegation unavailable' }
-          }
-          const goal = input.goal
-          const nonEmptyGoal = goal.trim().length > 0
-          const requestId = 'team:' + event.agentRunId + ':' + receiptId(id)
-          if (!await this.#judgment.decide(event, 'delegation.worth', {
-            role, goalLength: goal.length, nonEmptyGoal, goal, parentGoal: node.goal,
-          }, nonEmptyGoal,
-            nonEmptyGoal ? [true, false] : [false], [node.id], { planRequestId: requestId, signal }) || !this.#capabilities.enabled('delegate_worker') ||
-            signal.aborted || toolSignal?.aborted || activeChildCount > 0 || workspaceActive || blockingWrite()) {
-            return { ok: false, error: 'Delegation declined' }
-          }
-          try {
-            this.#childScope(workspace, scope, input, 'worker')
-            const child = this.#tasks.delegateScoped(task.id, requestId, node.id, input)
-            const invokeChild = () => runChild(child)
-            const result = child.result
-              ? { ...child.result, verification: child.verification }
-              : await (workspaceLease ? workspaceLease.suspendAndRun(invokeChild, signal) : invokeChild())
-            return result ? { ok: result.resultStatus === 'succeeded', ...result } : { ok: false, error: 'Worker interrupted' }
-          } catch {
-            return { ok: false, error: 'Delegation rejected by task scope or budget' }
+            const goal = input.goal
+            const nonEmptyGoal = goal.trim().length > 0
+            const requestId = 'team:' + event.agentRunId + ':' + receiptId(id)
+            if (!await this.#judgment.decide(event, 'delegation.worth', {
+              role, goalLength: goal.length, nonEmptyGoal, goal, parentGoal: node.goal,
+            }, nonEmptyGoal,
+              nonEmptyGoal ? [true, false] : [false], [node.id], { planRequestId: requestId, signal }) ||
+              !this.#capabilities.enabled('delegate_worker') ||
+              signal.aborted || toolSignal?.aborted || workspaceActive || blockingWrite()) {
+              return { ok: false, error: 'Delegation declined' }
+            }
+            try {
+              this.#childScope(workspace, freshGrant, input, 'worker')
+              if (input.route) await this.#scheduler.validateRoute(input.route)
+              const child = this.#tasks.delegateScoped(task.id, requestId, node.id, input)
+              if (child.result) {
+                return {
+                  ok: child.result.resultStatus === 'succeeded',
+                  nodeId: child.id,
+                  ...child.result,
+                  verification: child.verification,
+                  ...(nodeFailureReason(child) ? { failureReason: nodeFailureReason(child) } : {}),
+                }
+              }
+              const wait = input.wait !== false
+              coordinator.scheduleAll()
+              const launchPromise = coordinator.activeNodes.get(child.id)
+              if (!wait) {
+                return { ok: true, scheduled: true, nodeId: child.id, status: this.#tasks.getNode(task.id, child.id)?.status ?? 'ready' }
+              }
+              const childResult = await launchPromise
+              const settledChild = this.#tasks.getNode(task.id, child.id)
+              if (settledChild?.result) {
+                coordinator.mailbox.acknowledge(node.id, [nodeEventKey(settledChild)])
+              }
+              if (!childResult) return { ok: false, nodeId: child.id, error: 'Worker interrupted' }
+              return {
+                ok: childResult.resultStatus === 'succeeded',
+                nodeId: child.id,
+                ...childResult,
+              }
+            } catch {
+              return { ok: false, error: 'Delegation rejected by task scope or budget' }
+            }
+          }))
+
+        if (this.#capabilities.enabled('wait_task_nodes')) tools.push(waitNodesTool(async (_id, input, toolSignal) => {
+          coordinator.scheduleAll()
+          const scopedIds = input.nodeIds?.length
+            ? input.nodeIds.filter(id => teamScopeNodes().some(child => child.id === id))
+            : teamScopeNodes().map(child => child.id)
+          const waitSignal = toolSignal ? AbortSignal.any([signal, toolSignal]) : signal
+          const { timedOut, matched } = await coordinator.mailbox.waitForNodes(
+            node.id, scopedIds, input.mode,
+            () => ({
+              nodes: teamScopeNodes(),
+              activeIds: new Set(coordinator.activeNodes.keys()),
+              runnableIds: new Set(this.#tasks.runnableNodes(task.id, node.id).map(item => item.id)),
+            }),
+            waitSignal, input.timeoutMs,
+          )
+          return {
+            ok: !timedOut,
+            timedOut,
+            completedNodes: matched,
+            nodes: handoffs(teamScopeNodes().filter(item => !scopedIds.length || scopedIds.includes(item.id))),
           }
         }))
+
+        if (this.#capabilities.enabled('get_task_nodes')) tools.push(inspectNodesTool(async (_id, input) => {
+          const allChildren = teamScopeNodes()
+          const filtered = input.nodeIds?.length ? allChildren.filter(item => input.nodeIds!.includes(item.id)) : allChildren
+          return { ok: true, nodes: handoffs(filtered) }
+        }))
+      }
+
       signal.throwIfAborted()
       const advice = await preflight(this.#judgment, event, node.goal, signal)
       signal.throwIfAborted()
       session = await this.#execution.open({
         cwd: workspace.root, role, correlationId: event.agentRunId,
-        sessionDirectory: join(this.#sessions, teamKey ?? task.id), session: saved?.session, route,
+        sessionDirectory: join(this.#sessions, teamIdentityKey ?? task.id),
+        session: sessionToResume,
+        route,
         tools: tools.map(tool => toolRun.guard(tool, () => event, signal, availableTools.find(item => item.name === tool.name))),
-        systemPrompt: this.#extensions.workflow.systemPrompt(role, scope.access, node.check),
+        systemPrompt: this.#extensions.workflow.systemPrompt(role, liveGrant.access, node.check),
         selectSkills: skillDisclosure(this.#judgment, event, node.goal, signal),
         ...(this.#mode === 'quality' && advice.reasoningEffort ? { reasoningEffort: advice.reasoningEffort } : {}),
-        ...this.#runtimePolicy(workspace, scope),
+        ...this.#runtimePolicy(workspace, liveGrant),
         reserveRequest: (request) => {
           signal.throwIfAborted()
           try { return lease!.request(request) } catch (error) {
@@ -549,16 +751,25 @@ export class MultiAgentOrchestrator {
           this.#emit(reservationId ? { ...event, correlationId: reservationId } : event, runtime, role)
         },
       })
-      if (!sameRoute(session.route, route) || (saved && (session.ref.id !== saved.session.id || session.ref.path !== saved.session.path))) {
+      if (!sameRoute(session.route, route) ||
+        (sessionToResume && (session.ref.id !== sessionToResume.id || session.ref.path !== sessionToResume.path))) {
         throw new Error('Child Session identity or route changed')
       }
-      event = this.#register(task, session, event, teamKey ?? event.agentId!, role, timeMs, parent.agentId)
+      event = this.#register(task, session, event, teamIdentityKey ?? event.agentId!, role, timeMs, parent.agentId,
+        teamIdentityKey && node.teamKey ? { key: teamIdentityKey, teamKey: node.teamKey, cwd: workspace.root } : undefined)
       registered = true
       unwatch = this.#watchStop(session, signal)
-      if (role === 'team' && !signal.aborted && this.#tasks.runnableNodes(task.id, node.id).length > 0) {
-        if (workspaceLease) await workspaceLease.suspendAndRun(drainTeamChildren, signal)
-        else await drainTeamChildren()
+      if (role === 'team') {
+        coordinator.activeScopes.set(node.id, { event, route: session.route, workspace, signal: childSignal,
+          lease: workspaceLease, canDispatch: () => !workspaceActive && !followUp })
       }
+
+      if (role === 'team') {
+        coordinator.scheduleAll()
+        await coordinator.mailbox.waitForActivity(node.id, () => coordinator.hasPendingWork(node.id), signal, { wakeOnUnread: false })
+        coordinator.mailbox.drainUnread(node.id)
+      }
+
       if (!signal.aborted) {
         const childNodes = role === 'team' ? this.#tasks.nodesByParent(task.id, node.id) : []
         const activeChildHandoffs = childNodes.filter(child => !child.archivedAt).slice(-24)
@@ -567,8 +778,8 @@ export class MultiAgentOrchestrator {
           .map(depId => this.#tasks.getNode(task.id, depId))
           .filter((item): item is WorkerNode => Boolean(item))
         const constraints = [
-          scope.access === 'read' ? 'Read-only workspace access.' : 'Workspace changes must remain inside the assigned scope.',
-          scope.path ? 'Use workspace-relative paths under ' + scope.path + '.' : 'Use workspace-relative paths.',
+          liveGrant.access === 'read' ? 'Read-only workspace access.' : 'Workspace changes must remain inside the assigned scope.',
+          liveGrant.path ? 'Use workspace-relative paths under ' + liveGrant.path + '.' : 'Use workspace-relative paths.',
           'Return a short summary of observed evidence and any remaining risks.',
           ...(teamStage ? ['Team stage summary: ' + JSON.stringify(teamStage).slice(0, 4000)] : []),
           ...(activeChildHandoffs.length ? ['Child handoffs: ' + JSON.stringify(handoffs(activeChildHandoffs)).slice(0, 8000)] : []),
@@ -576,16 +787,23 @@ export class MultiAgentOrchestrator {
             id: item.id, status: item.status, evidenceRefs: item.result?.evidenceRefs, verification: item.verification,
           }))).slice(0, 4000)] : []),
         ]
-        const target = workspaceTarget(node.check ?? (scope.path ? undefined : task.check))
-        const prompt = await this.#context.build(event, {
+        const target = workspaceTarget(node.check ?? (liveGrant.path ? undefined : task.check))
+        const initialPrompt = await this.#context.build(event, {
           scope: memoryScope(task, session.route),
-          fallbackScopes: [legacyMemoryScope(task, session.route)],
-          filter: scope.path ? entry => memoryEntryInScope(entry, scope.path) : undefined,
+          fallbackScopes: [legacyMemoryScope(task, session.route), ...(node.teamKey ? [teamMemoryScope(task, node.teamKey)] : [])],
+          filter: liveGrant.path ? entry => memoryEntryInScope(entry, liveGrant.path) : undefined,
           goal: node.goal, constraints,
           artifactRefs: target ? [target] : [], availableTools: tools.map(tool => tool.name), signal,
         })
         signal.throwIfAborted()
-        let outcome = await session.run(advice.hint ? prompt + '\n\n' + advice.hint : prompt)
+
+        let currentPrompt = advice.hint ? initialPrompt + '\n\n' + advice.hint : initialPrompt
+        let outcome = { status: 'runtime_error' } as Awaited<ReturnType<ExecutionSession['run']>>
+        let reviewRounds = 0
+        let completionAccepted = true
+        let settledEvidence = false
+        let hardEvidence = false
+
         const drainDeferred = async () => {
           for (let round = 0; round < 3 && outcome.status === 'completed' && !signal.aborted; round++) {
             const receipts = await toolRun.waitForDeferred(signal)
@@ -594,27 +812,60 @@ export class MultiAgentOrchestrator {
             outcome = await session!.run(deferredResultPrompt(receipts))
           }
         }
-        await drainDeferred()
-        let reviewRounds = 0
-        let completionAccepted = true
-        let settledEvidence = false
-        let hardEvidence = false
-        while (!signal.aborted && outcome.status === 'completed' && outcome.text.trim() && !blockingWrite()) {
+
+        while (!signal.aborted) {
+          if (role === 'team' && !followUp) coordinator.scheduleAll()
+          if (followUp) this.#recordCompletionFollowUp(event, followUp)
+          outcome = await session.run(currentPrompt)
+          followUp = undefined
+          lastOutcomeStatus = outcome.status
+          await drainDeferred()
+          if (outcome.status === 'model_error') {
+            modelFailed = true
+            this.#scheduler.markRouteFailed(session.route)
+          } else if (outcome.status === 'completed') {
+            this.#scheduler.markRouteSucceeded(session.route)
+          }
+
+          if (signal.aborted || outcome.status !== 'completed') break
+
+          if (role === 'team') {
+            coordinator.scheduleAll()
+            const waitChildrenActive = () => coordinator.hasPendingWork(node.id)
+            if (coordinator.mailbox.hasUnread(node.id) || waitChildrenActive()) {
+              if (!coordinator.mailbox.hasUnread(node.id)) {
+                await coordinator.mailbox.waitForActivity(node.id, waitChildrenActive, signal)
+              }
+              const unread = coordinator.mailbox.drainUnread(node.id)
+              if (signal.aborted) break
+              if (unread.length) {
+                currentPrompt = formatMailboxPrompt(unread, teamScopeNodes())
+                await session.checkpoint()
+                continue
+              }
+            }
+          }
+
+          if (!outcome.text.trim() || blockingWrite()) break
+
+          if (workspaceLease?.suspended) await workspaceLease.resume(signal)
+          const scopeNow = currentGrant()
           if (node.check?.command && (!this.#capabilities.enabled('run_project_command') ||
-            (scope.tools && !scope.tools.includes('run_project_command')) ||
-            scope.disallowedTools?.includes('run_project_command'))) {
+            (scopeNow.tools && !scopeNow.tools.includes('run_project_command')) ||
+            scopeNow.disallowedTools?.includes('run_project_command'))) {
             verification = { passed: false, evidence: 'project_command_disabled' }
           } else if (node.check) {
             verification = await verifyWorkspace(this.#tasks, this.#extensions.workflow,
-              workspace, event, node.check, signal, scope.access)
+              workspace, event, node.check, signal, scopeNow.access)
           }
           const completedChildren = this.#tasks.completedChildCount(task.id, node.id)
+          const failedChildren = teamScopeNodes().filter(child => child.status === 'failed').length
           hardEvidence = node.check ? verification?.passed === true : evidence.size > 0 || completedChildren > 0
           const successfulTools = [...new Set(this.#tasks.operations(task.id)
             .filter(operation => evidence.has(operation.id)).map(operation => operation.tool))].slice(0, 24)
           settledEvidence = true
           const judgment = await reviewCompletion(this.#judgment, event, {
-            goal: node.goal, parentGoal: task.goal, summary: outcome.text, role, access: scope.access,
+            goal: node.goal, parentGoal: task.goal, summary: outcome.text, role, access: scopeNow.access,
             checkConfigured: Boolean(node.check), checked: Boolean(node.check), checkPassed: verification?.passed === true,
             evidenceCount: evidence.size, artifactCount: artifacts.size, completedChildren, successfulTools,
             operations: this.#tasks.operations(task.id), completedReceipts: this.#completedReceipts(event),
@@ -622,21 +873,20 @@ export class MultiAgentOrchestrator {
             attemptCount: reviewRounds, maxFollowUps: 1, signal, evidenceRefs: [...evidence],
           })
           completionAccepted = !judgment.insufficient
-          if (!judgment.followUp || signal.aborted) break
+          if (!judgment.followUp || signal.aborted) {
+            if (failedChildren > 0 && !hardEvidence) completionAccepted = false
+            break
+          }
           reviewRounds++
           followUp = judgment.followUp
           settledEvidence = false
           await session.checkpoint()
-          if (signal.aborted) break
-          this.#recordCompletionFollowUp(event, followUp)
-          outcome = await session.run(followUp.nudge)
-          followUp = undefined
-          await drainDeferred()
+          currentPrompt = followUp.nudge
         }
         followUp = undefined
         executionCompleted = outcome.status === 'completed'
         if (!signal.aborted && outcome.status === 'completed' && outcome.text.trim() && settledEvidence) {
-          const review = await this.#reviewWorkerPatch(task, node, event, scope, signal)
+          const review = await this.#reviewWorkerPatch(task, node, event, currentGrant(), signal)
           const patchNotice = review.flagged && review.paths.length
             ? `\n[Patch scope review: verify changes in ${review.paths.slice(0, 6).join(', ')} against assigned sub-goal.]`
             : ''
@@ -651,9 +901,16 @@ export class MultiAgentOrchestrator {
           }
         }
       }
-    } catch {
-      // The Task Engine settles the attempt after resources are released.
+    } catch (error) {
+      caughtReason = safeErrorReason(error)
+      if (error instanceof ModelUnavailableError) modelFailed = true
     } finally {
+      if (role === 'team') {
+        coordinator.activeScopes.delete(node.id)
+        stopChildren.abort()
+        const children = [...coordinator.activeNodes].filter(([id]) => this.#tasks.getNode(task.id, id)?.parentNodeId === node.id)
+        await Promise.allSettled(children.map(([, child]) => child))
+      }
       try {
         if (session) {
           try {
@@ -663,7 +920,8 @@ export class MultiAgentOrchestrator {
             await session.dispose()
           }
         }
-      } catch {
+      } catch (closeErr) {
+        caughtReason ??= safeErrorReason(closeErr)
         result = undefined
       } finally {
         try { await toolRun.close() } catch { result = undefined }
@@ -671,18 +929,33 @@ export class MultiAgentOrchestrator {
         if (teamLease) this.#activeTeams.delete(teamLease)
         lease?.release()
       }
-      if (!rootSignal.aborted && !result) result = {
-        resultStatus: 'failed', summary: 'Child Agent did not produce verified evidence.',
-        executionStatus: executionCompleted ? 'completed' : 'failed',
-        artifactRefs: [...artifacts], evidenceRefs: [...evidence],
-        remainingRisks: [stalled.signal.aborted ? 'tool_retry_loop'
-          : deadline.signal.aborted ? 'worker_deadline' : exhausted ? 'budget_exhausted' : 'worker_failed'],
+      if (!rootSignal.aborted && !result) {
+        const risk = stalled.signal.aborted ? 'tool_retry_loop'
+          : deadline.signal.aborted ? 'worker_deadline'
+          : exhausted ? 'budget_exhausted'
+          : modelFailed || lastOutcomeStatus === 'model_error' ? 'model_error'
+          : lastOutcomeStatus === 'model_output_limit' ? 'model_output_limit'
+          : 'worker_failed'
+        result = {
+          resultStatus: 'failed',
+          summary: caughtReason
+            ? `Child Agent failed (${risk}): ${caughtReason}`
+            : `Child Agent did not produce verified evidence (${risk}).`,
+          executionStatus: executionCompleted ? 'completed' : 'failed',
+          artifactRefs: [...artifacts], evidenceRefs: [...evidence],
+          remainingRisks: [risk],
+        }
       }
       if (rootSignal.aborted) result = undefined
       try {
         if (started && !this.#db.isClosed) {
           const settled = this.#tasks.settleWorker(task.id, node.id, result, verification, event.taskAttemptId)
-          result = settled?.result ? { ...settled.result, verification: settled.verification } : undefined
+          if (settled?.result) {
+            const failureReason = nodeFailureReason(settled)
+            result = { ...settled.result, verification: settled.verification, ...(failureReason ? { failureReason } : {}) }
+          } else {
+            result = undefined
+          }
         }
       } finally {
         workspaceLease?.release()
@@ -694,7 +967,7 @@ export class MultiAgentOrchestrator {
   }
 
 
-  async #reviewWorkerPatch(task: TaskSnapshot, node: WorkerNode, event: EventDraft, scope: CapabilityScope, signal: AbortSignal):
+  async #reviewWorkerPatch(task: TaskSnapshot, node: WorkerNode, event: EventDraft, scope: CapabilityGrant, signal: AbortSignal):
   Promise<{ flagged: boolean; paths: string[]; writeCount: number; targetCount: number }> {
     if (this.#judgment.mode('swarm.patch', task.id) === 'off' || signal.aborted) {
       return { flagged: false, paths: [], writeCount: 0, targetCount: 0 }
@@ -728,6 +1001,8 @@ export class MultiAgentOrchestrator {
       () => this.#approvalMode(task), this.#approvalContext)
     const budget = new AbortController()
     const signal = AbortSignal.any([stopSignal, budget.signal, stalled.signal])
+    const stopChildren = new AbortController()
+    const childSignal = AbortSignal.any([signal, stopChildren.signal])
     const agentKey = task.conversationId ?? task.id
     const saved = this.#db.get<AgentRecord>('agents', agentKey)
     let event: EventDraft = {
@@ -739,7 +1014,7 @@ export class MultiAgentOrchestrator {
     let session: ExecutionSession | undefined
     let unwatch: (() => Promise<void>) | undefined
     let registered = false
-    let workerActive = false
+    let syncWorkerActive = false
     let workspaceActive = false
     let checkpointFailed = false
     let outputFailed = false
@@ -760,79 +1035,125 @@ export class MultiAgentOrchestrator {
     let prompted = new Set<string>()
     let promptAccepted = false
     let outcome: Outcome = { status: 'runtime_error' }
-    const rootScope = this.#capabilities.root(task.workspaceAccess, Boolean(task.check))
     const visual = new VisualTelemetry(this.#mode,
       this.#db.eventsOfTypes(task.id, ['visual.preview_started', 'visual.draft_ready']).filter(item => item.taskNodeId === task.rootNodeId),
       (type, payload) => this.#db.transaction(() => { this.#db.append({ ...event, type, payload }) }))
     const hasUnknownWrite = () => this.#tasks.blocksToolWork(task.id)
-    const dispatchAllowed = (toolSignal?: AbortSignal) =>
-      this.#profile.delegation && !followUp && !signal.aborted && !toolSignal?.aborted && !workspaceActive && !workerActive && !hasUnknownWrite()
-    const runWorker = async (node: WorkerNode): Promise<WorkerResult | undefined> => {
-      if (!session || !dispatchAllowed()) throw new Error('Worker cannot start at this boundary')
-      if (node.result) return node.result
-      workerActive = true
-      try {
-        return await this.#worker(task, node, event, workspace, session.route, rootScope, signal)
-      } finally {
-        workerActive = false
-      }
-    }
-    const drain = async () => {
-      const completed = new Set<string>()
-      if (!session || !dispatchAllowed()) return []
-      const route = session.route
-      workerActive = true
-      const inFlight = new Map<string, Promise<void>>()
-      let firstRejection: unknown
-      let hasRejection = false
-      try {
-        while ((!signal.aborted && !hasUnknownWrite()) || inFlight.size > 0) {
-          if (!signal.aborted && !hasUnknownWrite() && !hasRejection) {
-            const batch = this.#tasks.runnableNodes(task.id)
-            for (const node of batch) {
-              if (inFlight.has(node.id)) continue
-              const runNode = this.#worker(task, node, event, workspace, route, rootScope, signal)
-                .then(() => {
-                  const latestNode = this.#tasks.getNode(task.id, node.id)
-                  if (latestNode && latestNode.status !== 'ready') completed.add(node.id)
-                }, (error) => {
-                  if (!hasRejection) {
-                    hasRejection = true
-                    firstRejection = error
-                  }
-                })
-                .finally(() => { inFlight.delete(node.id) })
-              inFlight.set(node.id, runNode)
+
+    const mailbox = new AgentMailbox()
+    const activeNodes = new Map<string, Promise<WorkerHandoff | undefined>>()
+    const activeScopes = new Map<string, ActiveScope>()
+
+    let scheduling = false
+    let reschedule = false
+
+    const launchNode = (
+      node: WorkerNode,
+      parentEvent: EventDraft,
+      nodeWorkspace: CodingWorkspace,
+      parentRoute: ModelRoute,
+      parentScope: CapabilityGrant,
+      runSignal: AbortSignal,
+      suspendParent = false,
+    ): Promise<WorkerHandoff | undefined> => {
+      const existing = activeNodes.get(node.id)
+      if (existing) return existing
+      const promise = (async (): Promise<WorkerHandoff | undefined> => {
+        await Promise.resolve()
+        try {
+          return await this.#worker(task, node, parentEvent, nodeWorkspace, parentRoute, parentScope, runSignal, suspendParent, coordinator)
+        } finally {
+          activeNodes.delete(node.id)
+          if (!this.#db.isClosed) {
+            // Schedule unblocked successors BEFORE waking parents so waiters observe active successors cleanly.
+            if (!runSignal.aborted) scheduleAll()
+            try {
+              const latestNode = this.#tasks.getNode(task.id, node.id)
+              if (latestNode && (latestNode.status === 'succeeded' || latestNode.status === 'failed')) {
+                mailbox.enqueue(node.parentNodeId, notificationFromNode(latestNode))
+                if (this.#tasks.needsArchive(task.id)) {
+                  try { this.#tasks.archiveCompletedNodes(task.id) } catch { /* Stage archiving is best-effort. */ }
+                }
+              } else {
+                mailbox.wake(node.parentNodeId)
+              }
+            } catch {
+              mailbox.wake(node.parentNodeId)
             }
           }
-          if (inFlight.size === 0) break
-          await Promise.race(inFlight.values())
-          if (hasRejection) {
-            await Promise.allSettled(inFlight.values())
-            throw firstRejection
-          }
-          if (this.#tasks.needsArchive(task.id)) {
-            try { this.#tasks.archiveCompletedNodes(task.id) } catch { /* Stage archiving must never break running tasks. */ }
-          }
+          mailbox.wake(task.rootNodeId)
         }
-      } finally {
-        if (inFlight.size > 0) await Promise.allSettled(inFlight.values())
-        workerActive = false
-      }
-      const finished: WorkerNode[] = []
-      for (const id of completed) {
-        const node = this.#tasks.getNode(task.id, id)
-        if (node) finished.push(node)
-      }
-      return finished
+      })()
+      void promise.catch(() => {})
+      activeNodes.set(node.id, promise)
+      return promise
     }
-    const availableTools = this.#extensions.tools(workspace, 'root', rootScope.access)
-      .filter(tool => this.#capabilities.describe(rootScope, tool))
+
+    const scheduleAll = () => {
+      if (scheduling) {
+        reschedule = true
+        return
+      }
+      if (signal.aborted || hasUnknownWrite() || this.#db.isClosed) return
+      scheduling = true
+      try {
+        do {
+          reschedule = false
+          const parentIds = [...activeScopes.keys()].sort((a, b) =>
+            (a === task.rootNodeId ? 1 : 0) - (b === task.rootNodeId ? 1 : 0))
+          for (const parentId of parentIds) {
+            if (signal.aborted || hasUnknownWrite()) break
+            const ctx = activeScopes.get(parentId)
+            if (!ctx || ctx.signal.aborted || ctx.canDispatch?.() === false) continue
+            const runnable = this.#tasks.runnableNodes(task.id, parentId === task.rootNodeId ? undefined : parentId)
+            const parentGrant = parentId === task.rootNodeId
+              ? this.#resolveRootGrant(task.id)
+              : this.#resolveNodeGrant(task.id, parentId)
+            if (!parentGrant) continue
+            for (const node of runnable) {
+              if (activeNodes.has(node.id) || ctx.signal.aborted) continue
+              ctx.lease?.suspend()
+              launchNode(node, ctx.event, ctx.workspace, ctx.route, parentGrant, ctx.signal, parentId !== task.rootNodeId)
+            }
+          }
+        } while (reschedule && !signal.aborted && !hasUnknownWrite())
+      } finally {
+        scheduling = false
+      }
+    }
+
+    const coordinator: TaskCoordinator = {
+      mailbox,
+      activeNodes,
+      activeScopes,
+      scheduleAll,
+      launchNode,
+      hasPendingWork: (ownerNodeId: string) => {
+        const ctx = activeScopes.get(ownerNodeId)
+        if (this.#db.isClosed || !ctx || ctx.signal.aborted) return false
+        if (ownerNodeId === task.rootNodeId) {
+          return activeNodes.size > 0 || this.#tasks.hasRunningNodes(task.id) || this.#tasks.runnableNodes(task.id).length > 0
+        }
+        return this.#tasks.hasRunningNodes(task.id, ownerNodeId) ||
+          [...activeNodes.keys()].some(id => this.#tasks.getNode(task.id, id)?.parentNodeId === ownerNodeId) ||
+          this.#tasks.runnableNodes(task.id, ownerNodeId).length > 0
+      },
+    }
+
+    const rootScopeInitial = this.#capabilities.root(task.workspaceAccess, Boolean(task.check))
+    const dispatchAllowed = (toolSignal?: AbortSignal) =>
+      this.#profile.delegation && !followUp && !signal.aborted && !toolSignal?.aborted && !workspaceActive && !syncWorkerActive && !hasUnknownWrite()
+
+    const availableTools = this.#extensions.tools(workspace, 'root', rootScopeInitial.access)
+      .filter(tool => this.#capabilities.describe(rootScopeInitial, tool))
     const tools: ExecutionTool[] = availableTools
       .map(tool => {
-        const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input =>
-          !workerActive &&
-          followUpAllows(followUp, tool.name) && this.#capabilities.authorize(rootScope, tool, input), undefined, undefined, task.goal)
+        const wrapped = toolRun.wrap(tool, workspace, () => event, signal, input => {
+          const freshRoot = this.#resolveRootGrant(task.id)
+          if (syncWorkerActive) return false
+          if (!followUpAllows(followUp, tool.name)) return false
+          return this.#capabilities.authorize(freshRoot, tool, input)
+        }, undefined, undefined, task.goal)
         return {
           ...wrapped,
           execute: async (id, input, toolSignal) => {
@@ -849,12 +1170,15 @@ export class MultiAgentOrchestrator {
           },
         }
       })
+
     const replay = this.#canArchiveToolEvidence(task.id) && toolRun.replayTool(() => event, signal, name => availableTools.some(tool => tool.name === name &&
-      this.#capabilities.describe(rootScope, tool) && followUpAllows(followUp, tool.name)))
+      this.#capabilities.describe(this.#resolveRootGrant(task.id), tool) && followUpAllows(followUp, tool.name)))
     if (replay) tools.push(replay)
+
     if (this.#profile.delegation) {
       if (this.#capabilities.enabled('delegate_task')) tools.push(delegationTool('delegate_task', async (id, input, toolSignal) => {
           if (!this.#capabilities.enabled('delegate_task') || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Delegation unavailable' }
+          const freshRoot = this.#resolveRootGrant(task.id)
           const goal = input.goal
           const nonEmptyGoal = goal.trim().length > 0
           const operationId = event.agentRunId + ':' + id
@@ -866,36 +1190,54 @@ export class MultiAgentOrchestrator {
           }
           this.#tasks.beginTool(task.id, event, operationId, 'delegate_task', 'read')
           let result: WorkerHandoff | undefined
+          let node: WorkerNode
           try {
-            this.#childScope(workspace, rootScope, input, 'worker')
-            const node = Object.keys(input).length === 1 ? this.#tasks.delegate(task.id, goal)
+            this.#childScope(workspace, freshRoot, input, 'worker')
+            if (input.route) await this.#scheduler.validateRoute(input.route)
+            const hasExtraFields = Object.keys(input).some(key => key !== 'goal' && key !== 'wait')
+            node = !hasExtraFields ? this.#tasks.delegate(task.id, goal)
               : this.#tasks.delegateScoped(task.id, 'delegate:' + event.agentRunId + ':' + receiptId(id), task.rootNodeId, input)
-            result = node.result ? { ...node.result, verification: node.verification } : await runWorker(node)
+            if (node.result) {
+              result = { ...node.result, verification: node.verification }
+            } else if (input.wait === false) {
+              launchNode(node, event, workspace, session!.route, freshRoot, childSignal, false)
+              this.#tasks.finishTool(event, operationId, 'succeeded')
+              return { ok: true, scheduled: true, nodeId: node.id, status: 'running' }
+            } else {
+              syncWorkerActive = true
+              try {
+                result = await launchNode(node, event, workspace, session!.route, freshRoot, childSignal, false)
+              } finally {
+                syncWorkerActive = false
+              }
+              const settled = this.#tasks.getNode(task.id, node.id)
+              if (settled) mailbox.acknowledge(task.rootNodeId, [nodeEventKey(settled)])
+            }
           } catch {
             this.#tasks.finishTool(event, operationId, 'failed')
             return { ok: false, error: 'Delegation rejected by task scope or budget' }
           }
           this.#tasks.finishTool(event, operationId, result?.resultStatus === 'succeeded' ? 'succeeded' : 'failed')
-          return result ? { ok: result.resultStatus === 'succeeded', ...result } : { ok: false, error: 'Worker interrupted' }
+          return result ? { ok: result.resultStatus === 'succeeded', nodeId: node.id, ...result } : { ok: false, nodeId: node.id, error: 'Worker interrupted' }
         }))
-      if (this.#capabilities.enabled('propose_task_plan')) tools.push(planTool(async (id, proposals, toolSignal) => {
+
+      if (this.#capabilities.enabled('propose_task_plan')) tools.push(planTool(async (id, proposals, waitMode, toolSignal) => {
         if (!this.#capabilities.enabled('propose_task_plan') || !dispatchAllowed(toolSignal) || !session || !proposals.length || proposals.length > 64) {
           return { ok: false, error: 'Planning unavailable' }
         }
         try {
+          const freshRoot = this.#resolveRootGrant(task.id)
           const requestId = 'plan:' + event.agentRunId + ':' + receiptId(id)
           const planned: NodeProposal[] = []
-          const teamScopes = new Map<string, CapabilityScope>()
+          const teamScopes = new Map<string, CapabilityGrant>()
           for (const existing of this.#tasks.nodesByParent(task.id, task.rootNodeId)) {
             if (existing.role === 'team') {
-              teamScopes.set(existing.id, this.#childScope(workspace, rootScope, existing, 'team'))
+              teamScopes.set(existing.id, this.#childScope(workspace, freshRoot, existing, 'team'))
             }
           }
           for (const proposal of proposals) {
             if (!proposal || typeof proposal !== 'object') throw new Error('Invalid node proposal')
-            if (proposal.route && !this.#scheduler.canSwitch(session.route, proposal.route)) {
-              throw new Error('Cross-provider delegation is not authorized')
-            }
+            if (proposal.route) await this.#scheduler.validateRoute(proposal.route)
             const teamCandidate = Boolean(proposal.teamKey)
             const baseline = proposal.role ?? (teamCandidate ? 'team' : 'worker')
             const role = await this.#judgment.decide(event, 'collaboration.mode',
@@ -904,7 +1246,7 @@ export class MultiAgentOrchestrator {
               baseline, !proposal.role && teamCandidate ? ['worker', 'team'] : [baseline], [task.rootNodeId], { planRequestId: requestId, signal })
             const effectiveProposal: NodeProposal = { ...proposal, role, ...(role === 'worker' ? { teamKey: undefined } : {}) }
             if (!effectiveProposal.parentNodeId || effectiveProposal.parentNodeId === task.rootNodeId) {
-              const scope = this.#childScope(workspace, rootScope, effectiveProposal, role)
+              const scope = this.#childScope(workspace, freshRoot, effectiveProposal, role)
               if (role === 'team' && typeof effectiveProposal.ref === 'string') teamScopes.set(effectiveProposal.ref, scope)
             } else {
               const parentTeamScope = teamScopes.get(effectiveProposal.parentNodeId)
@@ -916,15 +1258,107 @@ export class MultiAgentOrchestrator {
           if (!this.#capabilities.enabled('propose_task_plan') || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Planning interrupted' }
           const current = this.#tasks.getMeta(task.id)
           const nodes = this.#tasks.proposePlan(task.id, requestId, current.planVersion, planned)
-          await drain()
+          const submittedIds = nodes.map(node => node.id)
+          const currentSubmitted = () => submittedIds.map(id => this.#tasks.getNode(task.id, id)).filter((item): item is WorkerNode => Boolean(item))
+          const waitSignal = toolSignal ? AbortSignal.any([signal, toolSignal]) : signal
+
+          // Event-driven dispatch starts immediately with zero wave barriers!
+          scheduleAll()
+
+          if (waitMode === 'none') {
+            const latest = this.#tasks.getMeta(task.id)
+            const created = currentSubmitted()
+            return { ok: true, scheduled: true, planVersion: latest.planVersion, nodes: handoffs(created) }
+          }
+
+          if (waitMode === 'any') {
+            const { timedOut, matched } = await mailbox.waitForNodes(
+              task.rootNodeId, submittedIds, 'any',
+              () => ({
+                nodes: currentSubmitted(),
+                activeIds: new Set(activeNodes.keys()),
+                runnableIds: new Set(this.#tasks.runnableNodes(task.id).map(item => item.id)),
+              }),
+              waitSignal,
+            )
+            const latest = this.#tasks.getMeta(task.id)
+            const submitted = currentSubmitted()
+            return {
+              ok: !timedOut && submitted.some(node => node.status === 'succeeded'),
+              waited: 'any',
+              completedNodes: matched,
+              planVersion: latest.planVersion,
+              nodes: handoffs(submitted),
+            }
+          }
+
+          // waitMode === 'all': still runs pure event-driven successor scheduling with NO wave barriers!
+          syncWorkerActive = true
+          try {
+            while (!waitSignal.aborted) {
+              scheduleAll()
+              const remainingSubmitted = currentSubmitted()
+              const anyRunning = remainingSubmitted.some(node => node.status === 'running' || activeNodes.has(node.id))
+              const anyRunnable = this.#tasks.runnableNodes(task.id).some(node => submittedIds.includes(node.id))
+              if (!anyRunning && !anyRunnable) break
+              await mailbox.waitForActivity(task.rootNodeId, () => {
+                const sub = currentSubmitted()
+                return sub.some(n => n.status === 'running' || activeNodes.has(n.id)) ||
+                  this.#tasks.runnableNodes(task.id).some(n => submittedIds.includes(n.id))
+              }, waitSignal, { wakeOnUnread: false })
+            }
+          } finally {
+            syncWorkerActive = false
+          }
           const latest = this.#tasks.getMeta(task.id)
-          const settledNodes = nodes.map(({ id }) => this.#tasks.getNode(task.id, id)).filter((item): item is WorkerNode => Boolean(item))
-          const handoff = handoffs(settledNodes)
+          const finished = currentSubmitted()
+          for (const node of finished) {
+            if (node.status === 'succeeded' || node.status === 'failed') {
+              mailbox.acknowledge(task.rootNodeId, [nodeEventKey(node)])
+            }
+          }
+          const handoff = handoffs(finished)
           return { ok: handoff.every(node => node.status === 'succeeded'), planVersion: latest.planVersion, nodes: handoff }
         } catch {
           return { ok: false, error: 'Plan rejected by task scope, dependency, or budget' }
         }
       }))
+
+      if (this.#capabilities.enabled('wait_task_nodes')) tools.push(waitNodesTool(async (_id, input, toolSignal) => {
+        scheduleAll()
+        const waitSignal = toolSignal ? AbortSignal.any([signal, toolSignal]) : signal
+        const allTaskNodes = () => this.#tasks.get(task.id).nodes ?? []
+        const { timedOut, matched } = await mailbox.waitForNodes(
+          task.rootNodeId,
+          input.nodeIds,
+          input.mode,
+          () => ({
+            nodes: allTaskNodes(),
+            activeIds: new Set(activeNodes.keys()),
+            runnableIds: new Set(this.#tasks.runnableNodes(task.id).map(item => item.id)),
+          }),
+          waitSignal,
+          input.timeoutMs,
+        )
+        const latest = this.#tasks.get(task.id)
+        const latestNodes = latest.nodes ?? []
+        const scoped = input.nodeIds?.length ? latestNodes.filter(node => input.nodeIds!.includes(node.id)) : latestNodes
+        return {
+          ok: !timedOut,
+          timedOut,
+          planVersion: latest.planVersion,
+          completedNodes: matched,
+          nodes: handoffs(scoped),
+        }
+      }))
+
+      if (this.#capabilities.enabled('get_task_nodes')) tools.push(inspectNodesTool(async (_id, input) => {
+        const latest = this.#tasks.get(task.id)
+        const latestNodes = latest.nodes ?? []
+        const scoped = input.nodeIds?.length ? latestNodes.filter(node => input.nodeIds!.includes(node.id)) : latestNodes
+        return { ok: true, planVersion: latest.planVersion, nodes: handoffs(scoped) }
+      }))
+
       if (this.#capabilities.enabled('replan_task_node')) tools.push(replanTool(async (id, nodeId, update, toolSignal) => {
         if (!this.#capabilities.enabled('replan_task_node') || !dispatchAllowed(toolSignal)) return { ok: false, error: 'Replanning unavailable' }
         const current = this.#tasks.getMeta(task.id)
@@ -944,9 +1378,17 @@ export class MultiAgentOrchestrator {
         }
         try {
           this.#tasks.replanNode(task.id, requestId, current.planVersion, nodeId, update)
-          await drain()
+          scheduleAll()
+          const targetPromise = activeNodes.get(nodeId)
+          if (targetPromise) {
+            syncWorkerActive = true
+            try { await targetPromise } finally { syncWorkerActive = false }
+          }
           const latest = this.#tasks.getMeta(task.id)
           const updatedNode = this.#tasks.getNode(task.id, nodeId)
+          if (updatedNode && (updatedNode.status === 'succeeded' || updatedNode.status === 'failed')) {
+            mailbox.acknowledge(task.rootNodeId, [nodeEventKey(updatedNode)])
+          }
           return { ok: true, planVersion: latest.planVersion, nodes: handoffs(updatedNode ? [updatedNode] : []) }
         } catch {
           return { ok: false, error: 'Replan rejected by task scope, version, or budget' }
@@ -954,49 +1396,54 @@ export class MultiAgentOrchestrator {
       }))
       if (this.#capabilities.enabled('inspect_task_dag')) tools.push(inspectDagTool(query => Promise.resolve(this.#inspectDag(task.id, query))))
     }
+
     const previousAttempt = task.attemptCount > 1 ? this.#tasks.attempts(task.id)
       .filter(attempt => attempt.nodeId === task.rootNodeId && attempt.finishedAt)
       .sort((left, right) => right.finishedAt!.localeCompare(left.finishedAt!))[0] : undefined
-    const config = (route: ModelRoute | undefined, ref?: SessionRef): ExecutionConfig => ({
-      cwd: workspace.root, role: 'root', correlationId: event.agentRunId,
-      sessionDirectory: join(this.#sessions, agentKey), session: ref, route,
-      tools: tools.map(tool => toolRun.guard(tool, () => event, signal, availableTools.find(item => item.name === tool.name))),
-      systemPrompt: this.#extensions.workflow.systemPrompt('root', rootScope.access, task.check),
-      ...this.#runtimePolicy(workspace, rootScope),
-      ...(this.#mode === 'quality' && advice.reasoningEffort ? { reasoningEffort: advice.reasoningEffort } : {}),
-      selectSkills: skillDisclosure(this.#judgment, event, task.goal, signal),
-      resumeAfterOutputLimit: saved?.taskId === task.id && previousAttempt?.reason === 'model_output_limit' &&
-        !this.#tasks.operations(task.id).some(operation => isUnresolvedEffect(operation)),
-      canRecoverModelOutput: () => !signal.aborted && !hasUnknownWrite(),
-      reserveRequest: (request) => {
-        signal.throwIfAborted()
-        try {
-          const cap = lease!.request(request)
-          visual.requestStarted()
-          return cap
-        } catch (error) {
-          if (error instanceof ModelBudgetError) budget.abort()
-          throw error
-        }
-      },
-      onEvent: (runtime) => {
-        if (runtime.type === 'prompt.accepted') promptAccepted = true
-        if (runtime.type === 'instruction.applied') seenSteers.add(runtime.instructionId)
-        if (runtime.type === 'message.delta' && runtime.delta) {
-          streamed = true
-          textProduced ||= Boolean(runtime.delta.trim())
-        }
-        try {
-          visual.observe(runtime)
-          const reservationId = runtime.type === 'model.usage' ? lease!.usage(runtime)
-            : runtime.type === 'model.request_unaccounted' ? lease!.unknown() : undefined
-          this.#emit(reservationId ? { ...event, correlationId: reservationId } : event, runtime, 'root')
-        } catch {
-          outputFailed = true
-          budget.abort()
-        }
-      },
-    })
+    const config = (route: ModelRoute | undefined, ref?: SessionRef): ExecutionConfig => {
+      const rootGrant = this.#resolveRootGrant(task.id)
+      return {
+        cwd: workspace.root, role: 'root', correlationId: event.agentRunId,
+        sessionDirectory: join(this.#sessions, agentKey), session: ref, route,
+        tools: tools.map(tool => toolRun.guard(tool, () => event, signal, availableTools.find(item => item.name === tool.name))),
+        systemPrompt: this.#extensions.workflow.systemPrompt('root', rootGrant.access, task.check),
+        ...this.#runtimePolicy(workspace, rootGrant),
+        ...(this.#mode === 'quality' && advice.reasoningEffort ? { reasoningEffort: advice.reasoningEffort } : {}),
+        selectSkills: skillDisclosure(this.#judgment, event, task.goal, signal),
+        resumeAfterOutputLimit: saved?.taskId === task.id && previousAttempt?.reason === 'model_output_limit' &&
+          !this.#tasks.operations(task.id).some(operation => isUnresolvedEffect(operation)),
+        canRecoverModelOutput: () => !signal.aborted && !hasUnknownWrite(),
+        reserveRequest: (request) => {
+          signal.throwIfAborted()
+          try {
+            const cap = lease!.request(request)
+            visual.requestStarted()
+            return cap
+          } catch (error) {
+            if (error instanceof ModelBudgetError) budget.abort()
+            throw error
+          }
+        },
+        onEvent: (runtime) => {
+          if (runtime.type === 'prompt.accepted') promptAccepted = true
+          if (runtime.type === 'instruction.applied') seenSteers.add(runtime.instructionId)
+          if (runtime.type === 'message.delta' && runtime.delta) {
+            streamed = true
+            textProduced ||= Boolean(runtime.delta.trim())
+          }
+          try {
+            visual.observe(runtime)
+            const reservationId = runtime.type === 'model.usage' ? lease!.usage(runtime)
+              : runtime.type === 'model.request_unaccounted' ? lease!.unknown() : undefined
+            this.#emit(reservationId ? { ...event, correlationId: reservationId } : event, runtime, 'root')
+          } catch {
+            outputFailed = true
+            budget.abort()
+          }
+        },
+      }
+    }
+
     const closeSession = async (saveCheckpoint = true) => {
       if (!session) return
       const current = session
@@ -1023,6 +1470,7 @@ export class MultiAgentOrchestrator {
         }
       }
     }
+
     const conversationId = task.conversationId
     const lockRoute = () => { if (conversationId) this.#openingConversations.add(conversationId) }
     const unlockRoute = () => { if (conversationId) this.#openingConversations.delete(conversationId) }
@@ -1034,6 +1482,7 @@ export class MultiAgentOrchestrator {
         throw error
       }
     }
+
     let openingSavedSession = false
     try {
       lease = this.#scheduler.reserve(() => event, 'root')
@@ -1044,7 +1493,7 @@ export class MultiAgentOrchestrator {
       if (saved && initialRoute && !this.#scheduler.canSwitch(saved.route, initialRoute)) return { status: 'model_error' }
       if (initialRoute) {
         try {
-          await this.#scheduler.allocate(event, initialRoute, initialRoute, false, task.goal, signal)
+          await this.#scheduler.allocate(event, initialRoute, initialRoute, false, task.goal, signal, { sessionMode: 'resume' })
         } catch {
           return { status: 'model_error' }
         }
@@ -1065,6 +1514,7 @@ export class MultiAgentOrchestrator {
         unwatch = this.#watchStop(session, signal)
         event = this.#register(task, session, event, agentKey, 'root', deadlines[this.#mode].root)
         registered = true
+        activeScopes.set(task.rootNodeId, { event, route: session.route, workspace, signal: childSignal })
         this.#steering.set(task.id, async (id, text) => {
           if (!session || signal.aborted || prompted.has(id) || queuedSteers.has(id)) return false
           const item = this.#tasks.getMeta(task.id).instructions.find((instruction) => instruction.id === id)
@@ -1102,6 +1552,12 @@ export class MultiAgentOrchestrator {
           nextPrompt += `\n\nReconciliation safety note: Previous write operation(s) [${items}] still have uncertain historical effects. Inspect current workspace state first and never automatically replay them.`
         }
         if (advice.hint) nextPrompt += '\n\n' + advice.hint
+
+        if (saved?.taskId === task.id) {
+          scheduleAll()
+          await mailbox.waitForActivity(task.rootNodeId, () => coordinator.hasPendingWork(task.rootNodeId), signal, { wakeOnUnread: false })
+        }
+
         while (!signal.aborted) {
           const current = this.#tasks.getMeta(task.id)
           if (current.route && !sameRoute(current.route, session.route)) {
@@ -1122,6 +1578,7 @@ export class MultiAgentOrchestrator {
             if (signal.aborted) break
             unwatch = this.#watchStop(session, signal)
             const applied = session.route
+            activeScopes.set(task.rootNodeId, { event, route: applied, workspace, signal: childSignal })
             this.#db.transaction(() => {
               const agent = this.#db.get<AgentRecord>('agents', agentKey)!
               this.#db.put('agents', agentKey, { ...agent, route: applied })
@@ -1129,18 +1586,15 @@ export class MultiAgentOrchestrator {
             })
             unlockRoute()
           }
-          const completedNodes = followUp ? [] : await drain()
-          if (signal.aborted) break
-          if (completedNodes.length) {
-            const rootDirect = completedNodes.filter(item => item.parentNodeId === task.rootNodeId)
-            const selected = (rootDirect.length ? rootDirect : completedNodes).slice(-24)
-            const summaries = this.#tasks.teamSummaries(task.id).slice(-8)
-            nextPrompt += '\nAgent handoffs:\n' + JSON.stringify(handoffs(selected)).slice(0, 6000)
-            if (summaries.length) {
-              nextPrompt += '\nTeam stage summaries (use inspect_task_dag for node/evidence details):\n' +
-                JSON.stringify(summaries).slice(0, 4000)
-            }
+
+          // Include handoffs already available at this turn boundary.
+          if (!followUp) scheduleAll()
+          const unreadAtStart = mailbox.drainUnread(task.rootNodeId)
+          if (unreadAtStart.length) {
+            nextPrompt += '\n' + formatMailboxPrompt(unreadAtStart, this.#tasks.nodesByParent(task.id, task.rootNodeId).slice(-24))
           }
+          const summaries = unreadAtStart.length ? this.#tasks.teamSummaries(task.id).slice(-8) : []
+          if (summaries.length) nextPrompt += '\nTeam stage summaries:\n' + JSON.stringify(summaries).slice(0, 4000)
           const latest = this.#tasks.getMeta(task.id)
           if (conversationId && latest.route && !sameRoute(latest.route, session.route)) continue
           const instructions = latest.instructions.filter((item) => !item.delivered)
@@ -1190,6 +1644,7 @@ export class MultiAgentOrchestrator {
           promptAccepted = false
           seenSteers.clear()
           queuedSteers.clear()
+
           const receipts = await toolRun.waitForDeferred(signal)
           if (signal.aborted) break
           if (receipts.length && deferredResultRounds < 4) {
@@ -1197,13 +1652,36 @@ export class MultiAgentOrchestrator {
             nextPrompt = deferredResultPrompt(receipts)
             continue
           }
+
+          // Event-driven Mailbox wakeup: deliver completed/failed child events immediately at this safe turn boundary.
+          scheduleAll()
+          if (mailbox.hasUnread(task.rootNodeId)) {
+            const arrived = mailbox.drainUnread(task.rootNodeId)
+            const scopeNodes = this.#tasks.nodesByParent(task.id, task.rootNodeId).slice(-24)
+            nextPrompt = formatMailboxPrompt(arrived, scopeNodes)
+            continue
+          }
+          if (coordinator.hasPendingWork(task.rootNodeId) && !hasUnknownWrite()) {
+            await mailbox.waitForActivity(task.rootNodeId, () => coordinator.hasPendingWork(task.rootNodeId), signal)
+            if (signal.aborted) break
+            const arrived = mailbox.drainUnread(task.rootNodeId)
+            const scopeNodes = this.#tasks.nodesByParent(task.id, task.rootNodeId).slice(-24)
+            if (arrived.length || coordinator.hasPendingWork(task.rootNodeId)) {
+              nextPrompt = arrived.length
+                ? formatMailboxPrompt(arrived, scopeNodes)
+                : 'Child execution progressed. Inspect the latest DAG status and continue.'
+              continue
+            }
+          }
+
           const after = this.#tasks.getMeta(task.id)
-          const more = after.instructions.some((item) => !item.delivered) || this.#tasks.runnableNodes(task.id).length > 0 ||
+          const more = after.instructions.some((item) => !item.delivered) ||
+            this.#tasks.runnableNodes(task.id).length > 0 ||
             (!conversationId && after.route && !sameRoute(after.route, session.route))
           if (!more && !hasUnknownWrite() && completionAttempts < 1 && this.#judgment.mode('turn.completion', task.id) !== 'off') {
             const completedChildren = this.#tasks.completedChildCount(task.id, task.rootNodeId)
             const review = await reviewCompletion(this.#judgment, event, {
-              goal: task.goal, summary: result.text, role: 'root', access: rootScope.access,
+              goal: task.goal, summary: result.text, role: 'root', access: this.#resolveRootGrant(task.id).access,
               checkConfigured: Boolean(task.check), completedChildren,
               operations: this.#tasks.operations(task.id), completedReceipts: this.#completedReceipts(event),
               attemptCount: completionAttempts, maxFollowUps: 1, signal,
@@ -1214,6 +1692,8 @@ export class MultiAgentOrchestrator {
             const postReview = this.#tasks.getMeta(task.id)
             const arrivedDuringReview = postReview.instructions.some((item) => !item.delivered) ||
               this.#tasks.runnableNodes(task.id).length > 0 ||
+              mailbox.hasUnread(task.rootNodeId) ||
+              coordinator.hasPendingWork(task.rootNodeId) ||
               (!conversationId && postReview.route && !sameRoute(postReview.route, session.route))
             if (arrivedDuringReview) {
               followUp = undefined
@@ -1241,6 +1721,14 @@ export class MultiAgentOrchestrator {
         : openingSavedSession || checkpointFailed ? 'checkpoint_error' : 'runtime_error' }
     } finally {
       this.#steering.delete(task.id)
+      activeScopes.delete(task.rootNodeId)
+      stopChildren.abort()
+      // Ensure any active background child Workers settle cleanly before Root tears down.
+      if (activeNodes.size > 0) {
+        await Promise.allSettled([...activeNodes.values()])
+      }
+      activeScopes.clear()
+      mailbox.wakeAll()
       try {
         await closeSession()
       } catch {

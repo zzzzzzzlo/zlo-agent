@@ -82,8 +82,8 @@ test('multiple Read Workers run in parallel (including under a Team) while Write
       const res = await call('propose_task_plan', {
         nodes: [
           { ref: 'team', role: 'team', teamKey: 'readers', goal: 'Coordinate parallel reads', access: 'write', scopePath: 'src' },
-          { ref: 'r1', parentNodeId: 'team', goal: 'Read file A', scopePath: 'src', tools: ['read_text_file'] },
-          { ref: 'r2', parentNodeId: 'team', goal: 'Read file B', scopePath: 'src', tools: ['read_text_file'] },
+          { ref: 'r1', parentNodeId: 'team', goal: 'Read file A', access: 'read', scopePath: 'src', tools: ['read_text_file'] },
+          { ref: 'r2', parentNodeId: 'team', goal: 'Read file B', access: 'read', scopePath: 'src', tools: ['read_text_file'] },
           { ref: 'w1', goal: 'Write summary W1', access: 'write', scopePath: 'src', dependencies: ['team'] },
           { ref: 'w2', goal: 'Write follow-up W2', access: 'write', scopePath: 'src', dependencies: ['team'] },
         ],
@@ -210,6 +210,68 @@ test('fair Writer-preference queue prevents continuous Read Workers from starvin
 
   // Now nR2 and nR3 dispatch together in parallel!
   assert.deepEqual(engine.runnableNodes(taskId).map(n => n.id), [nR2.id, nR3.id])
+})
+
+test('a timed-out Team cancels auto-scheduled children before settling and releases their workspace leases', { timeout: 8_000 }, async (t) => {
+  const { cwd, directory } = await fixture(t)
+  let rootTurns = 0
+  let childRan = false
+  let childCancelled = false
+  let rootSawTimeout = false
+  const execution = new ConcurrencyExecution(async (config, call, prompt, signal) => {
+    if (config.role === 'root') {
+      if (++rootTurns === 1) {
+        const plan = await call('propose_task_plan', { wait: 'none', nodes: [
+          { ref: 'team', role: 'team', teamKey: 'timeout-test', goal: 'Coordinate work', access: 'write', budget: { timeMs: 500 } },
+          { ref: 'child', parentNodeId: 'team', goal: 'Hold the write lease until cancelled', access: 'write' },
+          { ref: 'independent', goal: 'Write independently after the lease is released', access: 'write' },
+        ] })
+        assert.equal(plan.ok, true, plan.error)
+      } else if (prompt.includes('worker_deadline') || prompt.includes('node_handoff_rejected')) {
+        rootSawTimeout = true
+      }
+      return 'Root processes the task outcome'
+    }
+    assert.equal(config.role, 'worker')
+    if (prompt.startsWith('Hold the write lease')) {
+      childRan = true
+      try {
+        await delay(60_000, undefined, { signal })
+      } catch (error) {
+        childCancelled = signal?.aborted === true
+        if (!childCancelled) throw error
+      }
+      return 'Child stopped'
+    }
+    const written = await call('create_text_file', { path: 'src/independent.txt', content: 'done' })
+    assert.equal(written.ok, true, written.error)
+    return 'Independent delivery completed'
+  })
+
+  const host = new LocalAgentHost({ directory, execution })
+  try {
+    const { taskId } = await host.createTask({ requestId: 'team-timeout', cwd, goal: 'Exercise cancellation', workspaceAccess: 'write' })
+    await host.idle()
+    const task = host.getTask(taskId)
+    const team = task.nodes!.find(node => node.role === 'team')!
+    const child = task.nodes!.find(node => node.parentNodeId === team.id)!
+    const events = host.events(taskId)
+    const childSettled = events.find(event => event.type === 'task.node_settled' && event.taskNodeId === child.id)
+    const teamSettled = events.find(event => event.type === 'task.node_settled' && event.taskNodeId === team.id)
+    assert.ok(childRan && childCancelled && rootSawTimeout)
+    assert.deepEqual(execution.errors, [])
+    assert.equal(task.status, 'failed')
+    assert.equal(team.status, 'failed')
+    assert.ok(team.result?.remainingRisks.includes('worker_deadline'))
+    assert.ok(childSettled && teamSettled && childSettled.seq < teamSettled.seq)
+    assert.equal(task.nodes!.some(node => node.status === 'running'), false)
+    assert.equal(await readFile(join(cwd, 'src', 'independent.txt'), 'utf8'), 'done')
+    const leases = new CodingWorkspace(cwd).leaseState()
+    assert.equal(leases.writer, undefined)
+    assert.equal(leases.waitingCount, 0)
+  } finally {
+    await host.close()
+  }
 })
 
 test('Team suspendParent handoff via delegate_worker avoids deadlock and safely restores Team write lease', { timeout: 15_000 }, async (t) => {

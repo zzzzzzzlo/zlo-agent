@@ -46,7 +46,7 @@ function catalogExecution() {
 const request = (estimatedInputTokens: number, maxOutputTokens: number, kind: ModelRequest['kind'] = 'prompt'): ModelRequest =>
   ({ route: defaultRoute, estimatedInputTokens, maxOutputTokens, kind })
 
-test('scheduler rejects invalid requests and restricts independent selection to eligible same-provider routes', async () => {
+test('scheduler distinguishes existing session resume from cross-provider fresh Worker allocation', async () => {
   const store = new LocalStore(':memory:')
   try {
     const { execution, validated, discovered } = catalogExecution()
@@ -62,20 +62,33 @@ test('scheduler rejects invalid requests and restricts independent selection to 
       },
     })
     const scheduler = new LocalModelScheduler(execution, store, judgment)
-    await assert.rejects(scheduler.allocate(event, defaultRoute, other, true), /Cross-provider/)
+    await assert.rejects(
+      scheduler.allocate(event, defaultRoute, other, true, undefined, undefined, { sessionMode: 'resume' }),
+      /Cross-provider/,
+    )
     assert.deepEqual(validated, [])
     await assert.rejects(scheduler.allocate(event, defaultRoute, { ...alternate, model: 'unknown' }), /Unavailable/)
     await assert.rejects(scheduler.allocate(event, defaultRoute, { ...alternate, model: 'bad\nroute' }), /Invalid model route/)
-    assert.deepEqual(await scheduler.allocate(event, defaultRoute, undefined, true), alternate)
+    // Fresh Worker Sessions allow cross-provider selection and prefer task-appropriate routes across providers.
+    assert.deepEqual(await scheduler.allocate(event, defaultRoute, other, true), other)
+    assert.deepEqual(await scheduler.allocate(event, defaultRoute, undefined, true), other)
+    // Resumed independent selection discovers only the session's current provider and selects same-provider alternate.
+    assert.deepEqual(
+      await scheduler.allocate(event, defaultRoute, undefined, true, undefined, undefined, { sessionMode: 'resume' }),
+      alternate,
+    )
     assert.deepEqual(await scheduler.allocate(event, defaultRoute, defaultRoute, true), defaultRoute)
-    assert.deepEqual(discovered, [defaultRoute.provider])
-    assert.deepEqual(candidates, [[defaultRoute, alternate], [defaultRoute]])
+    assert.deepEqual(discovered, [undefined, defaultRoute.provider])
+    assert.deepEqual(candidates, [[other], [defaultRoute, other, alternate], [defaultRoute, alternate], [defaultRoute]])
     assert.deepEqual(store.events('task').map(({ type, payload }) => [type, payload.judgeStatus, payload.output]), [
+      ['judgment.evaluated', 'invalid', 0],
+      ['judgment.evaluated', 'invalid', 1],
       ['judgment.evaluated', 'invalid', 1],
       ['judgment.evaluated', 'invalid', 0],
     ])
     assert.equal(scheduler.canSwitch(defaultRoute, alternate), true)
     assert.equal(scheduler.canSwitch(defaultRoute, other), false)
+    assert.equal(scheduler.canResumeSession(defaultRoute, other), false)
   } finally {
     store.close()
   }

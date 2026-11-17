@@ -108,7 +108,7 @@ test('Team scopes inherit and same-workspace writers serialize while a Team yiel
   const { taskId } = engine.create({ requestId: 'root', goal: 'Team work', cwd: 'ignored', workspaceAccess: 'trusted' })
   const [team, child, sibling] = engine.proposePlan(taskId, 'plan', 0, [
     { ref: 'team', goal: 'Fix feature', role: 'team', teamKey: 'feature', access: 'write', scopePath: 'src' },
-    { ref: 'child', goal: 'Inspect feature', parentNodeId: 'team' },
+    { ref: 'child', goal: 'Inspect feature', parentNodeId: 'team', access: 'read' },
     { ref: 'sibling', goal: 'Update documentation', access: 'write', scopePath: 'docs' },
   ])
   assert.equal(child.scopePath, 'src')

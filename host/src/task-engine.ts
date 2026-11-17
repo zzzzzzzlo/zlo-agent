@@ -1023,9 +1023,17 @@ export class TaskEngine {
     return graph.nonSucceededIds.size > 0
   }
 
-  hasRunningNodes(taskId: string): boolean {
+  hasUnconvergedFormalNodes(taskId: string): boolean {
+    const task = this.getMeta(taskId)
+    const graph = this.#graph(taskId, task)
+    return [...(graph.childrenByParent.get(task.rootNodeId) ?? [])].some(id => graph.nonSucceededIds.has(id))
+  }
+
+  hasRunningNodes(taskId: string, parentNodeId?: string): boolean {
     const graph = this.#graph(taskId)
-    return graph.activeIds.size > 0
+    if (parentNodeId === undefined) return graph.activeIds.size > 0
+    for (const id of graph.activeIds) if (graph.nodesById.get(id)?.parentNodeId === parentNodeId) return true
+    return false
   }
 
   completedChildCount(taskId: string, parentNodeId: string): number {
@@ -1244,9 +1252,11 @@ export class TaskEngine {
     if (task.legacyWorkerId) throw new Error('Single Worker budget exhausted')
     if (graph.nodesById.size >= this.#maxPlanNodes) throw new Error('Task node budget exhausted')
     if (!Array.isArray(dependencies) || dependencies.length) throw new Error('This sprint only supports a leaf with no execution dependencies')
+    const taskAccess = task.workspaceAccess ?? (task.check?.path ? 'write' : 'read')
+    const access: WorkspaceAccess = taskAccess === 'read' ? 'read' : 'write'
     const ordinal = (task.nodeSeq ?? graph.nodesById.size) + 1
     const stored: StoredTaskNode = {
-      id: randomUUID(), parentNodeId: task.rootNodeId, dependencies: [], goal: checkText(goal, 'worker goal', 8000), status: 'ready',
+      id: randomUUID(), parentNodeId: task.rootNodeId, dependencies: [], access, goal: checkText(goal, 'worker goal', 8000), status: 'ready',
       taskId: task.id, ordinal, isLegacyWorker: true,
     }
     this.#putNode(graph, stored)
@@ -1271,26 +1281,29 @@ export class TaskEngine {
   }
 
   delegateScoped(taskId: string, requestId: string, parentNodeId: string, input: Pick<NodeProposal,
-    'goal' | 'access' | 'scopePath' | 'tools' | 'disallowedTools' | 'budget' | 'check'>): WorkerNode {
+    'goal' | 'access' | 'scopePath' | 'tools' | 'disallowedTools' | 'budget' | 'check' | 'route'>): WorkerNode {
     const task = this.getMeta(taskId)
     const graph = this.#graph(taskId, task)
     this.#assertPlanning(task, task.planVersion, graph)
     const parent = parentNodeId === task.rootNodeId ? undefined : graph.nodesById.get(parentNodeId)
     if (parentNodeId !== task.rootNodeId && parent?.status !== 'running') throw new Error('Parent is not accepting delegation')
     const goal = checkText(input.goal, 'worker goal', 8000)
-    const access = input.access ?? 'read'
+    const taskAccess = task.workspaceAccess ?? (task.check?.path ? 'write' : 'read')
+    const parentAccess = parent ? (parent.access ?? 'read') : taskAccess
+    const access = input.access ?? (parentAccess === 'read' ? 'read' : 'write')
     const path = input.scopePath === undefined ? parent?.scopePath : scopePath(input.scopePath)
     const tools = input.tools === undefined ? undefined : planTools(input.tools)
     const disallowedTools = input.disallowedTools === undefined ? undefined : planTools(input.disallowedTools)
     const budget = input.budget === undefined ? undefined : planBudget(input.budget)
     const check = verificationCheck(input.check)
+    const route = input.route === undefined ? undefined : planRoute(input.route)
     const siblings = graph.childrenByParent.get(parentNodeId)
     if (siblings) {
       for (const childId of siblings) {
         const node = graph.nodesById.get(childId)
         if (!node || node.isLegacyWorker) continue
         if (node.role === 'worker' &&
-          node.goal === goal && !node.dependencies.length && !node.route && node.worktreeId === parent?.worktreeId &&
+          node.goal === goal && !node.dependencies.length && node.route?.provider === route?.provider && node.route?.model === route?.model && node.worktreeId === parent?.worktreeId &&
           node.access === access && node.scopePath === path &&
           JSON.stringify(node.tools) === JSON.stringify(tools) &&
           JSON.stringify(node.disallowedTools) === JSON.stringify(disallowedTools) &&
@@ -1302,7 +1315,7 @@ export class TaskEngine {
       }
     }
     return this.proposePlan(taskId, requestId, task.planVersion,
-      [{ ref: 'child', role: 'worker', parentNodeId, goal, access, scopePath: path, tools, disallowedTools, budget, check }])[0]!
+      [{ ref: 'child', role: 'worker', parentNodeId, goal, access, scopePath: path, tools, disallowedTools, budget, check, ...(route ? { route } : {}) }])[0]!
   }
 
   proposePlan(taskId: string, requestId: string, expectedVersion: number, proposals: NodeProposal[]): WorkerNode[] {
@@ -1323,10 +1336,33 @@ export class TaskEngine {
         ids.set(proposal.ref, randomUUID())
       }
       const resolve = (id: string) => ids.get(id) ?? id
-      const candidates = proposals.map((proposal): WorkerNode => {
-        const role = proposal.role ?? 'worker'
-        const access = proposal.access ?? 'read'
+      const taskAccess: WorkspaceAccess = task.workspaceAccess ?? (task.check?.path ? 'write' : 'read')
+      const proposalById = new Map(proposals.map(proposal => [ids.get(proposal.ref)!, proposal]))
+      const resolvedAccess = new Map<string, WorkspaceAccess>()
+      const visitingAccess = new Set<string>()
+      const resolveAccess = (nodeId: string): WorkspaceAccess => {
+        const cached = resolvedAccess.get(nodeId)
+        if (cached) return cached
+        const persisted = graph.nodesById.get(nodeId)
+        if (persisted) return persisted.access ?? 'read'
+        if (nodeId === task.rootNodeId) return taskAccess
+        const proposal = proposalById.get(nodeId)
+        if (!proposal || visitingAccess.has(nodeId)) throw new Error('Invalid parent scope or depth')
+        visitingAccess.add(nodeId)
         const parentNodeId = resolve(proposal.parentNodeId ?? task.rootNodeId)
+        const parentAccess = parentNodeId === task.rootNodeId ? taskAccess : resolveAccess(parentNodeId)
+        visitingAccess.delete(nodeId)
+        const inherited: WorkspaceAccess = parentAccess === 'read' ? 'read' : 'write'
+        const access = proposal.access ?? inherited
+        if (access !== 'read' && access !== 'write' && access !== 'trusted') throw new Error('Invalid node access')
+        resolvedAccess.set(nodeId, access)
+        return access
+      }
+      const candidates = proposals.map((proposal): WorkerNode => {
+        const id = ids.get(proposal.ref)!
+        const role = proposal.role ?? 'worker'
+        const parentNodeId = resolve(proposal.parentNodeId ?? task.rootNodeId)
+        const access = resolveAccess(id)
         if (proposal.worktreeId !== undefined && (typeof proposal.worktreeId !== 'string' ||
           !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/u.test(proposal.worktreeId) ||
           parentNodeId !== task.rootNodeId || task.workspaceAccess !== 'trusted')) {
@@ -1337,8 +1373,6 @@ export class TaskEngine {
           throw new Error('Team node requires a stable Team key')
         }
         if (role === 'worker' && proposal.teamKey !== undefined) throw new Error('Worker cannot claim a Team key')
-        if (access !== 'read' && access !== 'write' && access !== 'trusted') throw new Error('Invalid node access')
-        const taskAccess = task.workspaceAccess ?? (task.check?.path ? 'write' : 'read')
         if (nodeAccessRank[access] > nodeAccessRank[taskAccess]) throw new Error('Node cannot expand workspace access')
         const parent = graph.nodesById.get(parentNodeId)
         if (parent && parent.status !== 'ready' && parent.status !== 'running') throw new Error('Parent is not accepting work')
@@ -1347,7 +1381,7 @@ export class TaskEngine {
           throw new Error('Command verification requires trusted node workspace access')
         }
         return {
-          id: ids.get(proposal.ref)!, parentNodeId, role, access, status: 'ready',
+          id, parentNodeId, role, access, status: 'ready',
           goal: checkText(proposal.goal, 'worker goal', 8000),
           dependencies: nodeDependencies(proposal.dependencies, resolve, this.#maxDependenciesPerNode),
           ...(proposal.scopePath !== undefined ? { scopePath: scopePath(proposal.scopePath) } : {}),
@@ -1766,19 +1800,30 @@ export class TaskEngine {
       let accepted = result ?? interruption?.result
       if (interruption) verification = interruption.verification
       if (result?.resultStatus === 'succeeded') {
-        const finished = receipts.every(operation => operation.status !== 'started' && !isUnresolvedEffect(operation))
+        const childOperations = children.flatMap(child => this.#db.operationsForNode<Operation>(taskId, child.id))
+        const finished = [...receipts, ...childOperations].every(operation => operation.status !== 'started' && !isUnresolvedEffect(operation))
+        const failedOrBlocked = new Set(children.filter(child => child.status === 'failed').map(child => child.id))
+        for (const id of failedOrBlocked) {
+          for (const dependentId of graph.dependentsByNode.get(id) ?? []) {
+            if (graph.nodesById.get(dependentId)?.status === 'ready') failedOrBlocked.add(dependentId)
+          }
+        }
+        const childrenSettled = children.every(child => child.status === 'succeeded' || failedOrBlocked.has(child.id))
         const hasReceipt = receipts.some(({ id, status }) => status === 'succeeded' && result.evidenceRefs.includes(id))
-        const childrenCompleted = children.every(({ status }) => status === 'succeeded')
-        const hasHandoff = node.check ? confirmedCheck(verification) : hasReceipt || (children.length > 0 && childrenCompleted)
-        const completed = finished && childrenCompleted && hasHandoff && Boolean(result.summary.trim())
+        const succeededChildren = children.filter(({ status }) => status === 'succeeded')
+        const hasHandoff = node.check ? confirmedCheck(verification) : hasReceipt || succeededChildren.length > 0
+        const completed = finished && childrenSettled && hasHandoff && Boolean(result.summary.trim())
         const verified = completed && Boolean(node.check)
         verification = {
           passed: verified,
           verdict: verified ? 'verified' : completed ? 'unverified' : 'failed',
           basis: node.check ? node.check.command ? 'project_command' : 'workspace_path' : 'handoff',
-          evidence: !finished ? 'node_unsettled_operations' : !childrenCompleted ? 'node_child_verification_failed'
+          evidence: !finished ? 'node_unsettled_operations'
+            : !childrenSettled ? 'node_children_unsettled'
             : node.check ? verification?.evidence ?? 'node_check_unavailable'
-            : hasReceipt && completed ? 'node_confirmed_tool_receipt' : completed ? 'node_completed_children' : 'node_missing_evidence',
+            : hasReceipt && completed ? 'node_confirmed_tool_receipt'
+            : succeededChildren.length > 0 && completed ? 'node_completed_children'
+            : 'node_missing_evidence',
         }
         if (!completed) accepted = { ...result, resultStatus: 'failed', remainingRisks: [...result.remainingRisks, verification.evidence] }
       } else if (result?.resultStatus === 'failed') {
@@ -1826,6 +1871,8 @@ export class TaskEngine {
       this.#nodeEvent(task, settled, legacy ? 'task.worker_settled' : 'task.node_settled', {
         status: accepted?.resultStatus ?? 'interrupted',
         attemptStatus,
+        parentNodeId: node.parentNodeId,
+        role: node.role ?? 'worker',
         ...(accepted ? { executionStatus: accepted.executionStatus, evidenceRefs: accepted.evidenceRefs, verification } : {}),
       })
       return this.#toWorkerNode(settled)
@@ -2264,7 +2311,7 @@ export class TaskEngine {
       const completed = result.verdict === 'verified' || result.verdict === 'unverified'
       const legacyWorker = task.legacyWorkerId ? graph.nodesById.get(task.legacyWorkerId) : undefined
       if (graph.activeIds.size > 0 ||
-        (completed && graph.nonSucceededIds.size > 0) ||
+        (completed && this.hasUnconvergedFormalNodes(taskId)) ||
         (!completed && legacyWorker?.status === 'ready')) {
         throw new Error('Worker outcome prevents task acceptance')
       }

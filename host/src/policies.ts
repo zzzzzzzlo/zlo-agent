@@ -110,6 +110,9 @@ export interface CapabilityScope {
   canSelectTaskWorkspace?: boolean
 }
 
+/** Runtime capability grant evaluated dynamically per execution, decoupled from Team identity and Pi Session. */
+export type CapabilityGrant = CapabilityScope
+
 export const accessRank: Record<WorkspaceAccess, number> = { read: 0, write: 1, trusted: 2 }
 
 function validToolList(list: readonly string[]): boolean {
@@ -133,7 +136,8 @@ export class CodingCapabilities {
 
   child(parent: CapabilityScope, requested?: WorkspaceAccess, path?: string, role: 'team' | 'worker' = 'worker',
     tools?: readonly string[], disallowedTools?: readonly string[]): CapabilityScope {
-    const access = requested ?? 'read'
+    const inherited: WorkspaceAccess = parent.access === 'read' ? 'read' : 'write'
+    const access = requested ?? inherited
     if (!Object.hasOwn(accessRank, access) || accessRank[access] > accessRank[parent.access]) throw new Error('Requested access exceeds its parent workspace grant')
     const target = path === undefined ? parent.path : workspaceTarget({ path })
     if (path !== undefined && (!target || !within(parent.path, target))) throw new Error('Child workspace scope exceeds its parent')
@@ -150,6 +154,20 @@ export class CodingCapabilities {
     return { role, access, path: target, tools: tools === undefined ? parent.tools : [...tools],
       ...(mergedDisallowed.length ? { disallowedTools: mergedDisallowed } : {}),
       explicitDelegation: parent.explicitDelegation === true && tools !== undefined }
+  }
+
+  /** Recompute a child grant dynamically so revoked parent or user permissions take effect immediately. */
+  clamp(parent: CapabilityScope, requested?: WorkspaceAccess, path?: string, role: 'team' | 'worker' = 'worker',
+    tools?: readonly string[], disallowedTools?: readonly string[]): CapabilityGrant {
+    const ceiling = accessRank[parent.access]
+    const boundedAccess = requested === undefined
+      ? (parent.access === 'read' ? 'read' : 'write')
+      : (accessRank[requested] <= ceiling ? requested : parent.access)
+    const allowedTools = tools?.filter(name =>
+      this.enabled(name) &&
+      (parent.tools === undefined || parent.tools.includes(name)) &&
+      (parent.disallowedTools === undefined || !parent.disallowedTools.includes(name)))
+    return this.child(parent, boundedAccess, path, role, allowedTools, disallowedTools)
   }
 
   describe(scope: CapabilityScope, tool: WorkspaceTool): boolean {

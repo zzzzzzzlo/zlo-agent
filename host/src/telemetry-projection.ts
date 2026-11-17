@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import { verificationVerdict } from '../../shared/contracts/domain.ts'
+import { memoryKinds, verificationVerdict } from '../../shared/contracts/domain.ts'
 import type { VerificationResult } from '../../shared/contracts/domain.ts'
 import { jevModel, jevReasons, judgmentPoints, publicBatchLabels, retiredJudgmentPointIds } from '../../shared/contracts/jev.ts'
 import type { TelemetryEvent, TelemetryTask, TelemetryVerification } from '../../shared/contracts/observatory.ts'
@@ -12,7 +12,7 @@ const states = 'ready running verifying succeeded failed blocked stop_requested 
 const reasons = 'user_stop host_shutdown process_interrupted model_error model_interrupted runtime_error verification_failed unknown_effect checkpoint_error stop_timeout budget_exhausted model_output_limit tool_retry_loop'.split(' ')
 const roles = ['root', 'team', 'worker'] as const
 const accessLevels = ['read', 'write', 'trusted'] as const
-const verificationEvidence = 'workspace_text_file_exists workspace_file_contains_expected_text workspace_command_passed project_command_exit_zero project_command_not_authorized project_command_previous_result project_command_effect_unknown workspace_command_not_authorized workspace_write_active verification_interrupted workspace_command_unavailable workspace_command_failed workspace_file_unavailable workspace_file_missing_expected_text node_unknown_effect'.split(' ')
+const verificationEvidence = 'workspace_text_file_exists workspace_file_contains_expected_text workspace_command_passed project_command_exit_zero project_command_not_authorized project_command_previous_result project_command_effect_unknown workspace_command_not_authorized workspace_write_active verification_interrupted workspace_command_unavailable workspace_command_failed workspace_file_unavailable workspace_file_missing_expected_text node_unknown_effect node_confirmed_tool_receipt node_completed_children node_missing_evidence node_children_unsettled node_unsettled_operations node_handoff_rejected node_check_unavailable node_interrupted_after_write'.split(' ')
 const points = [...judgmentPoints.map(({ id }) => id), ...retiredJudgmentPointIds]
 const uuid = /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/iu
 const hashPattern = /^sha256:[0-9a-f]{64}$/u
@@ -71,12 +71,13 @@ function judgment(p: Record<string, unknown>) {
   const input = obj(p.features)
   const features: Record<string, unknown> = {}
   for (const key of ['nodeCount', 'nodeOrdinal', 'goalLength', 'evidenceCount', 'artifactCount', 'completedChildren', 'replanCount',
-    'failedCount', 'writeCount', 'targetCount', 'bytes', 'candidateCount', 'factCount', 'experienceCount', 'toolCount', 'length', 'attemptCount']) {
+    'failedCount', 'writeCount', 'targetCount', 'bytes', 'candidateCount', 'factCount', 'experienceCount', 'toolCount', 'length', 'attemptCount', 'budgetRemaining']) {
     features[key] = num(input[key])
   }
   for (const key of ['teamCandidate', 'hasDependencies', 'nonEmptyGoal', 'independent', 'requested', 'checked', 'checkPassed',
     'checkConfigured', 'hasWrite', 'isRootChild', 'hasScopePath', 'initial']) features[key] = bool(input[key])
   features.role = oneOf(input.role, roles)
+  features.taskRole = oneOf(input.taskRole, ['planning', 'research', 'coding', 'review', 'general'])
   features.access = oneOf(input.access, accessLevels)
   features.status = oneOf(input.status, ['missing', ...states])
   features.tool = oneOf(input.tool, ['web_search', 'web_fetch', 'browser_snapshot', 'process_output',
@@ -84,7 +85,7 @@ function judgment(p: Record<string, unknown>) {
   if (Array.isArray(input.candidates)) features.candidates = list(input.candidates, 8).map(value => {
     const c = obj(value)
     return { index: num(c.index), providerKey: ref(c.providerKey), modelKey: ref(c.modelKey), contextWindow: num(c.contextWindow),
-      supportsText: bool(c.supportsText), estimatedCost: num(c.estimatedCost), kind: oneOf(c.kind, ['fact', 'experience']),
+      supportsText: bool(c.supportsText), estimatedCost: num(c.estimatedCost), kind: oneOf(c.kind, memoryKinds),
       rank: num(c.rank), evidenceCount: num(c.evidenceCount), estimatedBytes: num(c.estimatedBytes) }
   })
   const link = obj(p.resultLink), usage = obj(p.usage)
@@ -170,7 +171,7 @@ function safePayload(type: string, p: Record<string, unknown>): Record<string, u
     case 'memory.captured': case 'memory.recalled': return { count: num(p.count), elapsedMs: num(p.elapsedMs),
       contextBytes: num(p.contextBytes), budgetBytes: num(p.budgetBytes), entries: list(p.entries).map(value => {
       const entry = obj(value)
-      return { memoryId: ref(entry.memoryId), version: num(entry.version), kind: oneOf(entry.kind, ['fact', 'experience']) }
+      return { memoryId: ref(entry.memoryId), version: num(entry.version), kind: oneOf(entry.kind, memoryKinds) }
     }) }
     case 'judgment.evaluated': return judgment(p)
   }

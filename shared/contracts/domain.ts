@@ -54,6 +54,9 @@ export function normalizeVerification(result: VerificationResult): VerificationR
 export type TaskStatus = 'ready' | 'running' | 'verifying' | 'succeeded' | 'failed' |
   'blocked' | 'stop_requested' | 'stopping' | 'stopped' | 'needs_reconciliation'
 
+export const memoryKinds = ['fact', 'experience', 'decision', 'contract', 'failure_pattern', 'risk', 'assumption'] as const
+export type MemoryKind = typeof memoryKinds[number]
+
 export type EndReason = 'user_stop' | 'host_shutdown' | 'process_interrupted' | 'model_error' |
   'model_interrupted' | 'runtime_error' | 'verification_failed' | 'unknown_effect' | 'checkpoint_error' |
   'stop_timeout' | 'budget_exhausted' | 'model_output_limit' | 'tool_retry_loop'
