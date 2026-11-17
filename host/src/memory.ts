@@ -336,7 +336,10 @@ function rankBm25(entries: readonly StoredMemoryEntry[], query: string, limit: n
       score += idf * ((freq * (k1 + 1)) / denom)
     }
     if (score > 0) {
-      if (doc.entry.durable === true || doc.entry.kind === 'experience') score *= 1.15
+      if (doc.entry.durable === true || doc.entry.kind === 'experience' || doc.entry.kind === 'decision' ||
+        doc.entry.kind === 'contract' || doc.entry.kind === 'failure_pattern') {
+        score *= 1.15
+      }
       scored.push({ entry: doc.entry, index, score })
     }
   }
@@ -389,10 +392,13 @@ function entryRef({ id, version, kind }: MemoryEntry) {
   return { memoryId: id, version, kind }
 }
 
-function formatMarkdownLine(entry: Pick<MemoryEntry, 'kind' | 'title' | 'text' | 'paths' | 'version' | 'updatedAt' | 'durable'>): string {
+function formatMarkdownLine(entry: Pick<MemoryEntry, 'kind' | 'title' | 'text' | 'paths' | 'version' | 'updatedAt' | 'durable' | 'confidence' | 'teamKey'>): string {
   const prefix = entry.title ? `**${entry.title}**: ` : ''
+  const meta: string[] = [entry.kind]
+  if (entry.teamKey) meta.push(`team:${entry.teamKey}`)
+  if (entry.confidence) meta.push(entry.confidence)
   const pathNote = entry.paths?.length ? ` _(paths: ${entry.paths.join(', ')})_` : ''
-  return `- ${prefix}${entry.text}${pathNote} _(v${entry.version}, ${entry.updatedAt})_`
+  return `- [${meta.join(', ')}] ${prefix}${entry.text}${pathNote} _(v${entry.version}, ${entry.updatedAt})_`
 }
 
 function compactText(value: string, maxLength: number): string {
@@ -408,6 +414,29 @@ function checkSummary(check?: TaskMemoryInput['check']): string | undefined {
   return undefined
 }
 
+function normalizedTargetPaths(rawPaths: readonly (string | undefined)[]): string[] | undefined {
+  const out = new Set<string>()
+  for (const raw of rawPaths) {
+    if (!raw) continue
+    const target = workspaceTarget({ path: raw }, 'read')
+    if (target && !sensitiveText.test(target)) out.add(target)
+  }
+  return out.size ? [...out].slice(0, maxEntryPaths) : undefined
+}
+
+function normalizedNodePaths(node?: Pick<TaskMemoryNodeInput, 'scopePath' | 'check'>): string[] | undefined {
+  if (!node) return undefined
+  const scopeTarget = node.scopePath ? workspaceTarget({ path: node.scopePath }, 'read') : undefined
+  const checkRaw = node.check?.path ?? node.check?.command?.path
+  const checkTarget = checkRaw ? workspaceTarget({ path: checkRaw }, 'read') : undefined
+  const out = new Set<string>()
+  if (scopeTarget && !sensitiveText.test(scopeTarget)) out.add(scopeTarget)
+  if (checkTarget && !sensitiveText.test(checkTarget) && (!scopeTarget || withinScopePath(scopeTarget, checkTarget))) {
+    out.add(checkTarget)
+  }
+  return out.size ? [...out] : undefined
+}
+
 /**
  * Distill bounded, evidence-backed structured memories from both succeeded and failed task executions.
  * Failed Worker writes are never promoted to verified facts or experiences; only parent/check-verified
@@ -417,6 +446,7 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
   const project = cleanProject(input.project)
   const nodes = input.nodes ?? []
   const byId = new Map(nodes.map(node => [node.id, node]))
+  const nodeIndex = new Map(nodes.map((node, index) => [node.id, index]))
   const operationsByNode = new Map<string, TaskMemoryOperationInput[]>()
   for (const operation of input.operations) {
     if (!operation.taskNodeId) continue
@@ -424,11 +454,68 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
     operations.push(operation)
     operationsByNode.set(operation.taskNodeId, operations)
   }
-  const successfulByParent = new Map<string, TaskMemoryNodeInput>()
-  for (const node of nodes) {
-    if (node.status === 'succeeded' && (node.verification?.passed || operationsByNode.get(node.id)?.some(op => op.status === 'succeeded'))) {
-      successfulByParent.set(node.parentNodeId, node)
+  const nodeSucceededWithEvidence = (node: TaskMemoryNodeInput): boolean =>
+    node.status === 'succeeded' &&
+    node.verification?.verdict !== 'failed' &&
+    (node.verification?.passed === true ||
+      (operationsByNode.get(node.id) ?? []).some(op => op.status === 'succeeded') ||
+      Boolean(node.result?.evidenceRefs.length))
+  const concreteNodeTargets = (node: TaskMemoryNodeInput, ops: readonly TaskMemoryOperationInput[]): string[] =>
+    normalizedTargetPaths([
+      node.check?.path,
+      node.check?.command?.path,
+      ...(node.result?.artifactRefs ?? []),
+      ...ops.flatMap(op => op.target ? [op.target] : (op.changedPaths ?? [])),
+    ]) ?? []
+  const findReplacementSibling = (failedNode: TaskMemoryNodeInput, failedIdx: number): TaskMemoryNodeInput | undefined => {
+    const failedScope = failedNode.scopePath ? workspaceTarget({ path: failedNode.scopePath }, 'read') : undefined
+    const failedCheck = normalizedTargetPaths([failedNode.check?.path, failedNode.check?.command?.path])?.[0]
+    const failedTargets = concreteNodeTargets(failedNode, operationsByNode.get(failedNode.id) ?? [])
+    let matched: TaskMemoryNodeInput | undefined
+    for (let idx = 0; idx < nodes.length; idx++) {
+      const candidate = nodes[idx]!
+      if (candidate.id === failedNode.id || candidate.parentNodeId !== failedNode.parentNodeId) continue
+      if (!nodeSucceededWithEvidence(candidate)) continue
+      const explicitSuccessor = candidate.dependencies.includes(failedNode.id)
+      const ranAfter = idx > failedIdx || (candidate.replans ?? 0) > 0 || explicitSuccessor
+      if (!ranAfter) continue
+      if (explicitSuccessor) {
+        matched = candidate
+        continue
+      }
+      const candSucceededOps = (operationsByNode.get(candidate.id) ?? []).filter(op => op.status === 'succeeded')
+      const candTargets = concreteNodeTargets(candidate, candSucceededOps)
+      const candCheck = normalizedTargetPaths([candidate.check?.path, candidate.check?.command?.path])?.[0]
+      if (failedCheck && candCheck &&
+        !withinScopePath(candCheck, failedCheck) &&
+        !withinScopePath(failedCheck, candCheck) &&
+        !candTargets.some(target => withinScopePath(target, failedCheck) || withinScopePath(failedCheck, target))) {
+        continue
+      }
+      const candScope = candidate.scopePath ? workspaceTarget({ path: candidate.scopePath }, 'read') : undefined
+      const candHasWrite = candSucceededOps.some(op => op.effect === 'write')
+      const targetsOverlap = failedTargets.length > 0 &&
+        candTargets.some(ct => failedTargets.some(ft => withinScopePath(ct, ft) || withinScopePath(ft, ct)))
+      if (failedScope && candScope) {
+        if (!withinScopePath(candScope, failedScope)) continue
+        if (!candHasWrite && !candidate.verification?.passed && !(candidate.replans ?? 0) &&
+          failedTargets.length > 0 && candTargets.length > 0 && !targetsOverlap) {
+          continue
+        }
+        matched = candidate
+      } else if (failedScope && !candScope) {
+        if (candTargets.some(target => withinScopePath(failedScope, target) || withinScopePath(target, failedScope))) {
+          matched = candidate
+        }
+      } else if (!failedScope && candScope) {
+        if (failedTargets.length > 0 && failedTargets.every(target => withinScopePath(candScope, target))) {
+          matched = candidate
+        }
+      } else if (targetsOverlap) {
+        matched = candidate
+      }
     }
+    return matched
   }
   const failedNodes = new Set(nodes.filter(node => node.status !== 'succeeded').map(node => node.id))
   const teamOf = (node?: TaskMemoryNodeInput): string | undefined => {
@@ -472,6 +559,7 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
     }
   }
   const structured: MemoryCandidate[] = []
+  const rootCheckPaths = normalizedTargetPaths([input.check?.path])
 
   // 2. Root verification experience (preserves established phrasing when task check passed).
   if (input.status === 'succeeded' && input.check && input.verification?.passed) {
@@ -479,7 +567,7 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
       kind: 'experience',
       key: 'verify:' + shortHash(JSON.stringify(input.check)),
       durable: true,
-      ...(input.check.path ? { paths: [input.check.path] } : {}),
+      ...(rootCheckPaths ? { paths: rootCheckPaths } : {}),
       text: input.check.command
         ? 'Project verification passed using ' + input.check.command.command
         : 'A workspace check passed for ' + input.check.path,
@@ -489,16 +577,62 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
     })
   }
 
+  const rootDirectWrites = input.operations.filter(op =>
+    (!op.taskNodeId || op.taskNodeId === input.rootNodeId) && op.effect === 'write' && op.status === 'succeeded')
+  const rootDirectTargets = normalizedTargetPaths(
+    rootDirectWrites.flatMap(op => op.target ? [op.target] : (op.changedPaths ?? [])),
+  ) ?? []
+
   // 3. Failure patterns, verified resolutions, and unresolved risks from Workers, Teams, and Root.
   for (const node of nodes) {
     const teamKey = teamOf(node)
+    const nodePaths = normalizedNodePaths(node)
     const parent = byId.get(node.parentNodeId)
     const parentIsRoot = node.parentNodeId === input.rootNodeId
-    const parentVerifiedSuccess = parentIsRoot
-      ? input.status === 'succeeded' && (input.verification?.passed === true || facts.length > 0)
-      : parent?.status === 'succeeded' && (parent.verification?.passed === true ||
-          operationsByNode.get(parent.id)?.some(op => op.status === 'succeeded'))
-    const successfulSibling = successfulByParent.get(node.parentNodeId)
+    const failedIdx = nodeIndex.get(node.id) ?? 0
+    const replacementSibling = node.status === 'failed' ? findReplacementSibling(node, failedIdx) : undefined
+    const parentDirectWrites = parentIsRoot
+      ? rootDirectWrites
+      : (parent ? (operationsByNode.get(parent.id) ?? []).filter(op => op.effect === 'write' && op.status === 'succeeded') : [])
+    const parentDirectTargets = parentIsRoot
+      ? rootDirectTargets
+      : (normalizedTargetPaths(parentDirectWrites.flatMap(op => op.target ? [op.target] : (op.changedPaths ?? []))) ?? [])
+    const parentScopeAccepted = parentIsRoot
+      ? input.status === 'succeeded' &&
+        input.verification?.verdict !== 'failed' &&
+        (input.verification?.passed === true || rootDirectTargets.length > 0 || Boolean(replacementSibling))
+      : parent?.status === 'succeeded' &&
+        parent.verification?.verdict !== 'failed' &&
+        (input.status === 'succeeded'
+          ? (parent.verification?.passed === true || input.verification?.passed === true ||
+              parentDirectTargets.length > 0 || Boolean(replacementSibling))
+          : parent.verification?.passed === true)
+    const hasParentDirectRecovery = (() => {
+      if (!parentScopeAccepted) return false
+      const failedScope = node.scopePath ? workspaceTarget({ path: node.scopePath }, 'read') : undefined
+      const failedTargets = concreteNodeTargets(node, operationsByNode.get(node.id) ?? [])
+      if (failedTargets.length > 0 &&
+        parentDirectTargets.some(pt => failedTargets.some(ft => withinScopePath(pt, ft) || withinScopePath(ft, pt)))) {
+        return true
+      }
+      if (failedScope && parentDirectTargets.some(pt => withinScopePath(failedScope, pt))) {
+        return true
+      }
+      const verifiedCheck = parentIsRoot
+        ? (input.verification?.passed === true ? input.check : undefined)
+        : (parent?.verification?.passed === true ? parent.check : undefined)
+      if (!verifiedCheck) return false
+      const verifiedTarget = normalizedTargetPaths([verifiedCheck.path, verifiedCheck.command?.path])?.[0]
+      if (!verifiedTarget) {
+        // Workspace-root command check (path '.') only proves direct recovery if parent also wrote or node was root-scoped.
+        return parentDirectTargets.length > 0
+      }
+      if (failedScope) return withinScopePath(failedScope, verifiedTarget) || withinScopePath(verifiedTarget, failedScope)
+      if (failedTargets.length > 0) {
+        return failedTargets.some(ft => withinScopePath(verifiedTarget, ft) || withinScopePath(ft, verifiedTarget))
+      }
+      return parentDirectTargets.length > 0
+    })()
 
     if (node.status === 'failed') {
       const nodeFailedOps = (operationsByNode.get(node.id) ?? []).filter(op => op.status === 'failed')
@@ -510,22 +644,28 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
         key: 'fail:' + shortHash(`${teamKey ?? node.role ?? 'worker'}:${node.scopePath ?? ''}:${reason}`),
         text: `Failure pattern in ${scopeLabel}: ${reason}` +
           (nodeFailedOps[0] ? ` (tool ${nodeFailedOps[0].tool})` : ''),
+        ...(nodePaths ? { paths: nodePaths } : {}),
+        nodeId: node.id,
         sourceRefs: refs,
         confidence: node.verification?.verdict === 'failed' || nodeFailedOps.length > 0 ? 'verified' : 'confirmed',
         ...common(teamKey, node.role ?? 'worker'),
       })
 
-      if (parentVerifiedSuccess || successfulSibling) {
-        const resolverRef = successfulSibling?.id ?? (parentIsRoot ? input.taskId : parent!.id)
-        const resolutionWay = successfulSibling
+      if (parentScopeAccepted && (replacementSibling || hasParentDirectRecovery)) {
+        const resolverRef = replacementSibling?.id ?? (parentIsRoot ? input.taskId : parent!.id)
+        const resolutionWay = replacementSibling
           ? 'replacement worker'
           : (parentIsRoot ? 'root delivery recovery' : `team ${teamKey ?? parent!.id} recovery`)
+        const resolvedPaths = nodePaths ?? normalizedNodePaths(replacementSibling) ?? (parent ? normalizedNodePaths(parent) : undefined)
         structured.push({
           kind: 'experience',
           key: 'resolved:' + shortHash(`${teamKey ?? node.parentNodeId}:${reason}:${node.scopePath ?? ''}`),
           text: `Resolved ${node.role ?? 'worker'} failure (${reason}) in ${scopeLabel} via ${resolutionWay}`,
+          ...(resolvedPaths ? { paths: resolvedPaths } : {}),
+          nodeId: node.id,
           sourceRefs: [node.id, resolverRef],
-          confidence: parent?.verification?.passed || input.verification?.passed ? 'verified' : 'confirmed',
+          confidence: parent?.verification?.passed || replacementSibling?.verification?.passed || input.verification?.passed
+            ? 'verified' : 'confirmed',
           ...common(teamKey, parentIsRoot ? 'root' : 'team'),
         })
       } else {
@@ -534,6 +674,8 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
             kind: 'risk',
             key: 'risk:' + shortHash(`${teamKey ?? node.id}:${risk}:${node.scopePath ?? ''}`),
             text: `Unresolved risk in ${scopeLabel}: ${compactText(risk, 120)}`,
+            ...(nodePaths ? { paths: nodePaths } : {}),
+            nodeId: node.id,
             sourceRefs: [node.id, input.taskId],
             confidence: 'unverified',
             ...common(teamKey, node.role ?? 'worker'),
@@ -543,11 +685,15 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
       continue
     }
 
-    if (node.status === 'succeeded' && (node.replans ?? 0) > 0) {
+    const replanAccepted = node.verification?.passed === true ||
+      (parentIsRoot ? input.status === 'succeeded' : parent?.status === 'succeeded' && (input.status === 'succeeded' || parent.verification?.passed === true))
+    if (node.status === 'succeeded' && (node.replans ?? 0) > 0 && replanAccepted) {
       structured.push({
         kind: 'experience',
         key: 'replan:' + shortHash(`${teamKey ?? node.role ?? 'worker'}:${node.scopePath ?? node.goal}`),
         text: `Replanned task node (${compactText(node.goal, 80)}) succeeded after revision`,
+        ...(nodePaths ? { paths: nodePaths } : {}),
+        nodeId: node.id,
         sourceRefs: [node.id, input.taskId],
         confidence: node.verification?.passed ? 'verified' : 'confirmed',
         ...common(teamKey, node.role ?? 'worker'),
@@ -560,6 +706,8 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
           kind: 'risk',
           key: 'risk:' + shortHash(`${teamKey ?? node.id}:${risk}:${node.scopePath ?? ''}`),
           text: `Remaining risk noted after ${node.scopePath ?? compactText(node.goal, 60)}: ${compactText(risk, 120)}`,
+          ...(nodePaths ? { paths: nodePaths } : {}),
+          nodeId: node.id,
           sourceRefs: [node.id, input.taskId],
           confidence: 'unverified',
           ...common(teamKey, node.role ?? 'worker'),
@@ -575,6 +723,7 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
       kind: 'failure_pattern',
       key: 'taskfail:' + shortHash(`${reason}:${checkSummary(input.check) ?? compactText(input.goal, 60)}`),
       text: `Task failure pattern (${compactText(input.goal, 80)}): ${reason}`,
+      ...(rootCheckPaths ? { paths: rootCheckPaths } : {}),
       sourceRefs: [...failedOps.map(op => op.id).slice(0, 4), input.taskId],
       confidence: input.verification?.verdict === 'failed' || failedOps.length > 0 ? 'verified' : 'confirmed',
       ...common(undefined, 'root'),
@@ -583,6 +732,7 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
       kind: 'risk',
       key: 'taskrisk:' + shortHash(`${reason}:${input.taskId}`),
       text: `Task ended unresolved (${reason}) for ${compactText(input.goal, 80)}`,
+      ...(rootCheckPaths ? { paths: rootCheckPaths } : {}),
       sourceRefs: [input.taskId],
       confidence: 'unverified',
       ...common(undefined, 'root'),
@@ -593,7 +743,9 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
   if (nodes.length > 0) {
     for (const node of nodes) {
       if (node.status !== 'succeeded') continue
+      if (input.status === 'failed' && !node.verification?.passed) continue
       const teamKey = teamOf(node)
+      const nodePaths = normalizedNodePaths(node)
       if (node.role === 'team' && node.teamKey) {
         structured.push({
           kind: 'decision',
@@ -601,6 +753,8 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
           text: `Team ${node.teamKey} owns ${node.scopePath ?? 'workspace'}` +
             (node.worktreeId ? ' (worktree isolated)' : '') +
             (checkSummary(node.check) ? ` verifying ${checkSummary(node.check)}` : ''),
+          ...(nodePaths ? { paths: nodePaths } : {}),
+          nodeId: node.id,
           sourceRefs: [node.id, input.taskId],
           confidence: node.verification?.passed ? 'verified' : 'confirmed',
           ...common(node.teamKey, 'team'),
@@ -611,6 +765,8 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
           kind: 'decision',
           key: 'decision:route:' + shortHash(`${node.route.provider}:${node.route.model}:${teamKey ?? node.role ?? 'worker'}:${node.scopePath ?? ''}`),
           text: `Cross-provider ${node.role ?? 'worker'} completed ${node.scopePath ?? compactText(node.goal, 60)} via ${node.route.provider}/${node.route.model}`,
+          ...(nodePaths ? { paths: nodePaths } : {}),
+          nodeId: node.id,
           sourceRefs: [node.id, input.taskId],
           confidence: node.verification?.passed ? 'verified' : 'confirmed',
           ...common(teamKey, node.role ?? 'worker'),
@@ -622,6 +778,8 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
           kind: 'contract',
           key: 'contract:check:' + shortHash(`${node.scopePath ?? teamKey ?? ''}:${checkLabel}`),
           text: `Deliverable contract for ${node.teamKey ?? node.scopePath ?? compactText(node.goal, 60)}: ${checkLabel}`,
+          ...(nodePaths ? { paths: nodePaths } : {}),
+          nodeId: node.id,
           sourceRefs: [node.id],
           confidence: 'verified',
           ...common(teamKey, node.role ?? 'worker'),
@@ -632,10 +790,13 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
         if (!producer || producer.status !== 'succeeded') continue
         const producerDeliverable = checkSummary(producer.check) ?? producer.result?.artifactRefs[0]
         if (!producerDeliverable) continue
+        const edgePaths = nodePaths ?? normalizedNodePaths(producer)
         structured.push({
           kind: 'contract',
           key: 'contract:edge:' + shortHash(`${producer.scopePath ?? producer.teamKey ?? producer.id}:${producerDeliverable}->${node.scopePath ?? node.teamKey ?? node.id}`),
           text: `Module dependency contract: ${producer.teamKey ?? producer.scopePath ?? 'upstream'} provides ${producerDeliverable} for ${node.teamKey ?? node.scopePath ?? compactText(node.goal, 60)}`,
+          ...(edgePaths ? { paths: edgePaths } : {}),
+          nodeId: node.id,
           sourceRefs: [producer.id, node.id],
           confidence: producer.verification?.passed ? 'verified' : 'confirmed',
           ...common(teamKey ?? producer.teamKey, node.role ?? 'worker'),
@@ -646,6 +807,8 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
           kind: 'assumption',
           key: 'assumption:' + shortHash(`${teamKey ?? node.role ?? 'worker'}:${node.scopePath ?? node.goal}`),
           text: `Unverified node deliverable for ${node.scopePath ?? compactText(node.goal, 70)} (no deterministic check configured)`,
+          ...(nodePaths ? { paths: nodePaths } : {}),
+          nodeId: node.id,
           sourceRefs: [node.id, input.taskId],
           confidence: 'unverified',
           ...common(teamKey, node.role ?? 'worker'),
@@ -664,7 +827,7 @@ export function distillTaskMemories(input: TaskMemoryInput): MemoryCandidate[] {
       paths: paths.slice(0, 24), sourceRefs: evidenceRefs, evidenceRefs, ...common(undefined, 'root') })
   }
   const failedTools = [...new Set(input.operations.filter(op => op.status === 'failed').map(op => op.tool))]
-  if (input.verification?.passed && (failedTools.length || (input.attemptCount ?? 1) > 1)) {
+  if (input.status === 'succeeded' && input.verification?.passed && (failedTools.length || (input.attemptCount ?? 1) > 1)) {
     structured.unshift({ kind: 'experience', key: 'repair:' + input.taskId, durable: true,
       text: failedTools.length ? 'Self-repair succeeded for verified task after resolving failed tool calls (' +
         failedTools.slice(0, 8).join(', ') + ')' : 'Task converged to verified completion after retry attempt ' + input.attemptCount,
@@ -691,6 +854,10 @@ export class LocalMemory {
       const dir = join(this.#memoriesDir, scopeKey)
       mkdirSync(dir, { recursive: true, mode: 0o700 })
       const durableAndExperience = records.filter(entry => entry.kind === 'experience' || entry.durable === true)
+      const decisionsAndContracts = records.filter(entry =>
+        (entry.kind === 'decision' || entry.kind === 'contract') && entry.durable !== true)
+      const failuresRisksAndAssumptions = records.filter(entry =>
+        (entry.kind === 'failure_pattern' || entry.kind === 'risk' || entry.kind === 'assumption') && entry.durable !== true)
       const regularFacts = records.filter(entry => entry.kind === 'fact' && entry.durable !== true)
       const fullLines = [
         '# Workspace Memory',
@@ -699,6 +866,12 @@ export class LocalMemory {
         '',
         '## Durable Experiences & Key Notes',
         ...(durableAndExperience.length ? durableAndExperience.map(formatMarkdownLine) : ['_(none)_']),
+        '',
+        '## Decisions & Contracts',
+        ...(decisionsAndContracts.length ? decisionsAndContracts.map(formatMarkdownLine) : ['_(none)_']),
+        '',
+        '## Failure Patterns, Risks & Assumptions',
+        ...(failuresRisksAndAssumptions.length ? failuresRisksAndAssumptions.map(formatMarkdownLine) : ['_(none)_']),
         '',
         '## Workspace Facts',
         ...(regularFacts.length ? regularFacts.map(formatMarkdownLine) : ['_(none)_']),
@@ -709,7 +882,7 @@ export class LocalMemory {
       const summaryBudget = 2048
       const summaryLines = ['# Memory Summary', '']
       let used = Buffer.byteLength(summaryLines.join('\n')) + 1
-      for (const entry of [...durableAndExperience, ...regularFacts]) {
+      for (const entry of [...durableAndExperience, ...decisionsAndContracts, ...failuresRisksAndAssumptions, ...regularFacts]) {
         const line = `- [${entry.kind}${entry.durable ? ',durable' : ''}] ${entry.title ? entry.title + ': ' : ''}${clipUtf8(entry.text, 220)}`
         const size = Buffer.byteLength(line) + 1
         if (used + size > summaryBudget) break
@@ -855,6 +1028,10 @@ export class LocalMemory {
     const entries = this.listScopes(scopes, filter)
     const prioritized = [
       ...entries.filter(entry => entry.kind === 'experience' || entry.durable === true),
+      ...entries.filter(entry =>
+        (entry.kind === 'decision' || entry.kind === 'contract' || entry.kind === 'failure_pattern') && entry.durable !== true),
+      ...entries.filter(entry =>
+        (entry.kind === 'risk' || entry.kind === 'assumption') && entry.durable !== true),
       ...entries.filter(entry => entry.kind === 'fact' && entry.durable !== true),
     ]
     const lines: string[] = []

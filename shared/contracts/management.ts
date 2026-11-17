@@ -23,10 +23,12 @@ export interface AgentPreferences {
   searchProvider: 'hacker_news' | 'brave' | 'disabled'
 }
 
+export type ManagedToolEffect = 'read' | 'write' | 'memory'
+
 export interface ManagedTool {
   name: string
   plugin: string
-  effect: 'read' | 'write'
+  effect: ManagedToolEffect
   approval: boolean
   enabled: boolean
   root: boolean
