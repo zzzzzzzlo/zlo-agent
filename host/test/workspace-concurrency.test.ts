@@ -92,8 +92,10 @@ test('multiple Read Workers run in parallel (including under a Team) while Write
       return 'Parallel Team readers and serial writers completed'
     }
     if (config.role === 'team') {
-      const r = await call('create_text_file', { path: 'src/team.txt', content: 'team ok' })
-      assert.equal(r.ok, true, r.error)
+      if (!prompt.includes('Child node completion events')) {
+        const r = await call('create_text_file', { path: 'src/team.txt', content: 'team ok' })
+        assert.equal(r.ok, true, r.error)
+      }
       return 'Team finished after parallel read children'
     }
     if (prompt.includes('Read file A') || prompt.includes('Read file B')) {
@@ -262,6 +264,8 @@ test('a timed-out Team cancels auto-scheduled children before settling and relea
     assert.deepEqual(execution.errors, [])
     assert.equal(task.status, 'failed')
     assert.equal(team.status, 'failed')
+    assert.equal(child.status, 'failed')
+    assert.ok(child.result?.remainingRisks.includes('parent_cancelled'))
     assert.ok(team.result?.remainingRisks.includes('worker_deadline'))
     assert.ok(childSettled && teamSettled && childSettled.seq < teamSettled.seq)
     assert.equal(task.nodes!.some(node => node.status === 'running'), false)

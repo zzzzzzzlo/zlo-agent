@@ -263,6 +263,7 @@ export interface Operation {
   worktreeId?: string
   filePostcondition?: FilePostcondition
   reconciliation?: OperationReconciliation
+  finishedSeq?: number
   status: 'started' | 'succeeded' | 'failed' | 'interrupted' | 'unknown_effect'
 }
 
@@ -349,7 +350,7 @@ function normalizeTask(task: TaskSnapshot): TaskSnapshot {
   }
 }
 function separateWorktrees(left?: string, right?: string): boolean {
-  return Boolean(left && right && left !== right)
+  return Boolean((left || right) && left !== right)
 }
 const nodeAccessRank: Record<WorkspaceAccess, number> = { read: 0, write: 1, trusted: 2 }
 const canWrite = (access?: WorkspaceAccess) => access === 'write' || access === 'trusted'
@@ -519,6 +520,8 @@ export interface StoredTaskNode extends WorkerNode {
   taskId: string
   ordinal: number
   isLegacyWorker?: boolean
+  startedSeq?: number
+  settledSeq?: number
 }
 
 interface TaskGraphIndex {
@@ -676,6 +679,8 @@ export class TaskEngine {
       taskId: _taskId,
       ordinal: _ordinal,
       isLegacyWorker: _isLegacy,
+      startedSeq: _startedSeq,
+      settledSeq: _settledSeq,
       suspendedForIds,
       priorFailures: _priorFailures,
       archivedAt,
@@ -1045,6 +1050,102 @@ export class TaskEngine {
       if (graph.nodesById.get(id)?.status === 'succeeded') count++
     }
     return count
+  }
+
+  #isGraphNodeBlocked(task: TaskSnapshot, graph: TaskGraphIndex, nodeId: string, visited = new Set<string>()): boolean {
+    if (visited.has(nodeId)) return false
+    visited.add(nodeId)
+    const node = graph.nodesById.get(nodeId)
+    if (!node || node.status !== 'ready') return false
+    if (this.#nodeRunCapacity(graph) <= 0 || graph.unknownWriteOps.size > 0) return true
+    if (node.parentNodeId !== task.rootNodeId) {
+      const parent = graph.nodesById.get(node.parentNodeId)
+      if (!parent || parent.status === 'failed' || parent.status === 'succeeded') return true
+      if (parent.status === 'ready' && this.#isGraphNodeBlocked(task, graph, parent.id, visited)) return true
+    }
+    for (const depId of node.dependencies) {
+      const dep = graph.nodesById.get(depId)
+      if (!dep || dep.status === 'failed') return true
+      if (dep.status === 'ready' && this.#isGraphNodeBlocked(task, graph, depId, visited)) return true
+    }
+    return false
+  }
+
+  isNodeBlocked(taskId: string, nodeId: string): boolean {
+    const task = this.getMeta(taskId)
+    const graph = this.#graph(taskId, task)
+    return this.#isGraphNodeBlocked(task, graph, nodeId)
+  }
+
+  blockedNodeIds(taskId: string, nodeIds?: readonly string[]): Set<string> {
+    const task = this.getMeta(taskId)
+    const graph = this.#graph(taskId, task)
+    const blocked = new Set<string>()
+    const candidates = nodeIds ?? graph.readyIds
+    for (const id of candidates) {
+      if (this.#isGraphNodeBlocked(task, graph, id)) blocked.add(id)
+    }
+    return blocked
+  }
+
+  hasNodeWriteOperations(taskId: string, nodeId: string): boolean {
+    this.#getRawMeta(taskId)
+    return this.#db.operationsForNode<Pick<Operation, 'effect'>>(taskId, nodeId).some(op => op.effect === 'write')
+  }
+
+  hasAttemptOperations(taskId: string, attemptId: string): boolean {
+    this.#getRawMeta(taskId)
+    return this.#db.operationsForAttempt<Pick<Operation, 'id'>>(taskId, attemptId).length > 0
+  }
+
+  hasUnrecoveredFailedChildren(taskId: string, nodeId: string, evidenceRefs?: ReadonlySet<string>): boolean {
+    const task = this.getMeta(taskId)
+    const graph = this.#graph(taskId, task)
+    const node = graph.nodesById.get(nodeId)
+    if (!node) return false
+    const childIds = graph.childrenByParent.get(nodeId)
+    if (!childIds?.size) return false
+    const children: StoredTaskNode[] = []
+    for (const childId of childIds) {
+      const child = graph.nodesById.get(childId)
+      if (child) children.push(child)
+    }
+    const failedChildren = children.filter(child => child.status === 'failed')
+    if (!failedChildren.length) return false
+    const succeededChildren = children.filter(child => child.status === 'succeeded')
+    const receipts = node.attemptId ? this.#db.operationsForAttempt<Operation>(taskId, node.attemptId) : []
+    return !failedChildren.every(failedChild => {
+      const fSeq = failedChild.settledSeq ?? 0
+      const needsWriteOrCheck = canWrite(failedChild.access) || Boolean(failedChild.check)
+      const parentRecovered = receipts.some(op =>
+        op.status === 'succeeded' &&
+        (!evidenceRefs || evidenceRefs.has(op.id)) &&
+        (op.finishedSeq ?? 0) > fSeq &&
+        (!needsWriteOrCheck || op.effect === 'write' || op.tool === 'run_project_command'))
+      if (parentRecovered) return true
+      return succeededChildren.some(sibling =>
+        (sibling.startedSeq ?? 0) > fSeq &&
+        (!needsWriteOrCheck || canWrite(sibling.access) || Boolean(sibling.check)))
+    })
+  }
+
+  nodesForInspection(taskId: string, nodeIds?: readonly string[], limit = 64): WorkerNode[] {
+    const task = this.getMeta(taskId)
+    const graph = this.#graph(taskId, task)
+    if (nodeIds?.length) {
+      const result: WorkerNode[] = []
+      for (const id of nodeIds) {
+        const stored = graph.nodesById.get(id)
+        if (stored) result.push(this.#toWorkerNode(stored))
+      }
+      return result
+    }
+    const items: WorkerNode[] = []
+    for (const id of graph.unarchivedIds) {
+      const stored = graph.nodesById.get(id)
+      if (stored) items.push(this.#toWorkerNode(stored))
+    }
+    return items.length > limit ? items.slice(-limit) : items
   }
 
   needsArchive(taskId: string): boolean {
@@ -1475,6 +1576,8 @@ export class TaskEngine {
       delete nextBase.result
       delete nextBase.verification
       delete nextBase.digest
+      delete nextBase.startedSeq
+      delete nextBase.settledSeq
       assertReplanAcyclic(task.rootNodeId, graph.nodesById, nextBase)
       this.#putNode(graph, nextBase)
       const version = task.planVersion + 1
@@ -1640,7 +1743,8 @@ export class TaskEngine {
         schemaVersion: 1, id, taskId, taskRunId: task.taskRunId, nodeId,
         startedAt: new Date().toISOString(), status: 'running',
       }
-      const running: StoredTaskNode = { ...node, attemptId: id, status: 'running' }
+      const startedSeq = this.#db.eventCursor(taskId) + 1
+      const running: StoredTaskNode = { ...node, attemptId: id, status: 'running', startedSeq }
       if (options.suspendParent) {
         const parent = active.find(other => other.id === node.parentNodeId)
         if (parent) {
@@ -1732,10 +1836,12 @@ export class TaskEngine {
           })
         }
         if (child.status === 'failed' && teamNode.status === 'succeeded') {
+          const verifiedResolution = Boolean(teamNode.check && confirmedCheck(teamNode.verification))
+          const summaryText = clipText(teamNode.result?.summary ?? 'Addressed by parent team', 130)
           resolvedFailures.push({
             nodeId: child.id,
             failure: clipText(child.result?.summary ?? 'Worker failed within team scope', 160),
-            resolution: clipText(teamNode.result?.summary ?? 'Resolved by parent team', 160),
+            resolution: verifiedResolution ? `Verified: ${summaryText}` : `Team recovery (unverified): ${summaryText}`,
           })
         }
       }
@@ -1811,7 +1917,23 @@ export class TaskEngine {
         const childrenSettled = children.every(child => child.status === 'succeeded' || failedOrBlocked.has(child.id))
         const hasReceipt = receipts.some(({ id, status }) => status === 'succeeded' && result.evidenceRefs.includes(id))
         const succeededChildren = children.filter(({ status }) => status === 'succeeded')
-        const hasHandoff = node.check ? confirmedCheck(verification) : hasReceipt || succeededChildren.length > 0
+        const failedChildren = children.filter(({ status }) => status === 'failed')
+        const failuresRecovered = failedChildren.every(failedChild => {
+          const fSeq = failedChild.settledSeq ?? 0
+          const needsWriteOrCheck = canWrite(failedChild.access) || Boolean(failedChild.check)
+          const parentRecovered = receipts.some(op =>
+            op.status === 'succeeded' &&
+            result.evidenceRefs.includes(op.id) &&
+            (op.finishedSeq ?? 0) > fSeq &&
+            (!needsWriteOrCheck || op.effect === 'write' || op.tool === 'run_project_command'))
+          if (parentRecovered) return true
+          return succeededChildren.some(sibling =>
+            (sibling.startedSeq ?? 0) > fSeq &&
+            (!needsWriteOrCheck || canWrite(sibling.access) || Boolean(sibling.check)))
+        })
+        const hasHandoff = node.check
+          ? confirmedCheck(verification)
+          : failuresRecovered && (hasReceipt || succeededChildren.length > 0)
         const completed = finished && childrenSettled && hasHandoff && Boolean(result.summary.trim())
         const verified = completed && Boolean(node.check)
         verification = {
@@ -1839,11 +1961,13 @@ export class TaskEngine {
         idx === arr.length - 1 && accepted?.resultStatus === 'succeeded'
           ? { ...item, resolvedByAttemptId: node.attemptId, resolution: clipText(accepted.summary, 200) }
           : item)
+      const settledSeq = this.#db.eventCursor(taskId) + 1
       const settled: StoredTaskNode = {
         ...node,
         status: accepted?.resultStatus ?? 'ready',
         result: accepted,
         verification,
+        ...(accepted ? { settledSeq } : {}),
         ...(nextPriorFailures?.length ? { priorFailures: nextPriorFailures } : {}),
       }
       const parent = graph.nodesById.get(node.parentNodeId)
@@ -2009,6 +2133,8 @@ export class TaskEngine {
             ...(current.scopePath ? { scopePath: current.scopePath } : {}),
             ...(current.worktreeId ? { worktreeId: current.worktreeId } : {}),
             ...(current.replans !== undefined ? { replans: current.replans } : {}),
+            ...(current.startedSeq !== undefined ? { startedSeq: current.startedSeq } : {}),
+            ...(current.settledSeq !== undefined ? { settledSeq: current.settledSeq } : {}),
             ...(current.result ? {
               result: {
                 resultStatus: current.result.resultStatus,
@@ -2191,8 +2317,10 @@ export class TaskEngine {
       }
       if (active.some(other => {
         const suspendedIds = other.suspendedForIds ?? (other.suspendedFor ? [other.suspendedFor] : [])
-        return other.id !== nodeId && !suspendedIds.includes(nodeId) &&
-          !separateWorktrees(node?.worktreeId, other.worktreeId) && (effect === 'write' || canWrite(other.access))
+        if (other.id === nodeId || suspendedIds.includes(nodeId)) return false
+        // A parent Team currently suspended for active children has yielded its own workspace grant to those children.
+        if (suspendedIds.length > 0) return false
+        return !separateWorktrees(node?.worktreeId, other.worktreeId) && (effect === 'write' || canWrite(other.access))
       })) {
         throw new Error('Concurrent workspace access conflicts with a write')
       }
@@ -2239,7 +2367,8 @@ export class TaskEngine {
           return 'sha256:' + createHmac('sha256', key).update(scope).digest('hex')
         }))]
       }
-      const nextOp: Operation = { ...operation, status, ...(paths?.length ? { changedPaths: paths } : {}) }
+      const finishedSeq = this.#db.eventCursor(event.taskId) + 1
+      const nextOp: Operation = { ...operation, status, finishedSeq, ...(paths?.length ? { changedPaths: paths } : {}) }
       const graph = this.#graphs.get(event.taskId)
       if (graph) {
         this.#invalidateOnRollback(event.taskId)

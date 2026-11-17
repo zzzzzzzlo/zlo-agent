@@ -18,6 +18,14 @@ export interface AllocateOptions {
   excludeRoutes?: readonly ModelRoute[]
 }
 export interface ModelLimits { requests: number; activeAgents: number }
+export interface ModelReservation {
+  request(request: ModelRequest): number
+  usage(usage: Usage): string | undefined
+  unknown(): string | undefined
+  suspend(): boolean
+  resume(signal?: AbortSignal): Promise<void>
+  release(): void
+}
 interface BudgetScope { nodeId: string; requests: number }
 interface Budget { requests: number; confirmed: number; reserved: number; uncertain: number }
 interface Reservation {
@@ -29,10 +37,18 @@ interface Reservation {
   scopeKeys?: string[]
   status: 'pending' | 'settled' | 'uncertain'
 }
+interface SlotWaiter {
+  resolve: () => void
+  reject: (error: unknown) => void
+  cleanup?: () => void
+}
 const budgets = 'model-budgets'
 const scopedBudgets = 'model-node-budgets'
+const taskScales = 'model-task-scales'
 const reservations = 'model-reservations'
 const defaults: ModelLimits = { requests: 96, activeAgents: 5 }
+const perNodeRequestAllowance = 8
+const maxAutoTaskRequests = 40_000
 const emptyBudget: Budget = { requests: 0, confirmed: 0, reserved: 0, uncertain: 0 }
 const routeCooldownMs = 60_000
 
@@ -77,7 +93,10 @@ export class LocalModelScheduler {
   readonly #active = new Set<string>()
   readonly #pending = new Map<string, Reservation>()
   readonly #failedRoutes = new Map<string, number>()
+  readonly #plannedNodes = new Map<string, number>()
+  readonly #slotWaiters: SlotWaiter[] = []
   readonly #limits: ModelLimits
+  readonly #explicitRequestLimit: boolean
   readonly #execution: AgentExecution
   readonly #store: LocalStore
   readonly #judgment: LocalJudgment
@@ -89,6 +108,7 @@ export class LocalModelScheduler {
     this.#store = store
     this.#judgment = judgment
     this.#automatic = automatic
+    this.#explicitRequestLimit = limits.requests !== undefined
     this.#limits = { requests: limits.requests ?? defaults.requests, activeAgents: limits.activeAgents ?? defaults.activeAgents }
     if (Object.values(this.#limits).some(value => !Number.isSafeInteger(value) || value < 1)) {
       throw new Error('Invalid model budget limits')
@@ -137,9 +157,34 @@ export class LocalModelScheduler {
     return this.#execution.discoverModels?.(provider) ?? []
   }
 
+  registerPlannedNodes(taskId: string, totalNodeCount: number): void {
+    if (!Number.isSafeInteger(totalNodeCount) || totalNodeCount <= 0) return
+    const prev = Math.max(this.#plannedNodes.get(taskId) ?? 0, this.#store.get<number>(taskScales, taskId) ?? 0)
+    if (totalNodeCount <= prev) {
+      this.#plannedNodes.set(taskId, prev)
+      return
+    }
+    this.#plannedNodes.set(taskId, totalNodeCount)
+    try {
+      this.#store.transaction(() => {
+        const stored = this.#store.get<number>(taskScales, taskId) ?? 0
+        if (totalNodeCount > stored) this.#store.put(taskScales, taskId, totalNodeCount)
+      })
+    } catch {
+      // In-memory scale remains authoritative if called inside an outer transaction or read-only context.
+    }
+  }
+
+  taskRequestLimit(taskId: string): number {
+    if (this.#explicitRequestLimit) return this.#limits.requests
+    const nodeCount = Math.max(this.#plannedNodes.get(taskId) ?? 0, this.#store.get<number>(taskScales, taskId) ?? 0)
+    if (nodeCount <= 0) return this.#limits.requests
+    return Math.min(maxAutoTaskRequests, this.#limits.requests + nodeCount * perNodeRequestAllowance)
+  }
+
   hasBudget(taskId: string, scopes: readonly BudgetScope[] = []): boolean {
     const taskBudget = this.budget(taskId)
-    if (taskBudget.requests >= this.#limits.requests) return false
+    if (taskBudget.requests >= this.taskRequestLimit(taskId)) return false
     return scopes.every(scope => {
       const key = JSON.stringify([taskId, scope.nodeId])
       const ledger = this.#store.get<Budget>(scopedBudgets, key) ?? emptyBudget
@@ -162,7 +207,8 @@ export class LocalModelScheduler {
     }
 
     const budget = this.budget(event.taskId)
-    const taskRemaining = Math.max(0, this.#limits.requests - budget.requests)
+    const taskLimit = this.taskRequestLimit(event.taskId)
+    const taskRemaining = Math.max(0, taskLimit - budget.requests)
     const remainingRequests = options.remainingRequests !== undefined
       ? Math.min(taskRemaining, options.remainingRequests) : taskRemaining
     if (remainingRequests <= 0) throw new ModelBudgetError('Model request budget exhausted')
@@ -232,8 +278,8 @@ export class LocalModelScheduler {
 
     const primaryEntry = candidates[0]!
     const bestAlternative = validatedAlternatives[0]
-    const shouldSwitchBaseline = independent && !requested && (
-      !primaryValid ||
+    // When primaryValid is false, candidates[0] is already validatedAlternatives[0], so index 0 is the top fallback.
+    const shouldSwitchBaseline = primaryValid && independent && !requested && (
       !this.#isRouteHealthy(primaryEntry.route) ||
       (bestAlternative !== undefined && (
         (bestAlternative.estimatedCost !== undefined &&
@@ -278,24 +324,57 @@ export class LocalModelScheduler {
     }
   }
 
-  reserve(currentEvent: () => EventDraft, _role: Role, scopes: readonly BudgetScope[] = []) {
-    const runId = currentEvent().agentRunId!
-    if (this.#active.size >= this.#limits.activeAgents || this.#active.has(runId)) {
-      throw new ModelBudgetError('Agent capacity exhausted')
+  #wakeSlotWaiters(): void {
+    while (this.#active.size < this.#limits.activeAgents && this.#slotWaiters.length > 0) {
+      const waiter = this.#slotWaiters.shift()!
+      waiter.cleanup?.()
+      waiter.resolve()
     }
+  }
+
+  async #acquireSlot(runId: string, signal?: AbortSignal): Promise<void> {
+    if (this.#active.has(runId)) throw new ModelBudgetError('Agent capacity exhausted')
+    while (this.#active.size >= this.#limits.activeAgents) {
+      signal?.throwIfAborted()
+      await new Promise<void>((resolve, reject) => {
+        const waiter: SlotWaiter = { resolve, reject }
+        if (signal) {
+          const onAbort = () => {
+            const idx = this.#slotWaiters.indexOf(waiter)
+            if (idx >= 0) this.#slotWaiters.splice(idx, 1)
+            this.#wakeSlotWaiters()
+            reject(new DOMException('Model slot acquisition aborted', 'AbortError'))
+          }
+          signal.addEventListener('abort', onAbort, { once: true })
+          waiter.cleanup = () => signal.removeEventListener('abort', onAbort)
+        }
+        this.#slotWaiters.push(waiter)
+      })
+      if (signal?.aborted) {
+        this.#wakeSlotWaiters()
+        signal.throwIfAborted()
+      }
+    }
+    if (this.#active.has(runId)) throw new ModelBudgetError('Agent capacity exhausted')
     this.#active.add(runId)
+  }
+
+  #makeReservation(runId: string, currentEvent: () => EventDraft, scopes: readonly BudgetScope[]): ModelReservation {
+    let released = false
+    let suspended = false
     return {
       request: (request: ModelRequest) => {
         const event = currentEvent()
         const tokens = request.estimatedInputTokens + request.maxOutputTokens
-        if (!this.#active.has(runId) || this.#pending.has(runId) ||
+        if (released || suspended || !this.#active.has(runId) || this.#pending.has(runId) ||
           !Number.isSafeInteger(request.estimatedInputTokens) || request.estimatedInputTokens < 0 ||
           !Number.isSafeInteger(request.maxOutputTokens) || request.maxOutputTokens < 1 || !Number.isSafeInteger(tokens)) {
           throw new ModelBudgetError('Model request budget exhausted')
         }
+        const taskRequestLimit = this.taskRequestLimit(event.taskId)
         const entry = this.#store.transaction(() => {
           const budget = this.budget(event.taskId)
-          if (budget.requests >= this.#limits.requests) {
+          if (budget.requests >= taskRequestLimit) {
             throw new ModelBudgetError('Task model budget exhausted')
           }
           const ledgers = scopes.map(scope => {
@@ -315,7 +394,7 @@ export class LocalModelScheduler {
           this.#store.put(reservations, entry.id, entry)
           this.#store.append({ ...event, correlationId: entry.id, type: 'model.reserved', payload: { route: request.route, kind: request.kind,
             estimatedTokens: tokens, estimatedInputTokens: request.estimatedInputTokens, maxOutputTokens: request.maxOutputTokens,
-            taskRequestLimit: this.#limits.requests } })
+            taskRequestLimit } })
           return entry
         })
         this.#pending.set(runId, entry)
@@ -331,12 +410,47 @@ export class LocalModelScheduler {
         if (entry) this.#settle(entry)
         return entry?.id
       },
+      suspend: () => {
+        if (released || suspended) return false
+        suspended = true
+        if (this.#active.delete(runId)) this.#wakeSlotWaiters()
+        return true
+      },
+      resume: async (signal?: AbortSignal) => {
+        if (released || !suspended) return
+        await this.#acquireSlot(runId, signal)
+        if (released) {
+          if (this.#active.delete(runId)) this.#wakeSlotWaiters()
+          return
+        }
+        suspended = false
+      },
       release: () => {
-        this.#active.delete(runId)
+        if (released) return
+        released = true
+        suspended = false
+        const hadSlot = this.#active.delete(runId)
         const entry = this.#pending.get(runId)
         if (entry) this.#settle(entry)
+        if (hadSlot) this.#wakeSlotWaiters()
       },
     }
+  }
+
+  reserve(currentEvent: () => EventDraft, _role: Role, scopes: readonly BudgetScope[] = []): ModelReservation {
+    const runId = currentEvent().agentRunId!
+    if (this.#active.size >= this.#limits.activeAgents || this.#active.has(runId)) {
+      throw new ModelBudgetError('Agent capacity exhausted')
+    }
+    this.#active.add(runId)
+    return this.#makeReservation(runId, currentEvent, scopes)
+  }
+
+  async reserveAsync(currentEvent: () => EventDraft, _role: Role, scopes: readonly BudgetScope[] = [],
+    signal?: AbortSignal): Promise<ModelReservation> {
+    const runId = currentEvent().agentRunId!
+    await this.#acquireSlot(runId, signal)
+    return this.#makeReservation(runId, currentEvent, scopes)
   }
 
   #settle(entry: Reservation, usage?: Usage) {
