@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto'
 import { jevModel, jevReasons } from '../../shared/contracts/jev.ts'
 import type { DecisionPoint, JevDecisionStatus, JevReason, JudgmentMode } from '../../shared/contracts/jev.ts'
+import { memoryKinds } from './contracts/domain.ts'
 import type { EventDraft } from './contracts/domain.ts'
 import type { LocalStore } from './store.ts'
 
@@ -131,6 +132,8 @@ function publicFeatures(point: DecisionPoint, input: Record<string, unknown>): R
     }
     case 'model.task_fit': return {
       independent: flag(input.independent), requested: flag(input.requested),
+      taskRole: category(input.taskRole, ['planning', 'research', 'coding', 'review', 'general']),
+      budgetRemaining: count(input.budgetRemaining),
       candidates: candidates(input).map((candidate, index) => ({
         index, providerKey: routeKey(candidate.provider), modelKey: routeKey(candidate.model),
         contextWindow: count(candidate.contextWindow), supportsText: flag(candidate.supportsText),
@@ -139,7 +142,7 @@ function publicFeatures(point: DecisionPoint, input: Record<string, unknown>): R
     }
     case 'context.relevance': return {
       candidates: candidates(input).map((candidate, index) => ({
-        index, kind: category(candidate.kind, ['fact', 'experience']), rank: count(candidate.rank),
+        index, kind: category(candidate.kind, memoryKinds), rank: count(candidate.rank),
         evidenceCount: count(candidate.evidenceCount), estimatedBytes: count(candidate.estimatedBytes),
       })),
     }

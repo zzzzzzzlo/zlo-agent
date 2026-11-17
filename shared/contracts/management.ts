@@ -1,4 +1,4 @@
-import type { EndReason, ModelCatalogEntry, ModelRoute, TaskStatus, VerificationResult, VerificationVerdict, WorkspaceAccess } from './domain.ts'
+import type { EndReason, MemoryKind, ModelCatalogEntry, ModelRoute, TaskStatus, VerificationResult, VerificationVerdict, WorkspaceAccess } from './domain.ts'
 import type { ConversationSummary, UsageTotals } from './desktop.ts'
 import type { ChatGptSession } from './chatgpt.ts'
 import type { JevSettings, JevStatus, JudgeCredentials } from './jev.ts'
@@ -88,7 +88,16 @@ export interface ManagedTask {
 }
 
 export interface ManagedMemory {
-  entries: { id: string; kind: 'fact' | 'experience'; text: string; version: number; updatedAt: string }[]
+  entries: {
+    id: string
+    kind: MemoryKind
+    text: string
+    version: number
+    updatedAt: string
+    teamKey?: string
+    confidence?: 'verified' | 'confirmed' | 'unverified'
+    sourceRefs?: readonly string[]
+  }[]
   recalls: { taskId: string; timestamp: number; count: number }[]
 }
 

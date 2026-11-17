@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { cnyRateNote, DEFAULT_USD_TO_CNY_RATE, formatCny, usdToCny } from '../../../../shared/contracts/currency.ts'
+import type { MemoryKind } from '../../../../shared/contracts/domain.ts'
 import type { AgentPreferences, DesktopManagementApi, ManagedDiagnostic, ManagementSnapshot } from '../../../../shared/contracts/management.ts'
 import { workspaceAccessLabels } from '../../features/sessions/model'
 import { activeSession, useWorkspace } from '../../stores/workspace'
@@ -216,6 +217,16 @@ function Tools({ snapshot, busy, save }: PreferencesProps) {
   )
 }
 
+const memoryKindLabels: Record<MemoryKind, string> = {
+  fact: '事实',
+  experience: '经验',
+  decision: '决策',
+  contract: '契约',
+  failure_pattern: '失败模式',
+  risk: '风险',
+  assumption: '假设',
+}
+
 function Memory({ snapshot, api, busy, perform }: ActionProps) {
   const id = snapshot.conversation?.id
   if (!id) return <p className="management-note">请选择一个会话。</p>
@@ -240,7 +251,9 @@ function Memory({ snapshot, api, busy, perform }: ActionProps) {
         {entries.map((entry) => (
           <div className="management-row" key={entry.id}>
             <div>
-              <strong>{entry.kind === 'fact' ? '事实' : '经验'}</strong>
+              <strong>{memoryKindLabels[entry.kind] ?? entry.kind}</strong>
+              {entry.teamKey && <small> · Team {entry.teamKey}</small>}
+              {entry.confidence === 'unverified' && <small> · 待验证</small>}
               <p>{entry.text}</p>
               <small>版本 {entry.version} · {dateLabel(entry.updatedAt)}</small>
             </div>
