@@ -162,31 +162,51 @@ export class AgentMailbox {
     })
   }
 
+  isConsumed(ownerNodeId: string, eventKey: string): boolean {
+    return Boolean(this.#buckets.get(ownerNodeId)?.consumed.has(eventKey))
+  }
+
   async waitForNodes(
     ownerNodeId: string,
     targetIds: readonly string[] | undefined,
     mode: 'any' | 'all',
-    state: () => { nodes: readonly WorkerNode[]; activeIds: ReadonlySet<string>; runnableIds?: ReadonlySet<string> },
+    state: () => {
+      nodes: readonly WorkerNode[]
+      activeIds: ReadonlySet<string>
+      runnableIds?: ReadonlySet<string>
+      blockedIds?: ReadonlySet<string>
+      hasGlobalProgress?: boolean
+    },
     signal?: AbortSignal,
     timeoutMs?: number,
   ): Promise<{ timedOut: boolean; matched: NodeCompletionNotification[] }> {
     const bucket = this.#bucket(ownerNodeId)
+    const isTerminal = (node: WorkerNode) => node.status === 'succeeded' || node.status === 'failed'
     const isFinished = () => {
       if (signal?.aborted) return true
-      const { nodes, activeIds, runnableIds } = state()
+      const { nodes, activeIds, runnableIds, blockedIds, hasGlobalProgress } = state()
       const scoped = targetIds?.length ? nodes.filter(node => targetIds.includes(node.id)) : nodes
       if (!scoped.length) return true
+      const progressPossible = hasGlobalProgress ??
+        (activeIds.size > 0 || nodes.some(n => n.status === 'running') || Boolean(runnableIds?.size))
+      const isPending = (node: WorkerNode) => {
+        if (isTerminal(node)) return false
+        if (node.status === 'running' || activeIds.has(node.id) || runnableIds?.has(node.id)) return true
+        if (node.status === 'ready') {
+          if (blockedIds?.has(node.id)) return false
+          return progressPossible
+        }
+        return false
+      }
       if (mode === 'any') {
         const unreadMatches = this.peekUnread(ownerNodeId).some(item =>
           !targetIds?.length || targetIds.includes(item.nodeId))
         if (unreadMatches) return true
-        return scoped.some(node => node.status === 'succeeded' || node.status === 'failed') ||
-          scoped.every(node => node.status !== 'running' && !activeIds.has(node.id) && !(runnableIds?.has(node.id)))
+        const unconsumedSettled = scoped.some(node => isTerminal(node) && !bucket.consumed.has(nodeEventKey(node)))
+        if (unconsumedSettled) return true
+        return scoped.every(node => !isPending(node))
       }
-      return scoped.every(node =>
-        (node.status === 'succeeded' || node.status === 'failed' || (node.status === 'ready' && !(runnableIds?.has(node.id)))) &&
-        !activeIds.has(node.id)) &&
-        !scoped.some(node => activeIds.has(node.id) || node.status === 'running' || Boolean(runnableIds?.has(node.id)))
+      return scoped.every(node => !isPending(node))
     }
 
     let timedOut = false
@@ -215,7 +235,15 @@ export class AgentMailbox {
     }
 
     const unread = this.peekUnread(ownerNodeId)
-    const matched = targetIds?.length ? unread.filter(item => targetIds.includes(item.nodeId)) : unread
+    let matched = targetIds?.length ? unread.filter(item => targetIds.includes(item.nodeId)) : unread
+    if (!matched.length && !timedOut && !signal?.aborted) {
+      const { nodes } = state()
+      const scoped = targetIds?.length ? nodes.filter(node => targetIds.includes(node.id)) : nodes
+      const unconsumed = scoped.filter(node => isTerminal(node) && !bucket.consumed.has(nodeEventKey(node)))
+      if (unconsumed.length) {
+        matched = (mode === 'any' ? unconsumed.slice(0, 1) : unconsumed).map(notificationFromNode)
+      }
+    }
     if (matched.length) this.acknowledge(ownerNodeId, matched.map(item => item.eventKey))
     return { timedOut, matched }
   }
