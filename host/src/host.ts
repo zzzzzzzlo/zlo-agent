@@ -723,14 +723,43 @@ export class LocalAgentHost {
     return this.#conversations.get(conversation.id)
   }
 
+  #recordKnownTeams(task: Pick<TaskSnapshot, 'conversationId' | 'cwd'>, teams: readonly string[]): void {
+    if (!teams.length) return
+    const workspaceScope = workspaceMemoryScope(task.cwd)
+    const knownWorkspaceTeams = new Set(this.#store.get<string[]>('workspace-memory-teams', workspaceScope) ?? [])
+    const wsBefore = knownWorkspaceTeams.size
+    for (const teamKey of teams) knownWorkspaceTeams.add(teamKey)
+    const knownConvTeams = task.conversationId
+      ? new Set(this.#store.get<string[]>('conversation-memory-teams', task.conversationId) ?? [])
+      : undefined
+    const convBefore = knownConvTeams?.size ?? 0
+    if (knownConvTeams) {
+      for (const teamKey of teams) knownConvTeams.add(teamKey)
+    }
+    if (knownWorkspaceTeams.size > wsBefore || (knownConvTeams && knownConvTeams.size > convBefore)) {
+      this.#store.transaction(() => {
+        if (knownWorkspaceTeams.size > wsBefore) {
+          this.#store.put('workspace-memory-teams', workspaceScope, [...knownWorkspaceTeams])
+        }
+        if (task.conversationId && knownConvTeams && knownConvTeams.size > convBefore) {
+          this.#store.put('conversation-memory-teams', task.conversationId, [...knownConvTeams])
+        }
+      })
+    }
+  }
+
   #conversationMemoryScopes(conversation: ConversationSummary): string[] {
+    const workspaceScope = workspaceMemoryScope(conversation.workspace)
     const providers = new Set<string>([
       ...management.providers,
       'chatgpt',
       'xai',
       ...(this.#store.get<string[]>('conversation-memory-providers', conversation.id) ?? []),
     ])
-    const teams = new Set<string>(this.#store.get<string[]>('conversation-memory-teams', conversation.id) ?? [])
+    const teams = new Set<string>([
+      ...(this.#store.get<string[]>('conversation-memory-teams', conversation.id) ?? []),
+      ...(this.#store.get<string[]>('workspace-memory-teams', workspaceScope) ?? []),
+    ])
     if (conversation.route) providers.add(conversation.route.provider)
     const activeRoute = this.#orchestrator.conversationRoute(conversation.id)
     if (activeRoute) providers.add(activeRoute.provider)
@@ -738,7 +767,7 @@ export class LocalAgentHost {
       try {
         const task = this.#engine.getMeta(taskId)
         if (task.route) providers.add(task.route.provider)
-        for (const node of task.nodes ?? []) {
+        for (const node of this.#engine.nodesByParent(taskId, task.rootNodeId)) {
           if (node.teamKey) teams.add(node.teamKey)
         }
         for (const item of this.#store.eventsOfTypes(taskId, ['agent.started', 'model.route_changed'])) {
@@ -747,10 +776,14 @@ export class LocalAgentHost {
         }
       } catch { /* Historical task lookup is best-effort. */ }
     }
-    const scopes = new Set<string>([workspaceMemoryScope(conversation.workspace), management.conversationScope(conversation)])
+    const scopes = new Set<string>([workspaceScope, management.conversationScope(conversation)])
     for (const provider of providers) scopes.add(management.conversationScope(conversation, provider))
-    const teamTask = { conversationId: conversation.id, cwd: conversation.workspace } as TaskSnapshot
-    for (const teamKey of teams) scopes.add(teamMemoryScope(teamTask, teamKey))
+    const conversationTeamTask = { conversationId: conversation.id, cwd: conversation.workspace } as TaskSnapshot
+    const workspaceTeamTask = { cwd: conversation.workspace } as TaskSnapshot
+    for (const teamKey of teams) {
+      scopes.add(teamMemoryScope(conversationTeamTask, teamKey))
+      scopes.add(teamMemoryScope(workspaceTeamTask, teamKey))
+    }
     return [...scopes]
   }
 
@@ -763,27 +796,80 @@ export class LocalAgentHost {
         if (taskId) {
           try { task = this.#engine.getMeta(taskId) } catch { /* Missing task falls back to workspace root. */ }
         }
-        const primary = workspaceMemoryScope(task?.cwd ?? workspaceRoot)
-        const all = [primary]
-        if (task && task.route) all.push(legacyMemoryScope(task, task.route))
-        if (task?.conversationId) {
-          try { all.push(...this.#conversationMemoryScopes(this.#conversations.get(task.conversationId))) }
-          catch { /* Conversation lookup is best-effort. */ }
-        }
-        const activeRun = agentRunId ? this.#store.get<{ event: EventDraft }>('agent-runs', agentRunId) : undefined
+        const workspaceScope = workspaceMemoryScope(task?.cwd ?? workspaceRoot)
+        const activeRun = agentRunId
+          ? this.#store.get<{ event: EventDraft; role?: 'root' | 'team' | 'worker' }>('agent-runs', agentRunId)
+          : undefined
         const runEvent = activeRun?.event.taskId === task?.id ? activeRun?.event : undefined
+        const nodeId = task && runEvent?.taskNodeId && runEvent.taskNodeId !== task.rootNodeId
+          ? runEvent.taskNodeId : undefined
+        const activeNode = task && nodeId ? this.#engine.getNode(task.id, nodeId) : undefined
+        const parentNode = task && activeNode && activeNode.parentNodeId !== task.rootNodeId
+          ? this.#engine.getNode(task.id, activeNode.parentNodeId) : undefined
+        const teamKey = activeNode?.teamKey ?? parentNode?.teamKey
+        const sourceRole: 'root' | 'team' | 'worker' | undefined = task
+          ? (activeNode ? (activeNode.role ?? activeRun?.role ?? 'worker') : 'root')
+          : undefined
+        const primary = task && teamKey ? teamMemoryScope(task, teamKey) : workspaceScope
+        const all = [primary, workspaceScope]
+        if (task && task.route) all.push(legacyMemoryScope(task, task.route))
+        if (task && teamKey) {
+          if (task.conversationId) {
+            all.push(teamMemoryScope({ ...task, conversationId: undefined }, teamKey))
+          }
+        } else if (task) {
+          for (const node of this.#engine.nodesByParent(task.id, task.rootNodeId)) {
+            if (node.teamKey) all.push(teamMemoryScope(task, node.teamKey))
+          }
+          for (const knownTeam of this.#store.get<string[]>('workspace-memory-teams', workspaceScope) ?? []) {
+            all.push(teamMemoryScope({ cwd: task.cwd } as TaskSnapshot, knownTeam))
+            if (task.conversationId) all.push(teamMemoryScope(task, knownTeam))
+          }
+        }
+        if (task?.conversationId) {
+          try {
+            const conv = this.#conversations.get(task.conversationId)
+            if (teamKey) {
+              all.push(management.conversationScope(conv))
+              for (const provider of [
+                ...management.providers,
+                'chatgpt',
+                'xai',
+                ...(this.#store.get<string[]>('conversation-memory-providers', conv.id) ?? []),
+                ...(conv.route ? [conv.route.provider] : []),
+              ]) {
+                all.push(management.conversationScope(conv, provider))
+              }
+            } else {
+              all.push(...this.#conversationMemoryScopes(conv))
+            }
+          } catch { /* Conversation lookup is best-effort. */ }
+        }
         const event: EventDraft | undefined = task
           ? {
             taskId: task.id,
             taskRunId: task.taskRunId,
             taskNodeId: runEvent?.taskNodeId ?? task.rootNodeId,
             taskAttemptId: runEvent?.taskAttemptId ?? task.attemptId,
+            agentId: runEvent?.agentId,
             agentRunId,
+            sessionId: runEvent?.sessionId,
+            parentAgentRunId: runEvent?.parentAgentRunId,
             type: '',
             payload: {},
           }
           : undefined
-        return { primary, all: [...new Set(all)], goal: task?.goal, event }
+        return {
+          primary,
+          all: [...new Set(all)],
+          goal: activeNode?.goal ?? task?.goal,
+          event,
+          teamKey,
+          sourceRole,
+          onSaved: (entry: { teamKey?: string }) => {
+            if (task && entry.teamKey) this.#recordKnownTeams(task, [entry.teamKey])
+          },
+        }
       },
     }
   }
@@ -1192,10 +1278,13 @@ export class LocalAgentHost {
   async #captureMemory(task: TaskSnapshot, event: EventDraft, signal: AbortSignal): Promise<void> {
     if (task.status !== 'succeeded' && task.status !== 'failed') return
     const operations = this.#engine.operations(task.id)
-    const nodes = [
+    const rawNodes = [
       ...(task.nodes ?? []),
       ...(task.worker && task.worker.status === 'failed' ? [task.worker] : []),
     ]
+    const nodes = rawNodes.map(node => node.archivedAt
+      ? (this.#engine.getNodeDetail(task.id, node.id)?.node ?? node)
+      : node)
     const candidates = distillTaskMemories({
       taskId: task.id,
       rootNodeId: task.rootNodeId,
@@ -1220,23 +1309,26 @@ export class LocalAgentHost {
       })),
     })
     if (!candidates.length) return
-    const scope = memoryScope(task)
-    if (this.#judgment.mode('memory.capture', task.id) === 'off') {
-      this.#memory.capture(event, scope, candidates)
-    } else {
-      await this.#memory.captureReviewed(event, scope, candidates, task.goal, this.#judgment, signal)
+    const baseScope = memoryScope(task)
+    const byScope = new Map<string, typeof candidates>()
+    for (const candidate of candidates) {
+      const targetScope = candidate.teamKey && candidate.kind !== 'fact'
+        ? teamMemoryScope(task, candidate.teamKey)
+        : baseScope
+      const group = byScope.get(targetScope) ?? []
+      group.push(candidate)
+      byScope.set(targetScope, group)
     }
-    if (task.conversationId) {
-      const teams = [...new Set(candidates.map(entry => entry.teamKey).filter((key): key is string => Boolean(key)))]
-      if (teams.length) {
-        const knownTeams = new Set(this.#store.get<string[]>('conversation-memory-teams', task.conversationId) ?? [])
-        const before = knownTeams.size
-        for (const teamKey of teams) knownTeams.add(teamKey)
-        if (knownTeams.size > before) {
-          this.#store.transaction(() => this.#store.put('conversation-memory-teams', task.conversationId!, [...knownTeams]))
-        }
+    const reviewOff = this.#judgment.mode('memory.capture', task.id) === 'off'
+    for (const [scope, group] of byScope) {
+      if (reviewOff) {
+        this.#memory.capture(event, scope, group)
+      } else {
+        await this.#memory.captureReviewed(event, scope, group, task.goal, this.#judgment, signal)
       }
     }
+    const teams = [...new Set(candidates.map(entry => entry.teamKey).filter((key): key is string => Boolean(key)))]
+    if (teams.length) this.#recordKnownTeams(task, teams)
   }
 
   async idle(): Promise<void> {

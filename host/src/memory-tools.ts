@@ -1,4 +1,5 @@
-import type { EventDraft } from './contracts/domain.ts'
+import { memoryKinds } from './contracts/domain.ts'
+import type { EventDraft, MemoryKind } from './contracts/domain.ts'
 import type { LocalJudgment } from './judgment.ts'
 import { memoryEntryInScope } from './memory.ts'
 import type { LocalMemory, MemoryCandidate, MemoryEntry } from './memory.ts'
@@ -13,11 +14,18 @@ export interface MemoryToolRuntime {
     all: string[]
     goal?: string
     event?: EventDraft
+    teamKey?: string
+    sourceRole?: 'root' | 'team' | 'worker'
+    onSaved?: (entry: MemoryEntry) => void
   }
 }
 
 function record(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : undefined
+}
+
+function isMemoryKind(value: unknown): value is MemoryKind {
+  return typeof value === 'string' && (memoryKinds as readonly string[]).includes(value)
 }
 
 function formatMemoryRow(entry: MemoryEntry) {
@@ -32,6 +40,9 @@ function formatMemoryRow(entry: MemoryEntry) {
     ...(entry.nodeId ? { nodeId: entry.nodeId } : {}),
     ...(entry.attemptId ? { attemptId: entry.attemptId } : {}),
     ...(entry.evidenceRefs?.length ? { evidenceRefs: entry.evidenceRefs } : {}),
+    ...(entry.confidence ? { confidence: entry.confidence } : {}),
+    ...(entry.teamKey ? { teamKey: entry.teamKey } : {}),
+    ...(entry.sourceRole ? { sourceRole: entry.sourceRole } : {}),
     version: entry.version,
     updatedAt: entry.updatedAt,
   }
@@ -43,7 +54,7 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
       name: 'memory_search',
       effect: 'read',
       policy: { targets: () => [] },
-      description: 'Search accumulated workspace long-term facts and durable experiences using BM25 + subtoken/CJK matching.',
+      description: 'Search accumulated workspace long-term memories (facts, experiences, decisions, contracts, failure patterns, risks, assumptions) using BM25 + subtoken/CJK matching.',
       parameters: {
         type: 'object',
         additionalProperties: false,
@@ -51,7 +62,7 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
         properties: {
           query: { type: 'string', minLength: 1, maxLength: 512 },
           limit: { type: 'integer', minimum: 1, maximum: 32 },
-          kind: { type: 'string', enum: ['fact', 'experience'] },
+          kind: { type: 'string', enum: [...memoryKinds] },
         },
       },
       execute: async (_callId, raw, signal, context) => {
@@ -67,7 +78,7 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
         if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1 || limit > 32) {
           return { ok: false, error: 'Invalid memory search limit' }
         }
-        if (input.kind !== undefined && input.kind !== 'fact' && input.kind !== 'experience') {
+        if (input.kind !== undefined && !isMemoryKind(input.kind)) {
           return { ok: false, error: 'Invalid memory kind filter' }
         }
         const { memory, scopesFor } = runtime()
@@ -85,13 +96,13 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
       name: 'memory_list',
       effect: 'read',
       policy: { targets: () => [] },
-      description: 'List recent workspace long-term memories (facts and durable experiences) sorted by recency.',
+      description: 'List recent workspace long-term memories sorted by recency.',
       parameters: {
         type: 'object',
         additionalProperties: false,
         properties: {
           limit: { type: 'integer', minimum: 1, maximum: 50 },
-          kind: { type: 'string', enum: ['fact', 'experience'] },
+          kind: { type: 'string', enum: [...memoryKinds] },
         },
       },
       execute: async (_callId, raw, signal, context) => {
@@ -104,7 +115,7 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
         if (typeof limit !== 'number' || !Number.isSafeInteger(limit) || limit < 1 || limit > 50) {
           return { ok: false, error: 'Invalid memory list limit' }
         }
-        if (input.kind !== undefined && input.kind !== 'fact' && input.kind !== 'experience') {
+        if (input.kind !== undefined && !isMemoryKind(input.kind)) {
           return { ok: false, error: 'Invalid memory kind filter' }
         }
         const { memory, scopesFor } = runtime()
@@ -176,16 +187,21 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
         if (!context?.taskId || !context?.agentRunId) {
           return { ok: false, error: 'Memory write requires an active task context' }
         }
-        const sourceRef = /^[a-zA-Z0-9_.:-]{1,128}$/.test(context.agentRunId + ':' + callId)
-          ? context.agentRunId + ':' + callId
+        const operationId = `${context.agentRunId}:${callId}`
+        const sourceRef = /^[a-zA-Z0-9_.:-]{1,128}$/.test(operationId)
+          ? operationId
           : context.agentRunId
         const { memory, judgment, scopesFor } = runtime()
         const scoped = scopesFor(context.taskId, workspace.root, context.agentRunId)
-        const eventDraft: EventDraft = scoped.event ?? {
+        const baseEvent: EventDraft = scoped.event ?? {
           taskId: context.taskId,
           agentRunId: context.agentRunId,
           type: '',
           payload: {},
+        }
+        const eventDraft: EventDraft = {
+          ...baseEvent,
+          correlationId: operationId,
         }
         const candidate: MemoryCandidate = {
           kind: input.kind,
@@ -198,6 +214,8 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
           taskId: context.taskId,
           ...(eventDraft.taskNodeId ? { nodeId: eventDraft.taskNodeId } : {}),
           ...(eventDraft.taskAttemptId ? { attemptId: eventDraft.taskAttemptId } : {}),
+          ...(scoped.teamKey ? { teamKey: scoped.teamKey } : {}),
+          ...(scoped.sourceRole ? { sourceRole: scoped.sourceRole } : {}),
           evidenceRefs: [sourceRef],
         }
         const controller = new AbortController()
@@ -209,6 +227,7 @@ export function createMemoryTools(workspace: CodingWorkspace, runtime: () => Mem
         }
         const savedEntry = memory.list(scoped.primary).find(entry =>
           entry.sourceRefs.includes(sourceRef) && memoryEntryInScope(entry, context.scopePath))
+        if (savedEntry) scoped.onSaved?.(savedEntry)
         return {
           ok: true,
           saved: Boolean(savedEntry),
