@@ -182,6 +182,35 @@ test('restart preserves confirmed usage and charges an unfinished reservation on
   }
 })
 
+test('default requests remain unlimited beyond 96 across restart, including uncertain usage', () => {
+  const store = new LocalStore(':memory:')
+  try {
+    const { execution } = catalogExecution()
+    let scheduler = new LocalModelScheduler(execution, store, new LocalJudgment(store))
+    const lease = scheduler.reserve(() => event, 'root')
+    for (let i = 0; i < 150; i++) {
+      assert.equal(lease.request(request(1_000_000, 120_000)), 120_000)
+      if (i % 2) lease.unknown()
+      else lease.usage({ type: 'model.usage', input: 1_000_000, output: 100_000, cacheRead: 2_000_000, cacheWrite: 0 })
+    }
+    lease.release()
+    scheduler = new LocalModelScheduler(execution, store, new LocalJudgment(store))
+    assert.equal(scheduler.taskRequestLimit('task'), Infinity)
+    assert.equal(scheduler.hasBudget('task'), true)
+    const resumed = scheduler.reserve(() => event, 'root')
+    assert.equal(resumed.request(request(1_000_000, 120_000)), 120_000)
+    resumed.release()
+    assert.equal(scheduler.budget('task').requests, 151)
+    assert.ok(store.events('task').filter(e => e.type === 'model.reserved')
+      .every(e => e.payload.taskRequestLimit === undefined && e.payload.taskTokenLimit === undefined))
+    const explicit = new LocalModelScheduler(execution, store, new LocalJudgment(store), { requests: 150 })
+    assert.equal(explicit.hasBudget('task'), false)
+    const capped = explicit.reserve(() => event, 'root')
+    assert.throws(() => capped.request(request(0, 1)), ModelBudgetError)
+    capped.release()
+  } finally { store.close() }
+})
+
 test('large cumulative usage does not shorten requests while delegated request counts still share a parent ledger', () => {
   const store = new LocalStore(':memory:')
   try {
@@ -251,7 +280,7 @@ test('P1-5: model.task_fit baseline keeps parent model when parent is already ch
   }
 })
 
-test('unavailable primary uses top fallback baseline (index 0), reserveAsync queues slots across suspend/resume, and planned DAG nodes scale default request limits', async () => {
+test('unavailable primary uses top fallback baseline, slots queue, and only explicit request limits cap DAG execution', async () => {
   const downPrimary = { provider: 'authorized', model: 'down-primary' }
   const firstFallback = { provider: 'authorized', model: 'best-fallback' }
   const secondFallback = { provider: 'authorized', model: 'second-fallback' }
@@ -302,9 +331,9 @@ test('unavailable primary uses top fallback baseline (index 0), reserveAsync que
     r1.release()
     assert.deepEqual(scheduler.getRouteStatus(), { quota: 'unknown', activeReservations: 0 })
 
-    // 3. registerPlannedNodes scales default request budget above 96, while explicit limits.requests enforces a hard ceiling.
+    // DAG size must not introduce an implicit spending limit.
     scheduler.registerPlannedNodes('big-dag', 30)
-    assert.equal(scheduler.taskRequestLimit('big-dag'), 336)
+    assert.equal(scheduler.taskRequestLimit('big-dag'), Infinity)
 
     const cappedScheduler = new LocalModelScheduler(execution, store, new LocalJudgment(store), { requests: 10 })
     cappedScheduler.registerPlannedNodes('big-dag-capped', 30)

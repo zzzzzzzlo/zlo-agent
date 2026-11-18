@@ -46,9 +46,7 @@ const budgets = 'model-budgets'
 const scopedBudgets = 'model-node-budgets'
 const taskScales = 'model-task-scales'
 const reservations = 'model-reservations'
-const defaults: ModelLimits = { requests: 96, activeAgents: 5 }
-const perNodeRequestAllowance = 8
-const maxAutoTaskRequests = 40_000
+const defaults: ModelLimits = { requests: Infinity, activeAgents: 5 }
 const emptyBudget: Budget = { requests: 0, confirmed: 0, reserved: 0, uncertain: 0 }
 const routeCooldownMs = 60_000
 
@@ -96,7 +94,6 @@ export class LocalModelScheduler {
   readonly #plannedNodes = new Map<string, number>()
   readonly #slotWaiters: SlotWaiter[] = []
   readonly #limits: ModelLimits
-  readonly #explicitRequestLimit: boolean
   readonly #execution: AgentExecution
   readonly #store: LocalStore
   readonly #judgment: LocalJudgment
@@ -108,9 +105,9 @@ export class LocalModelScheduler {
     this.#store = store
     this.#judgment = judgment
     this.#automatic = automatic
-    this.#explicitRequestLimit = limits.requests !== undefined
     this.#limits = { requests: limits.requests ?? defaults.requests, activeAgents: limits.activeAgents ?? defaults.activeAgents }
-    if (Object.values(this.#limits).some(value => !Number.isSafeInteger(value) || value < 1)) {
+    if ((limits.requests !== undefined && (!Number.isSafeInteger(limits.requests) || limits.requests < 1)) ||
+      !Number.isSafeInteger(this.#limits.activeAgents) || this.#limits.activeAgents < 1) {
       throw new Error('Invalid model budget limits')
     }
     for (const receipt of store.list<Reservation>(reservations)) {
@@ -176,10 +173,8 @@ export class LocalModelScheduler {
   }
 
   taskRequestLimit(taskId: string): number {
-    if (this.#explicitRequestLimit) return this.#limits.requests
-    const nodeCount = Math.max(this.#plannedNodes.get(taskId) ?? 0, this.#store.get<number>(taskScales, taskId) ?? 0)
-    if (nodeCount <= 0) return this.#limits.requests
-    return Math.min(maxAutoTaskRequests, this.#limits.requests + nodeCount * perNodeRequestAllowance)
+    // Usage and DAG size do not create spending limits. Only explicit configuration does.
+    return this.#limits.requests
   }
 
   hasBudget(taskId: string, scopes: readonly BudgetScope[] = []): boolean {
@@ -292,7 +287,8 @@ export class LocalModelScheduler {
 
     const selected = await this.#judgment.decide(event, 'model.task_fit', {
       candidates: candidates.map(item => modelFeatures(item.route, item)),
-      independent, requested: Boolean(requested), goal, taskRole, budgetRemaining: remainingRequests,
+      independent, requested: Boolean(requested), goal, taskRole,
+      ...(Number.isFinite(remainingRequests) ? { budgetRemaining: remainingRequests } : {}),
     }, baselineIndex, candidates.map((_, index) => index), [], { signal })
 
     const orderedCandidates = [candidates[selected]!, ...candidates.filter((_, index) => index !== selected)]
@@ -394,7 +390,7 @@ export class LocalModelScheduler {
           this.#store.put(reservations, entry.id, entry)
           this.#store.append({ ...event, correlationId: entry.id, type: 'model.reserved', payload: { route: request.route, kind: request.kind,
             estimatedTokens: tokens, estimatedInputTokens: request.estimatedInputTokens, maxOutputTokens: request.maxOutputTokens,
-            taskRequestLimit } })
+            ...(Number.isFinite(taskRequestLimit) ? { taskRequestLimit } : {}) } })
           return entry
         })
         this.#pending.set(runId, entry)

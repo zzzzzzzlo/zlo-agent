@@ -64,6 +64,38 @@ class ConcurrencyExecution extends FakeExecution {
   }
 }
 
+test('Root and delegated Worker exceed old request limits without an implicit deadline', async (t) => {
+  const { cwd, directory } = await fixture(t)
+  await writeFile(join(cwd, 'src', 'evidence.txt'), 'verified child evidence')
+  const execution = new ConcurrencyExecution(async (config, call) => {
+    for (let i = 0; i < 100; i++) {
+      config.reserveRequest?.({ route: { provider: 'fake', model: 'coding' }, estimatedInputTokens: 100_000, maxOutputTokens: 32_768, kind: 'prompt' })
+      config.onEvent({ type: 'model.request_started' })
+      config.onEvent({ type: 'model.usage', input: 100_000, output: 10, cacheRead: 1_000_000, cacheWrite: 0 })
+    }
+    if (config.role === 'root') {
+      const result = await call('delegate_task', { goal: 'Read src/evidence.txt after a long child task', access: 'read',
+        check: { path: 'src/evidence.txt', contains: 'verified child evidence' } })
+      assert.equal(result.ok, true, JSON.stringify(result))
+    } else {
+      const result = await call('read_text_file', { path: 'src/evidence.txt' })
+      assert.equal(result.ok, true)
+    }
+    return 'Execution finished'
+  })
+  const host = new LocalAgentHost({ directory, execution })
+  try {
+    const submitted = await host.createTask({ requestId: randomUUID(), goal: 'Complete a complex task', cwd })
+    await host.idle()
+    const result = host.getTask(submitted.taskId)
+    assert.deepEqual(execution.errors, [])
+    assert.equal(result.status, 'succeeded')
+    const events = host.events(submitted.taskId)
+    assert.ok(events.filter(e => e.type === 'model.request_started').length >= 202)
+    assert.ok(events.filter(e => e.type === 'agent.started').every(e => e.payload.maxDurationMs === undefined))
+  } finally { await host.close() }
+})
+
 test('multiple Read Workers run in parallel (including under a Team) while Writers stay mutually exclusive', { timeout: 15_000 }, async (t) => {
   const { cwd, directory } = await fixture(t)
   await writeFile(join(cwd, 'src', 'a.txt'), 'alpha')

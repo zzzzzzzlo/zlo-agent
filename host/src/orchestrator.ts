@@ -78,9 +78,6 @@ type Outcome =
   | { status: 'interrupted' | 'model_error' | 'model_output_limit' | 'runtime_error' | 'checkpoint_error' | 'budget_exhausted' | 'tool_retry_loop' }
 
 export type HarnessMode = 'fast' | 'quality'
-const deadlines: Record<HarnessMode, { root: number; child: number }> = {
-  fast: { root: 600_000, child: 120_000 }, quality: { root: 900_000, child: 300_000 },
-}
 type ProfileRuntime = ReturnType<ExtensionRegistry['resolve']>
 type WorkerHandoff = WorkerResult & { verification?: WorkerNode['verification']; failureReason?: string }
 
@@ -409,7 +406,7 @@ export class MultiAgentOrchestrator {
   }
 
   #register(task: TaskSnapshot, session: ExecutionSession, event: EventDraft, agentKey: string, role: AgentRole,
-    maxDurationMs: number, parentAgentId?: string, teamBinding?: { key: string; teamKey: string; cwd: string }): EventDraft {
+    maxDurationMs: number | undefined, parentAgentId?: string, teamBinding?: { key: string; teamKey: string; cwd: string }): EventDraft {
     const recorded = { ...event, sessionId: session.ref.id }
     this.#db.transaction(() => {
       const prevAgent = role === 'root' ? this.#db.get<AgentRecord>('agents', agentKey) : undefined
@@ -504,9 +501,9 @@ export class MultiAgentOrchestrator {
     const role = node.role ?? 'worker'
     const deadline = new AbortController()
     const stalled = new AbortController()
-    const timeMs = Math.min(node.budget?.timeMs ?? Infinity, deadlines[this.#mode].child)
-    const timer = setTimeout(() => deadline.abort(), timeMs)
-    timer.unref()
+    const timeMs = node.budget?.timeMs
+    const timer = timeMs === undefined ? undefined : setTimeout(() => deadline.abort(), timeMs)
+    timer?.unref()
     const signal = AbortSignal.any([rootSignal, parentSignal, deadline.signal, stalled.signal])
     const stopChildren = new AbortController()
     const childSignal = AbortSignal.any([signal, stopChildren.signal])
@@ -568,7 +565,6 @@ export class MultiAgentOrchestrator {
       const scopes = [
         ...[node, ...(parentNode ? [parentNode] : [])].flatMap(({ id, budget }) =>
           budget?.requests === undefined ? [] : [{ nodeId: id, requests: budget.requests }]),
-        ...(node.budget?.requests === undefined ? [{ nodeId: attemptId, requests: 32 }] : []),
       ]
       if (!this.#scheduler.hasBudget(task.id, scopes)) {
         exhausted = true
@@ -1182,7 +1178,6 @@ export class MultiAgentOrchestrator {
       agentId: saved?.id ?? randomUUID(), agentRunId: randomUUID(), type: '', payload: {},
     }
     let lease: ModelReservation | undefined
-    let deadline: NodeJS.Timeout | undefined
     let session: ExecutionSession | undefined
     let unwatch: (() => Promise<void>) | undefined
     let registered = false
@@ -1756,8 +1751,6 @@ export class MultiAgentOrchestrator {
     try {
       this.#scheduler.registerPlannedNodes(task.id, this.#tasks.getMeta(task.id).nodeCount ?? 0)
       lease = this.#scheduler.reserve(() => event, 'root')
-      deadline = setTimeout(() => budget.abort(), deadlines[this.#mode].root)
-      deadline.unref()
       lockRoute()
       const initialRoute = this.#tasks.getMeta(task.id).route ?? saved?.route
       if (saved && initialRoute && !this.#scheduler.canSwitch(saved.route, initialRoute)) return { status: 'model_error' }
@@ -1782,7 +1775,7 @@ export class MultiAgentOrchestrator {
         openingSavedSession = false
         signal.throwIfAborted()
         unwatch = this.#watchStop(session, signal)
-        event = this.#register(task, session, event, agentKey, 'root', deadlines[this.#mode].root)
+        event = this.#register(task, session, event, agentKey, 'root', undefined)
         registered = true
         activeScopes.set(task.rootNodeId, { event, route: session.route, workspace, signal: childSignal })
         this.#steering.set(task.id, async (id, text) => {
@@ -2038,7 +2031,6 @@ export class MultiAgentOrchestrator {
         try { await toolRun.close() } catch { checkpointFailed = true }
         try { visual.finish() } catch { /* A telemetry write cannot change the execution result. */ }
         unlockRoute()
-        clearTimeout(deadline)
         lease?.release()
       }
       if (checkpointFailed || outputFailed) outcome = { status: 'checkpoint_error' }
