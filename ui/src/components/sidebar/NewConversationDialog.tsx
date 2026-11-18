@@ -30,9 +30,11 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
   const [title, setTitle] = useState('')
   const [workspace, setWorkspace] = useState<string>()
   const [requestedAccess, setWorkspaceAccess] = useState<WorkspaceAccess>()
-  const [approvalMode, setApprovalMode] = useState<ToolApprovalMode>('ask')
+  const [requestedApprovalMode, setApprovalMode] = useState<ToolApprovalMode>('ask')
   const preferredAccess = catalog.snapshot?.preferences.workspaceAccess
   const workspaceAccess = requestedAccess ?? preferredAccess ?? (pi ? 'read' : 'write')
+  const allowFull = Boolean(workspace) && workspaceAccess === 'trusted'
+  const approvalMode = requestedApprovalMode === 'full' && !allowFull ? 'ask' : requestedApprovalMode
   const implicitAccess = preferredAccess === 'trusted' ? 'read' : preferredAccess
   const [route, setRoute] = useState<ModelRoute>()
   const [provider, setProvider] = useState('')
@@ -147,7 +149,7 @@ export function NewConversationDialog({ onClose }: { onClose: () => void }) {
                 )}
               </>
             )}
-            <ApprovalModeSelect value={approvalMode} onChange={setApprovalMode} disabled={pending} />
+            <ApprovalModeSelect value={approvalMode} onChange={setApprovalMode} disabled={pending} allowFull={allowFull} />
           </>
         )}
         {invalid && <p className="dialog-error" role="alert">{pi ? '请补全所选验收方式需要的路径。' : '请配对填写 Provider 与模型 ID，并补全所选验收方式需要的路径。'}</p>}

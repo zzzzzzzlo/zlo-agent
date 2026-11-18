@@ -198,7 +198,8 @@ function isSafeProjectCommandInput(input: unknown): boolean {
  * Evaluate tool execution using deny -> allow -> ask semantics:
  *  1. Safety floor (secret leakage / oversized / bidi characters) always denies.
  *  2. Pre-authorized workspace execution (e.g. run_project_command under 'trusted') runs directly.
- *  3. Routine/unattended safe allowlist rules auto-approve cleanly; everything else asks or blocks.
+ *  3. Full access pre-approves authorized tools. Export still requires a user-selected destination.
+ *  4. Routine/unattended use the safe allowlist; other calls ask or block.
  */
 export function evaluateToolExecutionPolicy({
   tool,
@@ -217,6 +218,10 @@ export function evaluateToolExecutionPolicy({
   const detail = JSON.stringify(input) ?? 'null'
   if (detail.length > 8_000 || redactProcessOutput(detail) !== detail || /[\u202a-\u202e\u2066-\u2069]/u.test(detail)) {
     return { decision: 'deny', reason: 'approval_safety' }
+  }
+
+  if (approvalMode === 'full' && effectiveAccess === 'trusted' && approvalKind !== 'export') {
+    return { decision: 'allow', automatic: true }
   }
 
   if (approvalMode !== 'ask') {

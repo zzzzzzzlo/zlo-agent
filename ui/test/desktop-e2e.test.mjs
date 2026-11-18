@@ -644,10 +644,27 @@ test('Windows Electron gates cold startup and applies the saved approval mode to
       await card.getByRole('button', { name: '仅本次允许' }).click()
       await waitForRun(page, id, 3, 'succeeded')
       await assert.rejects(readFile(target), { code: 'ENOENT' })
+      await writeFile(target, 'full access fixture')
+      await app.evaluate(({ dialog }) => {
+        dialog.showMessageBox = async (_window, options) => {
+          if (options.title !== '授权完全访问') throw new Error('Unexpected approval dialog')
+          return { response: 1 }
+        }
+      })
+      await page.getByRole('button', { name: '会话权限设置' }).click()
+      const permission = page.getByRole('dialog', { name: '会话权限' })
+      await permission.getByLabel('当前会话权限').selectOption('trusted')
+      await permission.getByLabel('工具审批模式').selectOption('full')
+      await permission.getByRole('button', { name: '保存权限' }).click()
+      await permission.waitFor({ state: 'hidden' })
+      await send(page, '[approval-check] 完全访问下删除')
+      await waitForRun(page, id, 4, 'succeeded')
+      assert.equal(await card.count(), 0)
+      await assert.rejects(readFile(target), { code: 'ENOENT' })
       await app.close()
       app = await launch(data)
       const restored = await ready(app, data)
-      assert.equal((await restored.evaluate(id => window.agentHost.getConversation({ conversationId: id }), id)).toolApprovalMode, 'routine')
+      assert.equal((await restored.evaluate(id => window.agentHost.getConversation({ conversationId: id }), id)).toolApprovalMode, 'full')
     } finally {
       await app?.close()
       await rm(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 })

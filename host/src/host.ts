@@ -696,6 +696,9 @@ export class LocalAgentHost {
     if (mode !== undefined && (!isToolApprovalMode(mode) || !isToolApprovalMode(expectedMode))) {
       throw new ConversationError('INVALID_INPUT', 'Invalid tool approval mode')
     }
+    if (mode === 'full' && access !== 'trusted') {
+      throw new ConversationError('INVALID_INPUT', 'Full access requires an explicitly trusted workspace')
+    }
     if (conversation.archived || current !== management.access(expected) || (mode !== undefined && currentMode !== expectedMode)) {
       throw new ConversationError('CONFLICT', 'Conversation permission changed')
     }
@@ -711,7 +714,8 @@ export class LocalAgentHost {
     }
     // Approval changes take effect at the next tool boundary. Pending requests
     // are cancelled by stopping the old run before an access change.
-    const update = () => this.#conversations.setWorkspaceAccess(conversation.id, access, mode)
+    const nextMode = mode ?? (currentMode === 'full' && access !== 'trusted' ? 'ask' : undefined)
+    const update = () => this.#conversations.setWorkspaceAccess(conversation.id, access, nextMode)
     if (current === access) {
       const result = this.#store.transaction(update)
       if (active && task) this.#approval.cancelScope(task.id)

@@ -166,7 +166,7 @@ export class ToolRun {
         if (blocked) {
           deny('policy')
           return blocked === 'unconfirmed_write'
-            ? { ok: false, code: 'UNCONFIRMED_WRITE', error: 'A previous write may have partially completed. Inspect the workspace or captured process output with read-only tools. Do not rerun the operation. Report what remains uncertain to the user.' }
+            ? { ok: false, code: 'UNCONFIRMED_WRITE', error: 'A previous write may have partially completed. Inspect the workspace or captured process output with read-only tools. Do not rerun the operation. If the result remains unknown, direct the user to Reconcile unknown operations in Diagnostics. Sending another message or changing approval mode does not resolve this receipt.' }
             : { ok: false, code: 'ACTIVE_WRITE', error: 'A workspace operation is in progress. For your shell command, read its process status or output before making another change.' }
         }
         const operationId = ref.agentRunId + ':' + callId

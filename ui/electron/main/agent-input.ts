@@ -121,6 +121,7 @@ function createInput(value: unknown, allowedWorkspace: (path: string) => boolean
     result.workspaceAccess = access
   }
   if (input.route !== undefined) result.route = modelRoute(input.route)
+  if (result.toolApprovalMode === 'full' && access !== 'trusted') return invalid()
   if (input.check !== undefined) {
     if (!result.workspace) return invalid()
     result.check = verificationCheck(input.check, access === 'trusted')

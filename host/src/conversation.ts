@@ -105,6 +105,9 @@ export function parseCreateConversation(input: CreateConversationInput): CreateC
   if (access !== undefined && access !== 'read' && access !== 'write' && access !== 'trusted') {
     throw new ConversationError('INVALID_INPUT', 'Invalid workspace access')
   }
+  if (toolApprovalMode === 'full' && access !== 'trusted') {
+    throw new ConversationError('INVALID_INPUT', 'Full access requires an explicitly trusted workspace')
+  }
   if ((check || access === 'trusted') && !workspace) throw new ConversationError('INVALID_INPUT', 'Select a workspace for this grant or check')
   let projectCheck: CreateConversationInput['check']
   if (check?.command !== undefined) {

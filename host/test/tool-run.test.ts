@@ -343,6 +343,12 @@ test('execution policy unlocks safe routine project checks and read-only shell c
     assert.deepEqual(await shellTool.execute('s3', { shell: 'sh', command: 'git diff src/a.ts' }), { ok: true })
     assert.equal((await shellTool.execute('s4', { shell: 'sh', command: 'npm install left-pad' }) as { ok: boolean }).ok, false)
     assert.deepEqual(executed, ['project:npm_test', 'project:npm_test', 'shell:git status', 'shell:git diff src/a.ts'])
+    const beforeFull = asked.length
+    mode = 'full'
+    assert.deepEqual(await shellTool.execute('s5', { shell: 'sh', command: 'python test_MSN.py' }), { ok: true })
+    assert.equal(asked.length, beforeFull)
+    assert.ok(db.events(trustedEvent.taskId).some(e => e.type === 'tool.approval_resolved' &&
+      e.payload.tool === 'shell_exec' && e.payload.automatic === true && e.payload.approved === true))
     await run.close()
   } finally {
     db.close()

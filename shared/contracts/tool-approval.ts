@@ -1,8 +1,8 @@
 export const approvalKinds = ['shell', 'destructive', 'git', 'browser_action', 'export', 'network'] as const
 export type ApprovalKind = typeof approvalKinds[number]
-export type ToolApprovalMode = 'ask' | 'routine' | 'unattended'
+export type ToolApprovalMode = 'ask' | 'routine' | 'unattended' | 'full'
 export function isToolApprovalMode(value: unknown): value is ToolApprovalMode {
-  return value === 'ask' || value === 'routine' || value === 'unattended'
+  return value === 'ask' || value === 'routine' || value === 'unattended' || value === 'full'
 }
 
 export interface DesktopToolApprovals {

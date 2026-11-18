@@ -104,15 +104,15 @@ export function registerAgentIpc(options: {
     return selected
   }
 
-  async function confirmTrustedWorkspace(window: BrowserWindow, workspace: string): Promise<void> {
+  async function confirmTrustedWorkspace(window: BrowserWindow, workspace: string, fullAccess: boolean): Promise<void> {
     const contents = window.webContents
     if (pendingTrust.has(contents)) throw new HostTransportError('CONFLICT', '请先处理正在等待的项目授权。')
     pendingTrust.add(contents)
     try {
       const { response } = await dialog.showMessageBox(window, {
         type: 'warning',
-        title: '授权运行项目代码',
-        message: '是否允许本会话运行此工作区的项目脚本？',
+        title: fullAccess ? '授权完全访问' : '授权运行项目代码',
+        message: fullAccess ? '是否允许此会话免审批执行 Shell 等已授权工具？' : '是否允许本会话运行此工作区的项目脚本？',
         detail: workspace + '\n\n项目脚本以当前用户身份运行，可以访问该用户有权访问的文件和网络。仅对你信任的项目授权。',
         buttons: ['取消', '信任并允许执行'],
         defaultId: 0,
@@ -195,7 +195,7 @@ export function registerAgentIpc(options: {
       if (command.type === 'createConversation' && command.workspace) {
         const grant = await checkWorkspace(window, command.workspace)
         if (command.workspaceAccess === 'trusted') {
-          await confirmTrustedWorkspace(window, command.workspace)
+          await confirmTrustedWorkspace(window, command.workspace, command.toolApprovalMode === 'full')
           await checkWorkspace(window, command.workspace, grant)
         }
       }

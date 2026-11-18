@@ -129,15 +129,22 @@ export function registerManagementIpc(options: {
     const next = access(input.access)
     const mode = input.toolApprovalMode
     if (mode !== undefined && !isToolApprovalMode(mode)) return invalid()
+    if (mode === 'full' && next !== 'trusted') return invalid()
     const conversation = await host.request<ConversationSummary>({ schemaVersion: 1, type: 'getConversation', conversationId })
     const current = conversation.workspaceAccess ?? (conversation.check ? 'write' : 'read')
-    if (ranks[next] > ranks[current]) {
+    const enableFull = mode === 'full' && conversation.toolApprovalMode !== 'full'
+    if (ranks[next] > ranks[current] || enableFull) {
       const path = conversation.workspace
       const identity = await directoryIdentity(path)
       const protectedPaths = await Promise.all(options.protectedPaths.map(item => realpath(item).catch(() => item)))
       if (protectedPaths.some(item => directoryOverlaps(item, path)) &&
         !(next === 'write' && path === await realpath(options.defaultWorkspace))) return invalid()
-      await confirm(window, '授权工作区权限', next === 'trusted' ? '允许以当前系统账户权限运行项目代码？' : '允许此会话修改工作区文件？', path)
+      if (enableFull) {
+        await confirm(window, '授权完全访问', '允许此会话免审批执行 Shell 等已授权工具？',
+          path + '\n\nShell 以当前系统账户身份运行，可访问该账户有权访问的文件和网络。')
+      } else {
+        await confirm(window, '授权工作区权限', next === 'trusted' ? '允许以当前系统账户权限运行项目代码？' : '允许此会话修改工作区文件？', path)
+      }
       if (await directoryIdentity(path) !== identity) return invalid()
     }
     return host.request({ schemaVersion: 1, type: 'setWorkspaceAccess', conversationId, access: next, expected: current,

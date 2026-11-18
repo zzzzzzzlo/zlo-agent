@@ -54,7 +54,8 @@ export function ConversationToolbar({ expanded, onObservatory, onManageModels }:
 function ConversationPermissionDialog({ session, current, onClose }: { session: Session; current: WorkspaceAccess; onClose(): void }) {
   const [selected, setSelected] = useState<WorkspaceAccess>(current)
   const currentMode = session.toolApprovalMode ?? 'ask'
-  const [mode, setMode] = useState<ToolApprovalMode>(currentMode)
+  const [requestedMode, setMode] = useState<ToolApprovalMode>(currentMode)
+  const mode = requestedMode === 'full' && selected !== 'trusted' ? 'ask' : requestedMode
   const changed = selected !== current || mode !== currentMode
   const [pending, setPending] = useState(false)
   const [error, setError] = useState<string>()
@@ -80,7 +81,7 @@ function ConversationPermissionDialog({ session, current, onClose }: { session: 
           </select>
         </label>
         <p className="settings-hint">收紧权限会收敛当前运行。提高权限时，系统会确认工作区路径和授权范围。</p>
-        <ApprovalModeSelect value={mode} onChange={setMode} disabled={pending} />
+        <ApprovalModeSelect value={mode} onChange={setMode} disabled={pending} allowFull={selected === 'trusted'} />
         {error && <p className="dialog-error" role="alert">{error}</p>}
         <div className="dialog-actions">
           <button type="button" className="button-neutral" onClick={onClose}>关闭</button>

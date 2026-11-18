@@ -10,6 +10,10 @@
 - 跨 Agent 写入：同工作树中没有真实隔离时，不可允许两个写 Worker 竞争相同文件范围；可串行化直到 Worktree 隔离实现。
 - `SandboxProvider` 首轮允许只有 `UnsupportedSandbox` 返回错误；不可用的沙箱不能 silently fallback 为不受限执行。
 
+桌面端的「完全访问（免工具审批）」是用户对单个受信任会话的明确授权。授权后，已获得能力的 Shell、文件删除、Git 修改、浏览器和网络工具可跳过逐次审批。Host 仍检查工具是否启用、子任务授权和调用范围，导出仍由用户选择保存位置。Shell 以当前系统账户运行，工作目录不构成沙箱。把工作区权限降到「可写」或「只读」时撤销此模式。
+
+若 Shell 启动后未正常退出，进程已停止与操作已完成是两项不同的事实。Host 保留提交前的执行回执和未知副作用状态，只开放用于核对的工具。用户可在「核对异常操作」查看证据。没有确定结果时，「人工确认已核查」会记录人工核查并保留原回执的未知标记，随后才能恢复原任务。
+
 ## Observability 不是 Task/Memory 权威存储
 
 - Event Bus 是统一的事件订阅入口；Agent Runtime、Task Engine、Scheduler、Memory Core、Judgment Kernel 发布带 correlation ID 的领域事件。
