@@ -388,12 +388,14 @@ export class LocalStore {
     return Number(row?.cnt ?? 0);
   }
 
-  openWriteOperations<T>(taskId: string): T[] {
+  trackedWriteOperations<T>(taskId: string): T[] {
     return this.#db.prepare(`
       SELECT value FROM records INDEXED BY idx_records_operations_task
       WHERE namespace = 'operations' AND json_extract(value, '$.taskId') = ?
         AND json_extract(value, '$.effect') = 'write'
-        AND json_extract(value, '$.status') IN ('started', 'unknown_effect')
+        AND (json_extract(value, '$.status') IN ('started', 'unknown_effect')
+          OR (json_extract(value, '$.status') = 'interrupted' AND json_extract(value, '$.tool') = 'shell_exec'
+            AND json_extract(value, '$.managed') = 1))
       ORDER BY id
     `).all(taskId).map(row => JSON.parse(row.value as string) as T);
   }

@@ -162,6 +162,10 @@ export class ToolRun {
           deny('policy')
           return { ok: false, code: 'REPLAY_BLOCKED', error: 'A previous invocation of this write operation had an unconfirmed effect and cannot be replayed automatically. Inspect current workspace state first or ask the user before making a new change.' }
         }
+        if (tool.name === 'shell_exec' && fingerprint && this.#tasks.hasInterruptedShellReplay(ref.taskId, fingerprint)) {
+          deny('policy')
+          return { ok: false, code: 'REPLAY_BLOCKED', error: 'This shell invocation was interrupted and may have partially changed state. Inspect its output and use a targeted recovery command or a fresh output directory.' }
+        }
         const blocked = this.#tasks.toolWorkBlock(ref, tool.name, effect, tool.policy)
         if (blocked) {
           deny('policy')
@@ -353,7 +357,7 @@ export class ToolRun {
     }
   }
 
-  #finish(event: EventDraft, id: string, status: 'succeeded' | 'failed' | 'unknown_effect', reason?: ToolFailureReason,
+  #finish(event: EventDraft, id: string, status: Awaited<DeferredToolOperation['completion']>, reason?: ToolFailureReason,
     changedPaths?: readonly string[]) {
     if (this.#tasks.hasOpenOperation(id)) {
       this.#tasks.finishTool(event, id, status, reason, changedPaths)
@@ -364,7 +368,7 @@ export class ToolRun {
     signal: AbortSignal, lease?: WorkspaceLease): void {
     const settled = operation.completion.catch(() => 'unknown_effect' as const)
       .then(status => {
-        this.#finish(event, id, status)
+        this.#finish(event, id, status, status === 'interrupted' ? 'tool_cancelled' : undefined)
         if (key && !this.#closed && !signal.aborted) {
           if (status === 'failed') this.#recordFailure(key, paths)
           if (status === 'succeeded') this.#failures.delete(key)

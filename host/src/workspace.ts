@@ -33,7 +33,7 @@ export interface ToolPolicy {
 }
 
 export interface DeferredToolOperation {
-  completion: Promise<'succeeded' | 'failed' | 'unknown_effect'>
+  completion: Promise<'succeeded' | 'failed' | 'interrupted' | 'unknown_effect'>
   stop(): Promise<void>
   pid?: number
 }

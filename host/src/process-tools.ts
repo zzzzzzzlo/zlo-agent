@@ -5,7 +5,7 @@ import { realpathSync, statSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { setTimeout as delay } from 'node:timers/promises'
-import type { CodingWorkspace, ToolInvocationContext, WorkspaceTool } from './workspace.ts'
+import type { CodingWorkspace, DeferredToolOperation, ToolInvocationContext, WorkspaceTool } from './workspace.ts'
 import { containsPath, processEnvironment, redactProcessOutput } from './workspace-process.ts'
 
 const windows = process.platform === 'win32'
@@ -22,13 +22,14 @@ const maxErrorBytes = 8 * 1024
 const maxPageBytes = 16 * 1024
 const maxHandles = 32
 const defaultPollWait = 1_000
-const maxPollWait = 15_000
+const maxPollWait = 300_000
+const interruptionOutputFrames = 4
 const pushDecodeChunkBytes = 16 * 1024
 const diagnosticLinePattern = /\b(?:error|fail(?:ed|ure)?|fatal|panic|exception|traceback|assertionerror|syntaxerror|typeerror|referenceerror|unhandled)\b|error\s+ts\d{4}:|^[×✖]|^\s*FAIL\b|^\s*ERR!/iu
 
 type Channel = 'stdout' | 'stderr'
 type State = 'starting' | 'running' | 'exited' | 'stopped' | 'timed_out' | 'failed' | 'unknown'
-type Receipt = 'succeeded' | 'failed' | 'unknown_effect'
+type Receipt = Awaited<DeferredToolOperation['completion']>
 type StopReason = 'stopped' | 'timed_out'
 type Shell = 'powershell' | 'cmd' | 'sh'
 type Input = Record<string, unknown>
@@ -238,8 +239,7 @@ async function killOrphanedChildren(parentPid: number, workspace: string, remain
   const pwsh = windowsSystemFile('WindowsPowerShell/v1.0/powershell.exe', workspace)
   const taskkill = windowsSystemFile('taskkill.exe', workspace)
   if (!pwsh || !taskkill || remainingMs < 200) return 'failed'
-  const script = `$ found = @(Get-CimInstance Win32_Process -Filter 'ParentProcessId = ${parentPid}' -ErrorAction SilentlyContinue); if ($found.Count -eq 0) { exit 2 }; foreach ($p in $found) { & '${taskkill.replaceAll("'", "''")}' /pid $p.ProcessId /t /f | Out-Null }; exit 0`
-    .replace('$ found', '$found')
+  const script = `$ErrorActionPreference = 'Stop'; $found = @(Get-CimInstance Win32_Process -Filter 'ParentProcessId = ${parentPid}'); if ($found.Count -eq 0) { exit 2 }; foreach ($p in $found) { & '${taskkill.replaceAll("'", "''")}' /pid $p.ProcessId /t /f | Out-Null; if ($LASTEXITCODE -ne 0) { exit 1 } }; exit 0`
   return new Promise(resolve => {
     const helper = spawn(pwsh, ['-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand', Buffer.from(script, 'utf16le').toString('base64')], {
       cwd: workspace, env: processEnvironment(workspace), stdio: 'ignore', shell: false, windowsHide: true,
@@ -339,14 +339,14 @@ function startProcess(invocation: ShellInvocation, cwd: string, workspace: strin
     signal?.removeEventListener('abort', abort)
     output.close(completeOutput)
     completed.resolve(next === 'exited' && code === 0 ? 'succeeded'
-      : next === 'exited' || next === 'failed' ? 'failed' : 'unknown_effect')
+      : next === 'exited' || next === 'failed' ? 'failed'
+      : next === 'stopped' || next === 'timed_out' ? 'interrupted' : 'unknown_effect')
   }
 
   const settleStopped = () => {
     if (!closed || stoppedTree === undefined || !stopReason) return
     if (stoppedTree === 'killed') finish(stopReason, null, true)
     else if (stoppedTree === 'already_gone' && naturalExit) finish('exited', naturalExit.code, true)
-    else if (stoppedTree === 'already_gone') finish(stopReason, null, true)
     else finish('unknown', null, true)
   }
 
@@ -403,8 +403,12 @@ function startProcess(invocation: ShellInvocation, cwd: string, workspace: strin
   const result = () => {
     const snapshot = status()
     if (state === 'stopped' || state === 'timed_out' || state === 'unknown') {
-      return { ok: false, ...snapshot, code: 'UNCONFIRMED_WRITE',
-        error: 'The shell command did not exit normally; some changes may already exist. Inspect the workspace and captured output without repeating the command.' }
+      const after = Math.max(0, output.totalFrames - interruptionOutputFrames)
+      const capturedOutput = { untrusted: true, omittedEarlier: after > 0, ...output.read(after, interruptionOutputFrames) }
+      if (state === 'unknown') return { ok: false, ...snapshot, code: 'UNCONFIRMED_WRITE', capturedOutput,
+        error: 'Could not verify that the controlled process tree stopped. Inspect the workspace and captured output without repeating the command.' }
+      return { ok: false, ...snapshot, code: state === 'timed_out' ? 'PROCESS_TIMEOUT' : 'PROCESS_INTERRUPTED', capturedOutput,
+        error: 'The controlled process tree stopped. Files and external effects may be partial. Inspect the output and affected paths before continuing. Use a targeted recovery command instead of repeating the interrupted invocation.' }
     }
     if (state === 'failed' || (state === 'exited' && exitCode !== 0)) {
       return { ok: false, ...snapshot, code: 'PROCESS_FAILED', error: 'The shell command failed. Inspect the captured output before retrying.' }
@@ -529,7 +533,7 @@ export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] 
     },
     {
       name: 'process_status',
-      description: 'Wait briefly for your shell process and get its state and exit code. Use waitMs up to 15000 to avoid rapid polling. A running state means the command is still working.',
+      description: `Wait for the exit of your shell process or get its current state. For long commands prefer waitMs: ${maxPollWait}; it returns early on exit or cancellation. Use waitMs: 0 for an immediate check.`,
       effect: 'read',
       policy: control,
       parameters: { type: 'object', additionalProperties: false, required: ['processId'], properties: { processId: idSchema, waitMs: waitSchema } },
@@ -579,7 +583,7 @@ export function createProcessTools(workspace: CodingWorkspace): WorkspaceTool[] 
     },
     {
       name: 'process_stop',
-      description: 'Stop a shell process started by this Agent run and attempt to stop its controlled children. Previous side effects can require reconciliation.',
+      description: 'Stop a shell process started by this Agent run and its controlled children. Returns the observed stop state and recent output. Inspect partial results before continuing.',
       effect: 'write',
       policy: control,
       parameters: { type: 'object', additionalProperties: false, required: ['processId'], properties: { processId: idSchema } },

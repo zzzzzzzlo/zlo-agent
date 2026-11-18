@@ -27,6 +27,7 @@ interface ToolResult {
   tailStartCursor?: number
   truncationNotice?: string
   frames: { cursor: number; stream: string; text: string }[]
+  capturedOutput?: { untrusted: boolean; frames: ToolResult['frames'] }
 }
 
 async function setup(t: TestContext) {
@@ -89,9 +90,15 @@ test('authorized shell streams complete redacted frames and settles the original
   assert.equal((await invoke('process_output', { processId }, { ...context, taskId: 'other' })).ok, false)
   assert.equal((await invoke('process_stop', { processId }, { ...context, taskId: 'other' })).ok, false)
   assert.equal((await invoke('shell_exec', { shell, command })).ok, false)
+  assert.equal((await invoke('process_status', { processId, waitMs: 300_001 })).ok, false)
+  const controller = new AbortController()
+  const cancelledWait = invoke('process_status', { processId, waitMs: 300_000 }, context, controller.signal)
+  controller.abort()
+  assert.equal((await cancelledWait).state, 'running')
+  const longWait = invoke('process_status', { processId, waitMs: 300_000 })
   await writeFile(join(root, 'subdir', 'release.flag'), '')
   assert.equal(await operations[0]!.completion, 'failed')
-  const final = await invoke('process_status', { processId })
+  const final = await longWait
   assert.equal(final.state, 'exited')
   assert.equal(final.exitCode, 7)
   assert.equal(final.ok, false)
@@ -112,11 +119,13 @@ test('CMD supports explicit quoting and propagates the true exit code', { skip: 
   assert.match(output.frames[0].text, /"zlo space"/)
 })
 
-test('process_stop stops the controlled child tree and keeps the original write outcome unknown', { timeout: 25_000 }, async t => {
+test('process_stop confirms the controlled tree stopped and returns redacted partial output', { timeout: 25_000 }, async t => {
   const { root, invoke, operations } = await setup(t)
   const script = join(root, 'child.cjs')
   await writeFile(script, [
     "const { writeFileSync } = require('node:fs')",
+    "console.log('partial test progress')",
+    "console.log('Cookie: sid=stop-private-fixture')",
     "writeFileSync('started.flag', '')",
     "setTimeout(() => writeFileSync('escaped.txt', 'ran'), 4500)",
   ].join('\n'))
@@ -142,8 +151,14 @@ test('process_stop stops the controlled child tree and keeps the original write 
   const result = await invoke('process_stop', { processId })
   assert.equal(result.state, 'stopped')
   assert.equal(result.ok, false)
-  assert.equal(result.code, 'UNCONFIRMED_WRITE')
-  assert.equal(await operations[0]!.completion, 'unknown_effect')
+  assert.equal(result.code, 'PROCESS_INTERRUPTED')
+  assert.equal(result.exitCode, null)
+  assert.equal(result.capturedOutput?.untrusted, true)
+  const captured = result.capturedOutput?.frames.map(frame => frame.text).join('') ?? ''
+  assert.match(captured, /partial test progress/u)
+  assert.match(captured, /\[redacted\]/u)
+  assert.doesNotMatch(captured, /stop-private-fixture/u)
+  assert.equal(await operations[0]!.completion, 'interrupted')
   await delay(4_700)
   await assert.rejects(access(join(root, 'escaped.txt')), { code: 'ENOENT' })
 })
@@ -166,15 +181,15 @@ test('shell enforces bounded input, output, timeout and task abort', async t => 
   const blocking = windows ? 'Start-Sleep -Seconds 50' : 'sleep 50'
   const timed = await invoke('shell_exec', { shell, command: blocking, timeoutMs: 300 })
   assert.equal(timed.ok, true)
-  assert.equal(await operations[1]!.completion, 'unknown_effect')
+  assert.equal(await operations[1]!.completion, 'interrupted')
   const timedStatus = await invoke('process_status', { processId: timed.processId })
   assert.equal(timedStatus.state, 'timed_out')
-  assert.equal(timedStatus.code, 'UNCONFIRMED_WRITE')
+  assert.equal(timedStatus.code, 'PROCESS_TIMEOUT')
   const abort = new AbortController()
   const cancelled = await invoke('shell_exec', { shell, command: blocking }, undefined, abort.signal)
   assert.equal(cancelled.ok, true)
   abort.abort()
-  assert.equal(await operations[2]!.completion, 'unknown_effect')
+  assert.equal(await operations[2]!.completion, 'interrupted')
   assert.equal((await invoke('process_status', { processId: cancelled.processId })).state, 'stopped')
 })
 
@@ -283,7 +298,7 @@ test('P1-3: process_stop terminates inherited-pipe descendants even after the to
   await delay(150)
   const stopped = await invoke('process_stop', { processId: launched.processId })
   assert.equal(stopped.state, 'stopped')
-  assert.equal(await operations[0]!.completion, 'unknown_effect')
+  assert.equal(await operations[0]!.completion, 'interrupted')
   await delay(8_700)
   await assert.rejects(access(join(root, 'bg-escaped.txt')), { code: 'ENOENT' })
 })

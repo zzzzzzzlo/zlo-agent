@@ -539,6 +539,7 @@ interface TaskGraphIndex {
   activeWriteOps: Map<string, Operation>
   unresolvedWriteOps: Map<string, Operation>
   unknownWriteOps: Map<string, Operation>
+  interruptedShellCalls: Set<string>
   hasReplanned: boolean
 }
 
@@ -737,15 +738,17 @@ export class TaskEngine {
       activeWriteOps: new Map(),
       unresolvedWriteOps: new Map(),
       unknownWriteOps: new Map(),
+      interruptedShellCalls: new Set(),
       hasReplanned: (task.replannedCount ?? 0) > 0,
     }
     for (const rawNode of nodes) {
       const node = normalizeNode(rawNode) as StoredTaskNode
       this.#insertNodeIntoIndex(graph, node)
     }
-    for (const op of this.#db.openWriteOperations<Operation>(taskId)) {
+    for (const op of this.#db.trackedWriteOperations<Operation>(taskId)) {
       if (op.status === 'started') graph.activeWriteOps.set(op.id, op)
       if (op.status === 'unknown_effect') graph.unknownWriteOps.set(op.id, op)
+      if (op.status === 'interrupted' && op.callFingerprint) graph.interruptedShellCalls.add(op.callFingerprint)
       if (isUnresolvedEffect(op)) graph.unresolvedWriteOps.set(op.id, op)
     }
     this.#graphs.set(taskId, graph)
@@ -1619,6 +1622,10 @@ export class TaskEngine {
     return false
   }
 
+  hasInterruptedShellReplay(taskId: string, fingerprint: string): boolean {
+    return this.#graph(taskId).interruptedShellCalls.has(fingerprint)
+  }
+
   #toolWorkBlock(taskId: string, managedOwner?: string, worktreeId?: string, tool?: string, effect?: Operation['effect'], graph?: TaskGraphIndex) {
     const resolved = graph ?? this.#graph(taskId)
     const inspection = effect === 'read' && (tool === 'list_directory' || tool === 'read_text_file' ||
@@ -2375,6 +2382,9 @@ export class TaskEngine {
         graph.activeWriteOps.delete(id)
         if (nextOp.effect === 'write' && nextOp.status === 'unknown_effect') {
           graph.unknownWriteOps.set(id, nextOp)
+        }
+        if (nextOp.tool === 'shell_exec' && nextOp.managed && status === 'interrupted' && nextOp.callFingerprint) {
+          graph.interruptedShellCalls.add(nextOp.callFingerprint)
         }
         if (nextOp.effect === 'write' && isUnresolvedEffect(nextOp)) {
           graph.unresolvedWriteOps.set(id, nextOp)

@@ -208,19 +208,29 @@ test('Phase 2 judges run at real tool, worker, and turn boundaries with bounded 
   }
 })
 
-test('stopping a task with an active shell records unknown effects and refuses to replay it', { timeout: 15_000 }, async () => {
+test('user stop interrupts a long shell wait, and the interrupted invocation cannot replay after restart', { timeout: 20_000 }, async () => {
   const env = await fixture()
   const started = Promise.withResolvers<void>()
-  const execution = new ScriptExecution(async (_config, _prompt, call, signal) => {
-    const result = await call('shell_exec', process.platform === 'win32'
-      ? { shell: 'powershell', command: 'Start-Sleep -Seconds 30' }
-      : { shell: 'sh', command: 'sleep 30' })
+  const args = process.platform === 'win32' ? { shell: 'powershell', command: 'Start-Sleep -Seconds 30' }
+    : { shell: 'sh', command: 'sleep 30' }
+  let resumed = false
+  let replayBlocked = false
+  const execution = new ScriptExecution(async (_config, _prompt, call) => {
+    const result = await call('shell_exec', args) as { ok: boolean; processId?: string; code?: string }
+    if (resumed) {
+      replayBlocked = result.code === 'REPLAY_BLOCKED'
+      const written = await call('create_text_file', { path: 'src/resumed.txt', content: 'continued' })
+      assert.ok(ok(written))
+      return 'Resumed without repeating the partial shell operation.'
+    }
     assert.ok(ok(result))
+    const longWait = call('process_status', { processId: result.processId, waitMs: 300_000 })
     started.resolve()
-    await delay(30_000, undefined, { signal })
+    await longWait
     return 'Unexpected completion'
   })
-  const host = new LocalAgentHost({ ...env, execution, approveTool: async () => ({ approved: true }) })
+  const options = { ...env, execution, approveTool: async () => ({ approved: true as const }) }
+  let host = new LocalAgentHost(options)
   try {
     const { taskId } = await host.createTask({
       requestId: 'shell-stop', goal: 'Start the process', cwd: env.workspace, workspaceAccess: 'trusted',
@@ -229,16 +239,22 @@ test('stopping a task with an active shell records unknown effects and refuses t
     assert.ok(host.getHistory(taskId).operations.some(({ tool, status }) => tool === 'shell_exec' && status === 'started'))
     assert.equal(host.stop(taskId, 'shell-stop-user').accepted, true)
     await host.idle()
-    assert.equal(host.getTask(taskId).status, 'needs_reconciliation')
-    assert.ok(host.getHistory(taskId).operations.some(({ tool, status }) => tool === 'shell_exec' && status === 'unknown_effect'))
-    assert.equal(host.resume(taskId, 'shell-no-replay').accepted, false)
+    assert.equal(host.getTask(taskId).status, 'stopped')
+    assert.ok(host.getHistory(taskId).operations.some(({ tool, status }) => tool === 'shell_exec' && status === 'interrupted'))
+    await host.close()
+    host = new LocalAgentHost(options)
+    resumed = true
+    assert.equal(host.resume(taskId, 'shell-resume').accepted, true)
+    await host.idle()
+    assert.equal(replayBlocked, true)
+    assert.equal(await readFile(join(env.workspace, 'src/resumed.txt'), 'utf8'), 'continued')
   } finally {
     await host.close()
     await rm(env.path, { recursive: true, force: true })
   }
 })
 
-test('Pi waits for shell approval and can recover from a refused call and a nonzero exit', { timeout: 20_000 }, async () => {
+test('Pi waits once for a shell command longer than 15 seconds and recovers from a nonzero exit', { timeout: 40_000 }, async () => {
   const env = await fixture()
   const defaultRoute = { provider: 'faux', model: 'shell-recovery' }
   const faux = fauxProvider({ models: [{ id: defaultRoute.model }] })
@@ -249,7 +265,7 @@ test('Pi waits for shell approval and can recover from a refused call and a nonz
     runtime.registerNativeProvider(faux.provider)
     return runtime
   })
-  const shell = process.platform === 'win32' ? 'cmd' : 'sh'
+  const shell = process.platform === 'win32' ? 'powershell' : 'sh'
   const tool = (name: string, args: Parameters<typeof fauxToolCall>[1]) =>
     fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' })
   let denied = false
@@ -259,12 +275,12 @@ test('Pi waits for shell approval and can recover from a refused call and a nonz
     context => {
       const result = context.messages.findLast(message => message.role === 'toolResult')
       denied = result?.isError === true && JSON.stringify(result.content).includes('APPROVAL_NOT_GRANTED')
-      return tool('shell_exec', { shell, command: shell === 'cmd' ? 'echo test failed&exit /b 7' : 'echo test failed; exit 7' })
+      return tool('shell_exec', { shell, command: shell === 'powershell' ? 'Start-Sleep -Seconds 16; exit 7' : 'sleep 16; exit 7' })
     },
     context => {
       const result = context.messages.findLast(message => message.role === 'toolResult')?.content[0]
       if (result?.type !== 'text') throw new Error('Missing shell launch result')
-      return tool('process_status', { processId: JSON.parse(result.text).processId, waitMs: 15_000 })
+      return tool('process_status', { processId: JSON.parse(result.text).processId, waitMs: 300_000 })
     },
     context => {
       const result = context.messages.findLast(message => message.role === 'toolResult')
@@ -300,6 +316,12 @@ test('Pi waits for shell approval and can recover from a refused call and a nonz
     assert.equal(failed, true)
     assert.equal(host.getTask(taskId).status, 'succeeded')
     assert.deepEqual(host.getHistory(taskId).operations.filter(operation => operation.tool === 'shell_exec').map(item => item.status), ['failed'])
+    const events = host.events(taskId)
+    const waits = events.filter(event => event.type === 'tool.started' && event.payload.tool === 'process_status')
+    assert.equal(waits.length, 1)
+    const finished = events.find(event => event.type === 'tool.finished' && event.payload.id === waits[0]!.payload.id)!
+    assert.ok(Date.parse(finished.occurredAt) - Date.parse(waits[0]!.occurredAt) >= 15_000)
+    assert.ok(!events.some(event => event.type === 'model.request_started' && event.seq > waits[0]!.seq && event.seq < finished.seq))
   } finally {
     unsubscribe()
     await host.close()
@@ -307,7 +329,7 @@ test('Pi waits for shell approval and can recover from a refused call and a nonz
   }
 })
 
-test('Pi receives an interrupted shell result, inspects partial output and cannot run another write', { timeout: 22_000 }, async () => {
+test('Pi receives a confirmed shell interruption, inspects partial output and continues with a different command', { timeout: 22_000 }, async () => {
   const env = await fixture()
   const defaultRoute = { provider: 'faux', model: 'shell-reconciliation' }
   const faux = fauxProvider({ models: [{ id: defaultRoute.model }] })
@@ -323,11 +345,13 @@ test('Pi receives an interrupted shell result, inspects partial output and canno
     fauxAssistantMessage(fauxToolCall(name, args), { stopReason: 'toolUse' })
   let interrupted = false
   let inspected = false
-  let writeDenied = false
+  let replayBlocked = false
+  let recoveryExited = false
+  const command = windows ? {
+    shell: 'powershell', command: "[Console]::WriteLine('test progress recorded'); [IO.File]::WriteAllText((Join-Path (Get-Location) 'src/partial.txt'), 'existing output'); Start-Sleep -Seconds 30",
+  } : { shell: 'sh', command: "echo 'test progress recorded'; printf 'existing output' > src/partial.txt; sleep 30" }
   faux.setResponses([
-    tool('shell_exec', windows ? {
-      shell: 'powershell', command: "[IO.File]::WriteAllText((Join-Path (Get-Location) 'src/partial.txt'), 'existing output'); Start-Sleep -Seconds 30",
-    } : { shell: 'sh', command: "printf 'existing output' > src/partial.txt; sleep 30" }),
+    tool('shell_exec', command),
     async context => {
       const result = context.messages.findLast(message => message.role === 'toolResult')?.content[0]
       if (result?.type !== 'text') throw new Error('Missing shell launch result')
@@ -342,18 +366,35 @@ test('Pi receives an interrupted shell result, inspects partial output and canno
     },
     context => {
       const result = context.messages.findLast(message => message.role === 'toolResult')
-      interrupted = result?.isError === true && JSON.stringify(result.content).includes('UNCONFIRMED_WRITE')
+      const text = result?.content[0]
+      const receipt = text?.type === 'text' ? JSON.parse(text.text) : undefined
+      interrupted = result?.isError === true && receipt?.code === 'PROCESS_INTERRUPTED' && receipt.state === 'stopped' &&
+        receipt.exitCode === null && receipt.capturedOutput?.untrusted === true &&
+        JSON.stringify(receipt.capturedOutput.frames).includes('test progress recorded')
       return tool('read_text_file', { path: 'src/partial.txt' })
     },
     context => {
       const result = context.messages.findLast(message => message.role === 'toolResult')
       inspected = result?.isError !== true && JSON.stringify(result?.content).includes('existing output')
-      return tool('edit_text_file', { path: 'src/partial.txt', oldText: 'existing output', newText: 'unsafe overwrite' })
+      return tool('shell_exec', command)
     },
     context => {
       const result = context.messages.findLast(message => message.role === 'toolResult')
-      writeDenied = result?.isError === true && JSON.stringify(result.content).includes('UNCONFIRMED_WRITE')
-      return fauxAssistantMessage('The partial file exists. The interrupted command needs reconciliation.')
+      replayBlocked = result?.isError === true && JSON.stringify(result.content).includes('REPLAY_BLOCKED')
+      return tool('shell_exec', windows ? {
+        shell: 'powershell', command: "[IO.File]::WriteAllText((Join-Path (Get-Location) 'src/recovered.txt'), 'targeted recovery')",
+      } : { shell: 'sh', command: "printf 'targeted recovery' > src/recovered.txt" })
+    },
+    context => {
+      const text = context.messages.findLast(message => message.role === 'toolResult')?.content[0]
+      assert.equal(text?.type, 'text')
+      return tool('process_status', { processId: JSON.parse(text.text).processId, waitMs: 300_000 })
+    },
+    context => {
+      const text = context.messages.findLast(message => message.role === 'toolResult')?.content[0]
+      const result = text?.type === 'text' ? JSON.parse(text.text) : undefined
+      recoveryExited = result?.state === 'exited' && result.exitCode === 0
+      return fauxAssistantMessage('Partial output retained. Targeted recovery completed.')
     },
   ])
   const host = new LocalAgentHost({ ...env, execution, defaultRoute, approveTool: async () => ({ approved: true }) })
@@ -363,11 +404,12 @@ test('Pi receives an interrupted shell result, inspects partial output and canno
     await host.idle()
     assert.equal(interrupted, true)
     assert.equal(inspected, true)
-    assert.equal(writeDenied, true)
-    assert.equal(host.getTask(taskId).status, 'needs_reconciliation')
+    assert.equal(replayBlocked, true)
+    assert.equal(recoveryExited, true)
+    assert.equal(host.getTask(taskId).status, 'succeeded')
     assert.equal(await readFile(join(env.workspace, 'src', 'partial.txt'), 'utf8'), 'existing output')
-    assert.equal(host.resume(taskId, 'unsafe-resume').accepted, false)
-    assert.ok(host.events(taskId).some(event => event.type === 'operation.reconciliation_required' && event.payload.reason === 'unknown_effect'))
+    assert.equal(await readFile(join(env.workspace, 'src', 'recovered.txt'), 'utf8'), 'targeted recovery')
+    assert.ok(!host.events(taskId).some(event => event.type === 'operation.reconciliation_required'))
   } finally {
     await host.close()
     await rm(env.path, { recursive: true, force: true })

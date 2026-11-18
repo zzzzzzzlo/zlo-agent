@@ -135,7 +135,7 @@ function receiptId(id: string): string {
 
 function deferredResultPrompt(receipts: readonly string[]): string {
   return 'A shell command was still running when you responded. Its recorded result is now: ' + receipts.join(', ') +
-    '. Check the process status and output before finalizing. If the result is uncertain, inspect using scoped read-only tools and explain what needs verification. Do not rerun a command with unknown effects.'
+    '. Check the process status and output before finalizing. If interrupted, inspect any partial outputs and continue with targeted recovery. If the process state is unknown, use scoped read-only tools and explain what needs verification. Do not blindly rerun either command.'
 }
 
 function safeErrorReason(error: unknown): string | undefined {
